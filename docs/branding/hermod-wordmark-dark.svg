@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 322 64" width="322" height="64" role="img" aria-label="HERMOD wordmark in runic strokes (dark background variant)">
+  <g fill="none" stroke="#E7ECEA" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M6 4 V60"/>
+    <path d="M40 4 V60"/>
+    <path d="M6 24 L40 40" stroke="#63C2D6"/>
+    <path d="M66 4 V60"/>
+    <path d="M66 10 L94 17"/>
+    <path d="M66 30 L88 36"/>
+    <path d="M66 47 L94 54"/>
+    <path d="M118 4 V60"/>
+    <path d="M118 8 L146 19 L122 31"/>
+    <path d="M122 31 L148 58"/>
+    <path d="M172 4 V60"/>
+    <path d="M208 4 V60"/>
+    <path d="M172 4 L190 36 L208 4"/>
+    <path d="M248 4 L268 32 L248 60 L228 32 Z"/>
+    <path d="M288 4 V60"/>
+    <path d="M288 8 L316 32 L288 56"/>
+  </g>
+</svg>

@@ -1,4 +1,9 @@
-● # <img src="docs/branding/hermod-mark-256.png" alt="Hermod logo" height="64" align="absmiddle"/>&nbsp; Hermod
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/branding/hermod-wordmark-dark.svg">
+    <img src="docs/branding/hermod-wordmark.svg" alt="Hermod" height="56">
+  </picture>
+</h1>
 
 A single-command bridge to a remote dev box — **Hermod** for short — that mirrors your
 working directory to a remote sandbox and drops you into a persistent session running there.
