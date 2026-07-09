@@ -8,7 +8,7 @@
 A single-command bridge to a remote dev box — **Hermod** for short — that mirrors your
 working directory to a remote sandbox and drops you into a persistent session running there.
 
-It syncs your working tree to the sandbox (Mutagen), attaches you to a persistent tmux
+It syncs your project files to the sandbox (Mutagen), attaches you to a persistent tmux
 session over SSH, and pauses the sync when you detach so you can resume it later.
 
 [![CI](https://github.com/zerlok/hermod/actions/workflows/ci.yml/badge.svg)](https://github.com/zerlok/hermod/actions/workflows/ci.yml)
