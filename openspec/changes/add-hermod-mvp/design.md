@@ -73,11 +73,40 @@ Parsing and (future) completion live only in the CLI layer; it produces one immu
 and hands off. Domain objects never import the CLI framework.
 - **Why:** keeps the domain unit-testable in isolation and the parsing surface at the boundary.
 
+### Decision: `spf13/cobra` is the CLI framework
+The thin CLI edge is built on cobra. The single positional arg (sandbox host alias) uses cobra's
+`ValidArgsFunction` for dynamic completion sourced from `~/.ssh/config`; the `--` passthrough is
+split with `cmd.ArgsLenAtDash()`; shell-completion scripts (a README follow-on) come from cobra's
+built-in `completion` generation.
+- **Why:** the README advertises both tab-completion of ssh hosts and completion-script generation,
+  and cobra makes both first-class rather than DIY. It is the community-standard framework, which
+  fits the "nothing here is a black box" ethos. cobra stays confined to the CLI edge, so the
+  domain remains framework-free per the decision above.
+- **Alternatives considered:** `kong` — cleaner struct→`Options` mapping, but dynamic ssh-host
+  completion and completion scripts are more DIY; `urfave/cli` — middle ground, less widely known.
+
+### Decision: standard-library `os/exec` is the only execution primitive
+`SubprocessExecutor` is built on `os/exec` with no third-party execution or PTY library. The
+interactive attach runs `exec.Cmd` with `Stdin`/`Stdout`/`Stderr` inherited from the process and
+`Run()` blocking until detach; probes use `exec.CommandContext(...).Output()` with a timeout to
+capture stdout. Mutagen, `ssh`, `tmux`, and `git` are invoked as their real binaries; argv is
+always built as a `[]string` run directly (never `sh -c "…"`).
+- **Why:** `ssh -t` allocates the PTY on the *remote*, and the local terminal is already a real
+  TTY that ssh shares, so inheriting stdio suffices — a local PTY library would only matter for
+  spawning a child that needs its own multiplexed pty, which the attach does not. `Run()` (not
+  `syscall.Exec`) is required so control returns to hermod after detach to run the liveness probe.
+  Running binaries directly (no intermediate shell) removes an injection surface and matches the
+  architecture's "no intermediate shell" rule. Result: zero execution dependencies and a single
+  static binary with no runtime deps — the external tools remain the user's to provide.
+- **Alternatives considered:** `creack/pty` for the attach — unnecessary given `ssh -t`; Go SDKs
+  for Mutagen/git (e.g. go-git) — rejected as reimplementation, contradicting "composes, doesn't
+  reimplement," and Mutagen has no stable public Go API (its CLI is the contract).
+
 ## Risks / Trade-offs
 
 - **Interactive attach needs real PTY/stdio inheritance, but probes only need captured output.** →
-  The `Executor` seam already separates them; the `SubprocessExecutor` must support both stdio
-  inheritance (attach) and captured stdout (probes). Deferred as an Open Question, not a blocker.
+  The `Executor` seam already separates them; `SubprocessExecutor` (on `os/exec`) supports both
+  stdio inheritance (attach) and captured stdout (probes). Resolved in Decisions above.
 - **`IsActive` probe races a session that dies between detach and probe.** → Acceptable: the probe
   reflects state at decision time; a session that dies just after is handled on the next
   invocation's open (resume finds nothing → create). No data loss because teardown flushes first.
@@ -94,8 +123,10 @@ skeleton implementing it. Rollback is deleting the change; nothing depends on it
 
 ## Open Questions
 
-- Which Go mechanism backs `SubprocessExecutor` for the interactive attach — `os/exec` with
-  inherited stdio, or an explicit PTY library — given probes are satisfied by plain `os/exec`?
+Resolved: the CLI framework (`spf13/cobra`) and the execution primitive (`os/exec`, no PTY
+library) are settled in the Decisions above. Remaining questions are about the exact external
+command *surface*, to be pinned during implementation:
+
 - Exact Mutagen CLI surface used for create/resume/flush/pause/terminate and status, and how the
   session name maps to Mutagen's session identifier.
 - How `IsActive` is implemented over tmux (e.g. `tmux has-session`) through the non-interactive

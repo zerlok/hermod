@@ -1,13 +1,13 @@
 ## 1. Project skeleton
 
-- [ ] 1.1 Initialize the Go module (`go mod init github.com/zerlok/hermod`) and a `main` entrypoint that wires the CLI to the orchestrator
+- [ ] 1.1 Initialize the Go module (`go mod init github.com/zerlok/hermod`), add the `spf13/cobra` dependency, and a `main` entrypoint that wires the CLI to the orchestrator
 - [ ] 1.2 Add the CI-relevant build/test targets so `go build ./...` and `go test ./...` pass on an empty skeleton
 - [ ] 1.3 Define the `Options` type (session name, sandbox host, cwd, agent args, ssh-config path, log level, dry-run) as an immutable value
 
 ## 2. Execution seam: Executor (how)
 
 - [ ] 2.1 Define the `Executor` interface: run one argv with cwd/env/capture and return a `Result`
-- [ ] 2.2 Implement `SubprocessExecutor` for real execution, supporting both inherited stdio (attach) and captured stdout (probes)
+- [ ] 2.2 Implement `SubprocessExecutor` on `os/exec` (no PTY lib): inherited stdio + blocking `Run()` for the attach, `CommandContext(...).Output()` for captured probes; build argv as `[]string` run directly, never `sh -c`
 - [ ] 2.3 Implement `DryRunExecutor` that prints argv as a copy-pasteable shell line and returns success
 - [ ] 2.4 Unit-test that `DryRunExecutor` prints and never executes, and that captured-output mode returns stdout
 
@@ -48,7 +48,7 @@
 
 ## 8. CLI (cli spec)
 
-- [ ] 8.1 Parse `hermod <sandbox> [-s] [-C] [-n] [-- args...]` into `Options`; error + usage on missing sandbox
+- [ ] 8.1 Parse `hermod <sandbox> [-s] [-C] [-n] [-- args...]` into `Options` with cobra (splitting `--` via `cmd.ArgsLenAtDash()`); error + usage on missing sandbox
 - [ ] 8.2 Default the session name to the working-directory base name and default the mirror dir to cwd
 - [ ] 8.3 Resolve the sandbox argument against the `~/.ssh/config` host alias and pass `--` args through verbatim
 - [ ] 8.4 Unit-test flag parsing, defaults, passthrough splitting, and the missing-argument path
