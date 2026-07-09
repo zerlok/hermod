@@ -16,7 +16,7 @@ session over SSH, and pauses the sync when you detach so you can resume it later
 [![Go Report Card](https://goreportcard.com/badge/github.com/zerlok/hermod)](https://goreportcard.com/report/github.com/zerlok/hermod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-![Hermod: one command mirrors your project to a remote box and attaches a persistent session](docs/images/demo.gif)
+[//]: # (![Hermod: one command mirrors your project to a remote box and attaches a persistent session]&#40;docs/images/demo.gif&#41;)
 
 > **Status: MVP.** The core loop (sync → attach → pause/teardown) comes first; shell
 > completions and per-sandbox config presets are follow-ons.
