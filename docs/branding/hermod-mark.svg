@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Hermod mark: hagalaz rune, two staves joined by a bridge stroke">
+  <g fill="none" stroke-width="6" stroke-linecap="round">
+    <path d="M17 8 V56" stroke="#1C2430"/>
+    <path d="M47 8 V56" stroke="#1C2430"/>
+    <path d="M17 25 L47 39" stroke="#16768D"/>
+  </g>
+</svg>
