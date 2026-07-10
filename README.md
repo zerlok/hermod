@@ -86,10 +86,13 @@ is carried only as environment so your commits are attributed correctly on the r
 **Language:** Go (single binary, no runtime dependencies).
 
 ```bash
-go build ./...     # build the hermod binary
-go test ./...      # run the test suite
-go install .       # install to $GOBIN for local use
+make build      # compile the hermod binary into ./bin
+make test       # run the test suite
+make lint       # static checks (gofmt + go vet)
+make install    # install to $GOBIN for local use
 ```
+
+Run `make help` for the full list of targets.
 
 This repository is **spec-driven**: changes start as OpenSpec proposals under `openspec/`
 before implementation. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the domain model.
