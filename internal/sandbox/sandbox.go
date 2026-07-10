@@ -6,7 +6,6 @@ package sandbox
 import (
 	"context"
 
-	"github.com/zerlok/hermod/internal/execx"
 	"github.com/zerlok/hermod/internal/shell"
 )
 
@@ -40,22 +39,21 @@ type sandbox struct {
 }
 
 // NewSession prepares a session on cfg.Host, building the ssh + tmux stacks over
-// the factory's Effective leaf (the attach is a side effect, and the liveness
-// probe follows a real attach). It does not attach.
-func NewSession(factory shell.Factory, cfg Config) Session {
-	leaf := factory.Effective()
+// inner (the effective, dry-run-aware shell: the attach is a side effect, and the
+// liveness probe follows a real attach). It does not attach.
+func NewSession(inner shell.Shell, cfg Config) Session {
 	return &sandbox{
 		session:     cfg.Session,
 		dir:         cfg.Dir,
 		command:     cfg.Command,
 		env:         cfg.Env,
-		interactive: shell.NewTmux(shell.NewSSH(leaf, cfg.Host, true), cfg.Session),
-		probe:       shell.NewSSH(leaf, cfg.Host, false),
+		interactive: shell.NewTmux(shell.NewSSH(inner, cfg.Host, true), cfg.Session),
+		probe:       shell.NewSSH(inner, cfg.Host, false),
 	}
 }
 
 func (s *sandbox) Attach(ctx context.Context) error {
-	_, err := s.interactive.Run(ctx, execx.Command{
+	_, err := s.interactive.Run(ctx, shell.Command{
 		Argv: s.command,
 		Dir:  s.dir,
 		Env:  s.env,
@@ -68,14 +66,14 @@ func (s *sandbox) Attach(ctx context.Context) error {
 // which we read as not-active; any other failure (e.g. an ssh connection error)
 // is ambiguous and returned so the caller can choose a safe default.
 func (s *sandbox) IsActive(ctx context.Context) (bool, error) {
-	_, err := s.probe.Run(ctx, execx.Command{
+	_, err := s.probe.Run(ctx, shell.Command{
 		Argv:    []string{"tmux", "has-session", "-t", s.session},
 		Capture: true,
 	})
 	if err == nil {
 		return true, nil
 	}
-	if code, ok := execx.ExitCode(err); ok && code == 1 {
+	if code, ok := shell.ExitCode(err); ok && code == 1 {
 		return false, nil
 	}
 	return false, err

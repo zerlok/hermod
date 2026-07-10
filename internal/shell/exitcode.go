@@ -1,4 +1,4 @@
-package execx
+package shell
 
 import "errors"
 

@@ -1,4 +1,4 @@
-// Command hermod mirrors a working directory to a sandbox sandbox and attaches a
+// Command hermod mirrors a working directory to a sandbox and attaches a
 // persistent session running there, pausing or tearing down the mirror on detach.
 package main
 

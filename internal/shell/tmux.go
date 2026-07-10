@@ -1,10 +1,6 @@
 package shell
 
-import (
-	"context"
-
-	"github.com/zerlok/hermod/internal/execx"
-)
+import "context"
 
 // tmux wraps a command as a persistent tmux window, attaching to the named
 // session if it exists and creating it otherwise (`new-session -A`). The start
@@ -21,7 +17,7 @@ func NewTmux(inner Shell, session string) Shell {
 	return tmux{inner: inner, session: session}
 }
 
-func (t tmux) Run(ctx context.Context, cmd execx.Command) (execx.Result, error) {
+func (t tmux) Run(ctx context.Context, cmd Command) (Result, error) {
 	argv := []string{"tmux", "new-session", "-A", "-s", t.session}
 	if cmd.Dir != "" {
 		argv = append(argv, "-c", cmd.Dir)
@@ -32,9 +28,9 @@ func (t tmux) Run(ctx context.Context, cmd execx.Command) (execx.Result, error) 
 	if len(cmd.Argv) > 0 {
 		// Pass the sandbox command as one string so tmux runs it via the shell
 		// and does not mistake the command's own flags for tmux options.
-		argv = append(argv, execx.Join(cmd.Argv))
+		argv = append(argv, join(cmd.Argv))
 	}
 	// Dir/Env are consumed into the tmux flags above; a fresh Command carries
 	// only the rewritten argv (and the preserved Capture flag) inward.
-	return t.inner.Run(ctx, execx.Command{Argv: argv, Capture: cmd.Capture})
+	return t.inner.Run(ctx, Command{Argv: argv, Capture: cmd.Capture})
 }

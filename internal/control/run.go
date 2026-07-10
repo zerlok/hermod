@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 
-	"github.com/zerlok/hermod/internal/execx"
 	"github.com/zerlok/hermod/internal/git"
 	"github.com/zerlok/hermod/internal/mirror"
 	"github.com/zerlok/hermod/internal/sandbox"
@@ -25,12 +24,16 @@ func Run(ctx context.Context, host string, opts ...Option) error {
 
 	logger := newLogger(o.Quiet)
 
-	shells := shell.NewFactory(execx.WithDryRun(o.DryRun))
+	// Two leaf shells: real always executes (plan-shaping probes stay true under
+	// dry-run); effective is dry-run-aware (side effects and the interactive
+	// attach). Each collaborator gets only the leaf it needs.
+	real := shell.NewLocal(false)
+	effective := shell.NewLocal(o.DryRun)
 
-	gitIdentity := git.New(shells, o.LocalDir).Read(ctx)
+	gitIdentity := git.New(real, o.LocalDir).Read(ctx)
 	logger.Printf("git identity: %s", describe(gitIdentity))
 
-	remote := sandbox.NewSession(shells, sandbox.Config{
+	remote := sandbox.NewSession(effective, sandbox.Config{
 		Host:    o.Sandbox,
 		Session: o.Session,
 		Dir:     o.RemoteDir,
@@ -38,7 +41,7 @@ func Run(ctx context.Context, host string, opts ...Option) error {
 		Env:     identityEnv(gitIdentity),
 	})
 
-	session, err := mirror.NewMutagenSession(ctx, shells, mirror.Config{
+	session, err := mirror.NewMutagenSession(ctx, effective, real, mirror.Config{
 		Name:       o.Session,
 		Host:       o.Sandbox,
 		RemotePath: o.RemoteDir,
@@ -47,6 +50,7 @@ func Run(ctx context.Context, host string, opts ...Option) error {
 	if err != nil {
 		return fmt.Errorf("open mirror: %w", err)
 	}
+
 	if err := session.Flush(ctx); err != nil {
 		// Setup failed before any work; still settle the mirror by liveness so it
 		// is never left leaking, then report the original failure.

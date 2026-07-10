@@ -1,10 +1,6 @@
 package shell
 
-import (
-	"context"
-
-	"github.com/zerlok/hermod/internal/execx"
-)
+import "context"
 
 // ssh runs the inner command on host over ssh. The command is collapsed into a
 // single shell-quoted argument because ssh joins its trailing args with spaces
@@ -22,14 +18,14 @@ func NewSSH(inner Shell, host string, tty bool) Shell {
 	return ssh{inner: inner, host: host, tty: tty}
 }
 
-func (s ssh) Run(ctx context.Context, cmd execx.Command) (execx.Result, error) {
+func (s ssh) Run(ctx context.Context, cmd Command) (Result, error) {
 	argv := []string{"ssh"}
 	if s.tty {
 		argv = append(argv, "-t")
 	}
-	argv = append(argv, s.host, execx.Join(cmd.Argv))
+	argv = append(argv, s.host, join(cmd.Argv))
 	// Dir/Env describe sandbox intent already folded into the argv by inner
 	// decorators, so the local ssh process gets neither; Capture is preserved
 	// for probe commands. A fresh Command is returned rather than mutating cmd.
-	return s.inner.Run(ctx, execx.Command{Argv: argv, Capture: cmd.Capture})
+	return s.inner.Run(ctx, Command{Argv: argv, Capture: cmd.Capture})
 }

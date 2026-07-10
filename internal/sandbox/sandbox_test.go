@@ -6,26 +6,18 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/zerlok/hermod/internal/execx"
 	"github.com/zerlok/hermod/internal/shell"
 )
 
-// leafFactory hands the same leaf shell back as Effective (what sandbox builds
-// its transports on); Real is unused here.
-type leafFactory struct{ leaf shell.Shell }
-
-func (f leafFactory) Real() shell.Shell      { return f.leaf }
-func (f leafFactory) Effective() shell.Shell { return f.leaf }
-
 // recShell records the last command handed to the leaf of a shell stack.
-type recShell struct{ got execx.Command }
+type recShell struct{ got shell.Command }
 
-func (r *recShell) Run(_ context.Context, cmd execx.Command) (execx.Result, error) {
+func (r *recShell) Run(_ context.Context, cmd shell.Command) (shell.Result, error) {
 	r.got = cmd
-	return execx.Result{}, nil
+	return shell.Result{}, nil
 }
 
-// exitErr carries an exit code so execx.ExitCode can read it, matching how a
+// exitErr carries an exit code so shell.ExitCode can read it, matching how a
 // real *exec.ExitError behaves.
 type exitErr struct{ code int }
 
@@ -35,8 +27,8 @@ func (e exitErr) ExitCode() int { return e.code }
 // cannedShell returns a fixed error, standing in for the liveness probe leaf.
 type cannedShell struct{ err error }
 
-func (c cannedShell) Run(_ context.Context, _ execx.Command) (execx.Result, error) {
-	return execx.Result{}, c.err
+func (c cannedShell) Run(_ context.Context, _ shell.Command) (shell.Result, error) {
+	return shell.Result{}, c.err
 }
 
 func TestAttachComposesSshTmuxLine(t *testing.T) {
@@ -61,7 +53,7 @@ func TestAttachComposesSshTmuxLine(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			leaf := &recShell{}
-			s := NewSession(leafFactory{leaf: leaf}, Config{
+			s := NewSession(leaf, Config{
 				Host: "prod", Session: "api", Dir: tc.dir, Command: tc.command, Env: tc.env,
 			})
 			if err := s.Attach(context.Background()); err != nil {
@@ -88,7 +80,7 @@ func TestIsActive(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := NewSession(leafFactory{leaf: cannedShell{err: tc.probeErr}}, Config{Host: "prod", Session: "api"})
+			s := NewSession(cannedShell{err: tc.probeErr}, Config{Host: "prod", Session: "api"})
 			alive, err := s.IsActive(context.Background())
 			if alive != tc.wantAlive {
 				t.Errorf("alive = %v, want %v", alive, tc.wantAlive)

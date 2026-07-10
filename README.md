@@ -101,11 +101,10 @@ Packages are layered; dependencies only ever point downward.
 ```
 main.go                  entrypoint
 internal/
-  cli/                   parse one invocation into an immutable Options (cobra edge)
+  cli/                   parse one invocation into functional options (cobra edge)
   control/               resolve defaults, run sync → attach → pause/teardown, decide the branch
   git/                   read local author identity to carry into the remote
   mirror/                the Mutagen file mirror: open (create/resume), flush, pause, close
-  remote/                the tmux-over-ssh session: attach-or-create, liveness probe
-  shell/                 where a command runs — transport decorators (ssh, tmux) nested by the caller
-  execx/                 how a command runs — real subprocess vs printed dry-run
+  sandbox/               the tmux-over-ssh session: attach-or-create, liveness probe
+  shell/                 where a command runs (ssh/tmux decorators) and how (real vs printed leaf)
 ```

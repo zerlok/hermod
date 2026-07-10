@@ -6,7 +6,6 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/zerlok/hermod/internal/execx"
 	"github.com/zerlok/hermod/internal/shell"
 )
 
@@ -18,17 +17,11 @@ type fakeShell struct {
 	seen [][]string
 }
 
-func (f *fakeShell) Run(_ context.Context, cmd execx.Command) (execx.Result, error) {
+func (f *fakeShell) Run(_ context.Context, cmd shell.Command) (shell.Result, error) {
 	f.seen = append(f.seen, cmd.Argv)
 	key := cmd.Argv[len(cmd.Argv)-1]
-	return execx.Result{Stdout: f.out[key]}, f.err[key]
+	return shell.Result{Stdout: f.out[key]}, f.err[key]
 }
-
-// factoryOf serves a fixed shell as the Real (probe) leaf git reads from.
-type factoryOf struct{ sh shell.Shell }
-
-func (f factoryOf) Real() shell.Shell      { return f.sh }
-func (f factoryOf) Effective() shell.Shell { return f.sh }
 
 func TestRead(t *testing.T) {
 	readErr := errors.New("exit status 1")
@@ -46,7 +39,7 @@ func TestRead(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := New(factoryOf{sh: &fakeShell{out: tc.out, err: tc.err}}, "").Read(context.Background())
+			got := New(&fakeShell{out: tc.out, err: tc.err}, "").Read(context.Background())
 			if got != tc.want {
 				t.Errorf("Read() = %+v, want %+v", got, tc.want)
 			}
@@ -67,7 +60,7 @@ func TestReadIsReadOnly(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &fakeShell{}
-			New(factoryOf{sh: f}, "").Read(context.Background())
+			New(f, "").Read(context.Background())
 			if !reflect.DeepEqual(f.seen, tc.want) {
 				t.Errorf("issued %v, want %v", f.seen, tc.want)
 			}

@@ -6,7 +6,6 @@ import (
 	"context"
 	"strings"
 
-	"github.com/zerlok/hermod/internal/execx"
 	"github.com/zerlok/hermod/internal/shell"
 )
 
@@ -60,14 +59,14 @@ type mutagen struct {
 // NewMutagenSession opens the mirror as create-or-resume — an existing session
 // (paused or running) is resumed so its synced state is reused, otherwise a new
 // bidirectional session is created — and returns it ready for use. Mutations run
-// on the factory's Effective leaf; the status probe runs on its Real leaf.
-func NewMutagenSession(ctx context.Context, factory shell.Factory, cfg Config) (Session, error) {
+// on exec (dry-run-aware); the status probe runs on probe (always real).
+func NewMutagenSession(ctx context.Context, exec, probe shell.Shell, cfg Config) (Session, error) {
 	m := &mutagen{
 		name:      cfg.Name,
 		localPath: cfg.LocalPath,
 		endpoint:  cfg.Host + ":" + cfg.RemotePath,
-		exec:      factory.Effective(),
-		probe:     factory.Real(),
+		exec:      exec,
+		probe:     probe,
 	}
 	st, err := m.Status(ctx)
 	if err != nil {
@@ -79,7 +78,7 @@ func NewMutagenSession(ctx context.Context, factory shell.Factory, cfg Config) (
 		}
 		return m, nil
 	}
-	_, err = m.exec.Run(ctx, execx.Command{
+	_, err = m.exec.Run(ctx, shell.Command{
 		Argv: []string{"mutagen", "sync", "create", "--name", m.name, m.localPath, m.endpoint},
 	})
 	if err != nil {
@@ -93,7 +92,7 @@ func (m *mutagen) Pause(ctx context.Context) error { return m.verb(ctx, "pause")
 func (m *mutagen) Close(ctx context.Context) error { return m.verb(ctx, "terminate") }
 
 func (m *mutagen) verb(ctx context.Context, verb string) error {
-	_, err := m.exec.Run(ctx, execx.Command{
+	_, err := m.exec.Run(ctx, shell.Command{
 		Argv: []string{"mutagen", "sync", verb, m.name},
 	})
 	return err
@@ -103,7 +102,7 @@ func (m *mutagen) verb(ctx context.Context, verb string) error {
 // is not an error: Mutagen exits non-zero when it cannot locate the named
 // session, which we read as Absent so the caller can create it.
 func (m *mutagen) Status(ctx context.Context) (State, error) {
-	res, err := m.probe.Run(ctx, execx.Command{
+	res, err := m.probe.Run(ctx, shell.Command{
 		Argv:    []string{"mutagen", "sync", "list", m.name},
 		Capture: true,
 	})

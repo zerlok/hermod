@@ -21,16 +21,15 @@ Everything below is in service of that sentence.
 ## Domain objects
 
 Each lives in one package; dependencies point downward only
-(`cli → control → git/mirror/remote → shell → execx`).
+(`cli → control → git/mirror/sandbox → shell`).
 
-| Object                     | Responsibility                                                                                                                                                            | Collaborators              |
-|----------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------|
-| `control.Options`          | The fully-resolved intent of one invocation: sandbox host, session name, local dir, remote dir, passthrough command, dry-run, quiet. Immutable.                          | built by the CLI edge      |
-| `remote.Session`           | The remote interactive session — a tmux window on `host`, reached over SSH. `NewSandboxSession` **prepares** it (wraps a leaf shell in ssh + tmux) without attaching; `Attach` blocks until detach, `IsActive` probes liveness. | its ssh + tmux `Shell` stack |
-| `mirror.Session`           | The file mirror between the local dir and `host:remotePath`. `NewMutagenSession` **opens** it (create **or** resume) at construction; the interface then exposes `Flush`, `Pause`, `Close` (terminate), `Status`. Backed by a private Mutagen impl. | a side-effecting + a probe `Shell` |
-| `git.Reader` / `Identity`  | Read-only discovery of `user.name` / `user.email` from the mirrored directory. `New(shell, dir).Read()` returns an `Identity`; it does not build environment.            | a probe `Shell`            |
-| `shell.Shell`              | **Where** a command runs (local / over ssh / inside tmux). A decorator the caller nests.                                                                                 | `execx.Executor` at the leaf |
-| `execx.Executor`           | **How** a single argv is run: for real (`NewSubprocess`) or printed (`NewDryRun`).                                                                                       | —                          |
+| Object                 | Responsibility                                                                                                                                                                                                                                      | Collaborators                      |
+|------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------|
+| `control.Options`      | The fully-resolved intent of one invocation: sandbox host, session name, local dir, remote dir, passthrough command, dry-run, quiet. Immutable.                                                                                                     | built by the CLI edge              |
+| `sandbox.Session`      | The remote interactive session — a tmux window on `host`, reached over SSH. `NewSession` **prepares** it (wraps a leaf shell in ssh + tmux) without attaching; `Attach` blocks until detach, `IsActive` probes liveness.                            | its ssh + tmux `Shell` stack       |
+| `mirror.Session`       | The file mirror between the local dir and `host:remotePath`. `NewMutagenSession` **opens** it (create **or** resume) at construction; the interface then exposes `Flush`, `Pause`, `Close` (terminate), `Status`. Backed by a private Mutagen impl. | a side-effecting + a probe `Shell` |
+| `git.Git` / `Identity` | Read-only discovery of `user.name` / `user.email` from the mirrored directory. `New(shell, dir).Read()` returns an `Identity`; it does not build environment.                                                                                       | a probe `Shell`                    |
+| `shell.Shell`          | **Where** a command runs (local / over ssh / inside tmux), and at the leaf **how** it runs — for real or, under dry-run, printed. A decorator the caller nests.                                                                                     | —                                  |
 
 `control` is the composition layer: it reads identity, builds the two leaf shells (real vs
 effective), wires the collaborators, runs the flow, and owns the pause/teardown decision.
@@ -40,7 +39,9 @@ effective), wires the collaborators, runs the flow, and owns the pause/teardown 
 ## Two axes: *where* vs *how*
 
 The central design idea is separating **where** a command runs from **how** it is executed.
-They compose independently, which is what makes the tool both dry-runnable and testable.
+They compose independently, which is what makes the tool both dry-runnable and testable. Both
+axes live in the `shell` package: the transport decorators are *where*, and the local leaf is
+*how*.
 
 ### `Shell` — where (composable decorators)
 
@@ -49,14 +50,14 @@ a capture flag — and every transport is a decorator constructed with an inner 
 rewrites the argv for and delegates inward:
 
 ```
-NewTmux( "sess", NewSSH( "host", tty, NewLocal(executor) ) )
+NewTmux( "sess", NewSSH( "host", tty, NewLocal(dryRun) ) )
     │                 │                    │
-    │                 │                    └─ leaf: actually runs argv on this machine
+    │                 │                    └─ leaf: runs argv on this machine (or prints it)
     │                 └─ wraps argv to run over ssh (-t for the interactive attach)
     └─ wraps argv to attach/create the persistent tmux window (-c cwd, -e env)
 ```
 
-The **caller composes the stack it needs**: `remote.Session` nests tmux-over-ssh for the
+The **caller composes the stack it needs**: `sandbox.Session` nests tmux-over-ssh for the
 interactive attach and a plain ssh for the `IsActive` probe; `mirror` and `git` run local leaf
 shells directly. There is no shared factory — `control` builds the two leaves (a real one and a
 dry-run-aware one) and hands them to the collaborators, which nest transports as they see fit.
@@ -66,15 +67,16 @@ environment, and the default shell covers the no-command case.
 Adding a new transport (a container exec, a different multiplexer) means writing one more
 decorator constructor — no existing object changes.
 
-### `Executor` — how (the dry-run seam)
+### The local leaf — how (the dry-run seam)
 
-At the leaf, the local `Shell` holds an `Executor` (a stateless function behind a constructor):
+`NewLocal(dryRun)` returns the leaf `Shell`. The `dryRun` flag picks one of two internal run
+functions once, at construction, so the swap is invisible to every decorator above it:
 
-- `NewSubprocess` runs the argv for real via `os/exec`, no intermediate shell. Capture mode
+- the **real** run executes the argv via `os/exec`, no intermediate shell. Capture mode
   collects stdout (probes); otherwise the child inherits the process stdio, so the interactive
   attach shares the real terminal and the call blocks until detach. `ssh -t` allocates the pty
   on the *remote*, so no local PTY library is needed.
-- `NewDryRun` **prints** the argv as a copy-pasteable shell line and returns success.
+- the **dry-run** run **prints** the argv as a copy-pasteable shell line and returns success.
 
 One rule: **the probes that shape the plan stay real even in dry-run** — git-identity reads and
 Mutagen `status` always use the real leaf, so `--dry-run` reflects true git identity and true
@@ -130,8 +132,8 @@ and the remote's own config applies — a soft feature, never a hard failure.
 ## CLI seam
 
 The CLI layer owns argument parsing and completion and nothing else: it collects flags and the
-ambient cwd/home and calls `control.Resolve`, which applies functional options over the defaults
-to produce one immutable `Options`, then hands off to `control.Run`. The sandbox argument is an
+ambient cwd/home into functional options and calls `control.Run`, which applies them over the
+defaults to produce one immutable `Options` before running the flow. The sandbox argument is an
 `~/.ssh/config` **host alias** (completion is sourced from that file), and everything after `--`
 passes through verbatim to the remote command.
 

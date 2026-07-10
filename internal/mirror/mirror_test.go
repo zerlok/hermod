@@ -6,28 +6,20 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/zerlok/hermod/internal/execx"
 	"github.com/zerlok/hermod/internal/shell"
 )
 
 // recShell records every argv it runs and returns a canned result/error.
 type recShell struct {
-	ret  execx.Result
+	ret  shell.Result
 	err  error
 	seen [][]string
 }
 
-func (r *recShell) Run(_ context.Context, cmd execx.Command) (execx.Result, error) {
+func (r *recShell) Run(_ context.Context, cmd shell.Command) (shell.Result, error) {
 	r.seen = append(r.seen, cmd.Argv)
 	return r.ret, r.err
 }
-
-// factoryOf serves fixed leaves so a test can inspect the mutation and probe
-// commands separately.
-type factoryOf struct{ real, eff shell.Shell }
-
-func (f factoryOf) Real() shell.Shell      { return f.real }
-func (f factoryOf) Effective() shell.Shell { return f.eff }
 
 func testConfig() Config {
 	return Config{Name: "api", Host: "prod-box", RemotePath: "dev/api", LocalPath: "/home/u/api"}
@@ -37,19 +29,19 @@ func TestNewMutagenSessionOpens(t *testing.T) {
 	notFound := errors.New("unable to locate requested sessions")
 	cases := []struct {
 		name     string
-		probeRet execx.Result
+		probeRet shell.Result
 		probeErr error
 		want     []string
 	}{
-		{"absent creates", execx.Result{}, notFound, []string{"mutagen", "sync", "create", "--name", "api", "/home/u/api", "prod-box:dev/api"}},
-		{"paused resumes", execx.Result{Stdout: "Name: api\nStatus: Paused\n"}, nil, []string{"mutagen", "sync", "resume", "api"}},
-		{"running resumes", execx.Result{Stdout: "Name: api\nStatus: Watching for changes\n"}, nil, []string{"mutagen", "sync", "resume", "api"}},
+		{"absent creates", shell.Result{}, notFound, []string{"mutagen", "sync", "create", "--name", "api", "/home/u/api", "prod-box:dev/api"}},
+		{"paused resumes", shell.Result{Stdout: "Name: api\nStatus: Paused\n"}, nil, []string{"mutagen", "sync", "resume", "api"}},
+		{"running resumes", shell.Result{Stdout: "Name: api\nStatus: Watching for changes\n"}, nil, []string{"mutagen", "sync", "resume", "api"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			exec := &recShell{}
 			probe := &recShell{ret: tc.probeRet, err: tc.probeErr}
-			if _, err := NewMutagenSession(context.Background(), factoryOf{real: probe, eff: exec}, testConfig()); err != nil {
+			if _, err := NewMutagenSession(context.Background(), exec, probe, testConfig()); err != nil {
 				t.Fatalf("NewMutagenSession() error: %v", err)
 			}
 			if len(exec.seen) != 1 || !reflect.DeepEqual(exec.seen[0], tc.want) {
@@ -74,8 +66,8 @@ func TestLifecycleArgv(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			exec := &recShell{}
 			// A running session resumes on open, leaving one prior side effect.
-			probe := &recShell{ret: execx.Result{Stdout: "Status: Watching for changes"}}
-			s, err := NewMutagenSession(ctx, factoryOf{real: probe, eff: exec}, testConfig())
+			probe := &recShell{ret: shell.Result{Stdout: "Status: Watching for changes"}}
+			s, err := NewMutagenSession(ctx, exec, probe, testConfig())
 			if err != nil {
 				t.Fatalf("NewMutagenSession() error: %v", err)
 			}
@@ -94,13 +86,13 @@ func TestStatusIsReadOnly(t *testing.T) {
 	notFound := errors.New("unable to locate requested sessions")
 	cases := []struct {
 		name     string
-		probeRet execx.Result
+		probeRet shell.Result
 		probeErr error
 		want     State
 	}{
-		{"absent", execx.Result{}, notFound, Absent},
-		{"paused", execx.Result{Stdout: "Status: Paused\n"}, nil, Paused},
-		{"running", execx.Result{Stdout: "Status: Watching for changes\n"}, nil, Running},
+		{"absent", shell.Result{}, notFound, Absent},
+		{"paused", shell.Result{Stdout: "Status: Paused\n"}, nil, Paused},
+		{"running", shell.Result{Stdout: "Status: Watching for changes\n"}, nil, Running},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

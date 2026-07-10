@@ -7,7 +7,6 @@ import (
 	"context"
 	"strings"
 
-	"github.com/zerlok/hermod/internal/execx"
 	"github.com/zerlok/hermod/internal/shell"
 )
 
@@ -30,8 +29,8 @@ type Git struct {
 // New returns a Git that reads identity from dir over sh. Callers pass a
 // real-executor shell so the read reflects true identity even under dry-run, and
 // the mirrored directory so a repo-local user.name/email is honored.
-func New(factory shell.Factory, dir string) Git {
-	return Git{shell: factory.Real(), dir: dir}
+func New(sh shell.Shell, dir string) Git {
+	return Git{shell: sh, dir: dir}
 }
 
 // Read returns the local identity. Any per-key read failure (git absent, key
@@ -44,7 +43,7 @@ func (r Git) Read(ctx context.Context) Identity {
 }
 
 func (r Git) get(ctx context.Context, key string) string {
-	res, err := r.shell.Run(ctx, execx.Command{
+	res, err := r.shell.Run(ctx, shell.Command{
 		Argv:    []string{"git", "config", "--get", key},
 		Dir:     r.dir,
 		Capture: true,

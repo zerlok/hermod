@@ -41,7 +41,7 @@ func newRootCmd(a app) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "hermod <sandbox> [flags] [-- <sandbox command>...]",
-		Short: "Mirror your working directory to a sandbox sandbox and attach a persistent session",
+		Short: "Mirror your working directory to a sandbox and attach a persistent session",
 		// The domain surfaces its own errors; usage is printed only for the
 		// argument errors below, and Execute prints the error line itself.
 		SilenceUsage:  true,
