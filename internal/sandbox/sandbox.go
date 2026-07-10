@@ -47,7 +47,7 @@ func NewSession(inner shell.Shell, cfg Config) Session {
 		dir:         cfg.Dir,
 		command:     cfg.Command,
 		env:         cfg.Env,
-		interactive: shell.NewTmux(shell.NewSSH(inner, cfg.Host, true), cfg.Session),
+		interactive: shell.NewLoginShell(shell.NewTmux(shell.NewSSH(inner, cfg.Host, true), cfg.Session)),
 		probe:       shell.NewSSH(inner, cfg.Host, false),
 	}
 }

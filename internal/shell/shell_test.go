@@ -69,6 +69,28 @@ func TestTmuxRewrite(t *testing.T) {
 	}
 }
 
+func TestLoginShellRewrite(t *testing.T) {
+	cases := []struct {
+		name string
+		in   Command
+		want []string
+	}{
+		{"empty command untouched", Command{Dir: "/home/u/api"}, nil},
+		{"single word wrapped", Command{Argv: []string{"claude"}}, []string{"sh", "-c", `exec "$SHELL" -lc "$1"`, "sh", "claude"}},
+		{"flags preserved in one word", Command{Argv: []string{"claude", "--model", "opus"}}, []string{"sh", "-c", `exec "$SHELL" -lc "$1"`, "sh", "claude --model opus"}},
+		{"inner spaces stay quoted", Command{Argv: []string{"claude", "-p", "hi there"}}, []string{"sh", "-c", `exec "$SHELL" -lc "$1"`, "sh", "claude -p 'hi there'"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inner := &recShell{}
+			NewLoginShell(inner).Run(context.Background(), tc.in)
+			if !reflect.DeepEqual(inner.got.Argv, tc.want) {
+				t.Errorf("argv = %q, want %q", inner.got.Argv, tc.want)
+			}
+		})
+	}
+}
+
 // TestAttachStack asserts the full interactive stack (Tmux → SSH → leaf) yields
 // one copy-pasteable ssh command line.
 func TestAttachStack(t *testing.T) {

@@ -47,7 +47,7 @@ func TestAttachComposesSshTmuxLine(t *testing.T) {
 		{
 			"passthrough with identity",
 			[]string{"claude", "--model", "opus"}, "/home/u/api", []string{"GIT_AUTHOR_NAME=Jane Doe"},
-			[]string{"ssh", "-t", "prod", "tmux new-session -A -s api -c /home/u/api -e 'GIT_AUTHOR_NAME=Jane Doe' 'claude --model opus'"},
+			[]string{"ssh", "-t", "prod", `tmux new-session -A -s api -c /home/u/api -e 'GIT_AUTHOR_NAME=Jane Doe' 'sh -c '\''exec "$SHELL" -lc "$1"'\'' sh '\''claude --model opus'\'''`},
 		},
 	}
 	for _, tc := range cases {
