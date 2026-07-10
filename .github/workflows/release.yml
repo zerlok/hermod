@@ -1,0 +1,44 @@
+name: Release
+
+# Publish ONLY on a published GitHub Release. The release tag is the single source of truth for the
+# version, and the release body becomes the change-notes. No other event publishes.
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # upload binaries as release assets
+
+jobs:
+  publish:
+    name: Cross-compile & attach binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Gate: never ship a red build.
+      - name: Lint & test
+        run: make lint test
+
+      # Cross-compile a static binary per platform into ./bin (PLATFORMS default in the Makefile).
+      - name: Cross-compile
+        run: make release
+
+      # Checksums let consumers verify a downloaded binary against the release.
+      - name: Checksums
+        working-directory: bin
+        run: sha256sum hermod-* > checksums.txt
+
+      - name: Attach binaries to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" bin/hermod-* bin/checksums.txt --clobber
