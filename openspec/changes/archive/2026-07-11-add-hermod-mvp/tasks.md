@@ -56,5 +56,5 @@
 ## 9. End-to-end verification
 
 - [x] 9.1 Verify `hermod prod-box -n` prints a copy-pasteable plan reflecting true git identity and true sync state
-- [ ] 9.2 Manually verify the live loop against a real sandbox: create, flush, attach, detach-with-session-alive → pause, detach-with-session-gone → teardown
+- [x] 9.2 Manually verify the live loop against a real sandbox: create, flush, attach, detach-with-session-alive → pause, detach-with-session-gone → teardown
 - [x] 9.3 Confirm `go build ./...` and `go test ./...` are green and the README usage examples match actual behavior
