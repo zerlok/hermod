@@ -8,6 +8,19 @@ PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 # Everything a build depends on; a release binary older than any of these is stale.
 SOURCES := go.mod go.sum $(shell find . -name '*.go' -not -path './$(BIN_DIR)/*')
 
+# Where `go install` places the binary: honor GOBIN if set, else GOPATH/bin.
+ifdef GOBIN
+GO_BIN_DIR := $(GOBIN)
+else
+GO_BIN_DIR := $(shell go env GOPATH)/bin
+endif
+HERMOD := $(GO_BIN_DIR)/$(BINARY)
+
+# bash-completion (v2) lazy-loads per-command scripts from here by command name.
+XDG_DATA_HOME ?= $(HOME)/.local/share
+COMPLETION_DIR := $(XDG_DATA_HOME)/bash-completion/completions
+COMPLETION := $(COMPLETION_DIR)/$(BINARY)
+
 .DEFAULT_GOAL := build
 
 .PHONY: build
@@ -39,8 +52,16 @@ fmt-check: ## Fail if any file is not gofmt-clean
 	fi
 
 .PHONY: install
-install: ## Install to $GOBIN for local use
+install: $(HERMOD) $(COMPLETION) ## Install to $GOBIN and (re)generate bash completions
+
+# Install the hermod binary to $GOBIN
+$(HERMOD): $(SOURCES)
 	go install .
+
+# Generate completion script whenever the installed binary changes
+$(COMPLETION): $(HERMOD)
+	@mkdir -p $(@D)
+	$< completion bash > $@
 
 .PHONY: release
 release: $(foreach p,$(PLATFORMS),$(BIN_DIR)/$(BINARY)-$(subst /,-,$(p))) ## Cross-compile a static binary for every platform in PLATFORMS
