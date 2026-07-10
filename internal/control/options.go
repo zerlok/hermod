@@ -22,16 +22,13 @@ type Options struct {
 	Quiet     bool     // suppress step logging
 }
 
-// Option applies one setting to the Options being built. Run applies each in
-// turn; most just copy a value, while WithWorkdir carries the derivation.
+// Option applies one setting to the Options being built.
 type Option func(*Options)
 
 // WithWorkdir selects the directory to mirror and derives the sandbox path from
-// it. This is the option with extended logic: it resolves dir (defaulting to
-// cwd, expanding a leading ~, making it absolute against cwd), maps it to the
-// home-relative sandbox path, and — unless a session name is already set —
-// defaults the session to a dash-joined slug of that path so distinct projects
-// sharing a base name do not collide.
+// it. When no session name is set, it defaults the session to a dash-joined slug
+// of that path so distinct projects sharing a base name do not collide on one
+// tmux/Mutagen session.
 func WithWorkdir(dir, cwd, home string) Option {
 	return func(o *Options) {
 		if dir == "" {
@@ -62,7 +59,7 @@ func WithSession(name string) Option {
 // WithCommand sets the verbatim passthrough command run in the sandbox session.
 func WithCommand(cmd []string) Option { return func(o *Options) { o.Command = cmd } }
 
-// WithDryRun marks the run as a dry-run.
+// WithDryRun prints side-effecting commands instead of executing them.
 func WithDryRun(on bool) Option { return func(o *Options) { o.DryRun = on } }
 
 // WithQuiet suppresses step logging.

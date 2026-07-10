@@ -18,9 +18,9 @@ type local struct {
 }
 
 // NewLocal returns the leaf Shell that executes on this machine. When dryRun is
-// set, side-effecting commands are printed as a copy-pasteable shell line rather
-// than run; probes still execute for real, since a caller wanting a real probe
-// under dry-run builds a non-dry-run leaf for it.
+// set, commands are printed as a copy-pasteable shell line rather than run —
+// callers that need a probe to stay real under dry-run build a separate
+// non-dry-run leaf for it.
 func NewLocal(dryRun bool) Shell {
 	if dryRun {
 		return local{run: printTo(os.Stdout)}

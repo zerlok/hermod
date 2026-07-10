@@ -24,9 +24,8 @@ func Run(ctx context.Context, host string, opts ...Option) error {
 
 	logger := newLogger(o.Quiet)
 
-	// Two leaf shells: real always executes (plan-shaping probes stay true under
-	// dry-run); effective is dry-run-aware (side effects and the interactive
-	// attach). Each collaborator gets only the leaf it needs.
+	// real always executes, so plan-shaping probes stay true under dry-run;
+	// effective is dry-run-aware, for side effects and the interactive attach.
 	real := shell.NewLocal(false)
 	effective := shell.NewLocal(o.DryRun)
 
@@ -51,10 +50,15 @@ func Run(ctx context.Context, host string, opts ...Option) error {
 		return fmt.Errorf("open mirror: %w", err)
 	}
 
+	// Settling the mirror must outlive a cancelled ctx: a SIGINT during the attach
+	// cancels ctx and kills the attach, but the mirror still has to be paused or
+	// closed — never left leaking — so teardown runs on a detached context.
+	settle := context.WithoutCancel(ctx)
+
 	if err := session.Flush(ctx); err != nil {
 		// Setup failed before any work; still settle the mirror by liveness so it
 		// is never left leaking, then report the original failure.
-		_ = teardown(ctx, session, remote, logger)
+		_ = teardown(settle, session, remote, logger)
 		return fmt.Errorf("flush mirror: %w", err)
 	}
 
@@ -64,7 +68,7 @@ func Run(ctx context.Context, host string, opts ...Option) error {
 		logger.Printf("attach ended with error: %v", err)
 	}
 
-	return teardown(ctx, session, remote, logger)
+	return teardown(settle, session, remote, logger)
 }
 
 // teardown decides the mirror's fate from sandbox-session liveness alone: pause it
@@ -82,7 +86,12 @@ func teardown(ctx context.Context, session mirror.Session, sandbox sandbox.Sessi
 		return session.Pause(ctx)
 	}
 	logger.Printf("session gone → flushing then terminating mirror")
-	_ = session.Flush(ctx)
+	if err := session.Flush(ctx); err != nil {
+		// The final flush pushes any unsynced edits before terminate discards the
+		// session; a failure here risks losing them, so surface it. Termination
+		// still proceeds — a live "gone" session is a leak we must not keep.
+		logger.Printf("final flush before terminate failed: %v", err)
+	}
 	return session.Close(ctx)
 }
 

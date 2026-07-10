@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -22,10 +24,15 @@ type app struct {
 	home func() (string, error)
 }
 
-// Run builds and runs the root command, returning a process exit code.
+// Run builds and runs the root command, returning a process exit code. A
+// SIGINT/SIGTERM cancels the command context, so an interrupted attach unwinds
+// through the normal teardown path rather than leaving the mirror leaking.
 func Run() int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	a := app{run: control.Run, cwd: os.Getwd, home: os.UserHomeDir}
-	if err := newRootCmd(a).Execute(); err != nil {
+	if err := newRootCmd(a).ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "hermod:", err)
 		return 1
 	}

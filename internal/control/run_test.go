@@ -12,10 +12,17 @@ import (
 	"github.com/zerlok/hermod/internal/mirror"
 )
 
-// fakeMirror records the lifecycle methods invoked on it, in order.
-type fakeMirror struct{ calls []string }
+// fakeMirror records the lifecycle methods invoked on it, in order. flushErr, if
+// set, is returned from Flush to exercise the final-flush failure path.
+type fakeMirror struct {
+	calls    []string
+	flushErr error
+}
 
-func (m *fakeMirror) Flush(context.Context) error { m.calls = append(m.calls, "flush"); return nil }
+func (m *fakeMirror) Flush(context.Context) error {
+	m.calls = append(m.calls, "flush")
+	return m.flushErr
+}
 func (m *fakeMirror) Pause(context.Context) error { m.calls = append(m.calls, "pause"); return nil }
 func (m *fakeMirror) Close(context.Context) error { m.calls = append(m.calls, "close"); return nil }
 func (m *fakeMirror) Status(context.Context) (mirror.State, error) {
@@ -39,15 +46,17 @@ func TestTeardownByLiveness(t *testing.T) {
 		name      string
 		alive     bool
 		liveErr   error
+		flushErr  error
 		wantCalls []string
 	}{
-		{"alive pauses", true, nil, []string{"pause"}},
-		{"gone flushes then closes", false, nil, []string{"flush", "close"}},
-		{"ambiguous liveness pauses", false, errors.New("unreachable"), []string{"pause"}},
+		{"alive pauses", true, nil, nil, []string{"pause"}},
+		{"gone flushes then closes", false, nil, nil, []string{"flush", "close"}},
+		{"gone still closes when final flush fails", false, nil, errors.New("sync failed"), []string{"flush", "close"}},
+		{"ambiguous liveness pauses", false, errors.New("unreachable"), nil, []string{"pause"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := &fakeMirror{}
+			m := &fakeMirror{flushErr: tc.flushErr}
 			err := teardown(context.Background(), m, fakeSandbox{alive: tc.alive, liveErr: tc.liveErr}, log.New(io.Discard, "", 0))
 			if err != nil {
 				t.Fatalf("teardown() error: %v", err)
