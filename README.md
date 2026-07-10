@@ -60,10 +60,10 @@ The sandbox argument is an `~/.ssh/config` host alias (tab-completion offers you
 hosts). Everything after `--` is passed straight through to the remote command.
 
 ```bash
-hermod prod-box                     # mirror cwd, attach to a tmux session named after the dir
+hermod prod-box                     # mirror cwd, attach to a tmux session named after the dir path
 hermod prod-box -s my-session       # explicit session name for tmux + mutagen
 hermod prod-box -C ~/work/api       # mirror a directory other than the current one
-hermod prod-box -- claude --model opus     # pass args through to the agent CLI on the remote
+hermod prod-box -- claude --model opus     # pass args through to the agent CLI on the sandbox
 hermod prod-box -n                  # dry run: print the commands it would run, run nothing
 ```
 
@@ -86,11 +86,28 @@ is carried only as environment so your commits are attributed correctly on the r
 **Language:** Go (single binary, no runtime dependencies).
 
 ```bash
-go build ./...     # build the hermod binary
-go test ./...      # run the test suite
-go install .       # install to $GOBIN for local use
+make build      # compile the hermod binary into ./bin
+make test       # run the test suite
+make lint       # static checks (gofmt + go vet)
+make install    # install to $GOBIN for local use
 ```
+
+Run `make help` for the full list of targets.
 
 This repository is **spec-driven**: changes start as OpenSpec proposals under `openspec/`
 before implementation. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the domain model.
 
+### Project structure
+
+Packages are layered; dependencies only ever point downward.
+
+```
+main.go                  entrypoint
+internal/
+  cli/                   parse one invocation into functional options (cobra edge)
+  control/               resolve defaults, run sync → attach → pause/teardown, decide the branch
+  git/                   read local author identity to carry into the remote
+  mirror/                the Mutagen file mirror: open (create/resume), flush, pause, close
+  sandbox/               the tmux-over-ssh session: attach-or-create, liveness probe
+  shell/                 where a command runs (ssh/tmux decorators) and how (real vs printed leaf)
+```

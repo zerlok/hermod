@@ -28,16 +28,17 @@ missing values; the invocation alone determines the run.
 
 ### Requirement: Session name flag and default
 The CLI SHALL accept a `-s <name>` flag naming the tmux and Mutagen session. When `-s` is
-omitted, the CLI SHALL default the session name to the base name of the working directory being
-mirrored.
+omitted, the CLI SHALL default the session name to a slug of the mirrored directory's remote
+path (its home-relative path with separators replaced by dashes, or a full path slug when
+outside home), so distinct projects sharing a base name do not collide on one session.
 
 #### Scenario: Explicit session name
 - **WHEN** the user runs `hermod prod-box -s my-session`
 - **THEN** the resolved intent uses `my-session` as the session name for both tmux and Mutagen
 
-#### Scenario: Default session name from directory
-- **WHEN** the user runs `hermod prod-box` from a directory named `api`
-- **THEN** the resolved intent uses `api` as the session name
+#### Scenario: Default session name from directory path
+- **WHEN** the user runs `hermod prod-box` from `~/dev/repos/myproj`
+- **THEN** the resolved intent uses `dev-repos-myproj` as the session name
 
 ### Requirement: Working-directory flag and default
 The CLI SHALL accept a `-C <dir>` flag selecting the directory to mirror. When `-C` is omitted,
