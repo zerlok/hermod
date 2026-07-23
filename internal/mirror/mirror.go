@@ -78,6 +78,14 @@ func NewMutagenSession(ctx context.Context, exec, probe shell.Shell, cfg Config)
 		}
 		return m, nil
 	}
+	// Mutagen creates the sync root but not its parent directories; ensure the
+	// remote root (and any missing parents) exists before creating the session,
+	// otherwise a home-relative remote path with an absent parent stalls the sync.
+	if _, err := m.exec.Run(ctx, shell.Command{
+		Argv: []string{"ssh", cfg.Host, "mkdir", "-p", cfg.RemotePath},
+	}); err != nil {
+		return nil, err
+	}
 	_, err = m.exec.Run(ctx, shell.Command{
 		Argv: []string{"mutagen", "sync", "create", "--name", m.name, m.localPath, m.endpoint},
 	})
@@ -98,16 +106,27 @@ func (m *mutagen) verb(ctx context.Context, verb string) error {
 	return err
 }
 
-// Status reports the current sync state without mutating it. A missing session
-// is not an error: Mutagen exits non-zero when it cannot locate the named
-// session, which we read as Absent so the caller can create it.
+// Status reports the current sync state without mutating it. It reports Absent
+// only on positive confirmation that no session exists: a focused probe failure
+// is disambiguated with a list-all probe, and only a reachable daemon that lists
+// no such session is read as Absent. Any other failure is surfaced, so the caller
+// aborts opening rather than creating a new session over an existing one.
 func (m *mutagen) Status(ctx context.Context) (State, error) {
 	res, err := m.probe.Run(ctx, shell.Command{
 		Argv:    []string{"mutagen", "sync", "list", m.name},
 		Capture: true,
 	})
 	if err != nil {
-		return Absent, nil
+		// The focused query failed. Disambiguate: if a list-all probe succeeds the
+		// daemon is reachable and only our named session was missing (Absent);
+		// otherwise the failure is ambiguous (daemon down / transport) — surface it.
+		if _, allErr := m.probe.Run(ctx, shell.Command{
+			Argv:    []string{"mutagen", "sync", "list"},
+			Capture: true,
+		}); allErr == nil {
+			return Absent, nil
+		}
+		return Absent, err
 	}
 	if strings.Contains(res.Stdout, "Paused") {
 		return Paused, nil
