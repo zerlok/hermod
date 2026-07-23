@@ -66,6 +66,46 @@ func TestAttachComposesSshTmuxLine(t *testing.T) {
 	}
 }
 
+// TestReverseForwardOnInteractiveOnly asserts the notify -R spec rides the attach
+// ssh and never the liveness probe.
+func TestReverseForwardOnInteractiveOnly(t *testing.T) {
+	cases := []struct {
+		name           string
+		reverseForward string
+		wantInAttach   bool
+	}{
+		{"no spec leaves attach unchanged", "", false},
+		{"spec adds -R to attach", "/r/s.sock:/l/s.sock", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			attach := &recShell{}
+			NewSession(attach, Config{Host: "prod", Session: "api", Dir: "/home/u/api", ReverseForward: tc.reverseForward}).
+				Attach(context.Background())
+			hasR := containsArg(attach.got.Argv, "-R")
+			if hasR != tc.wantInAttach {
+				t.Errorf("attach argv -R present = %v, want %v (argv=%q)", hasR, tc.wantInAttach, attach.got.Argv)
+			}
+
+			probe := &recShell{}
+			NewSession(probe, Config{Host: "prod", Session: "api", ReverseForward: tc.reverseForward}).
+				IsActive(context.Background())
+			if containsArg(probe.got.Argv, "-R") {
+				t.Errorf("probe argv must never carry -R, got %q", probe.got.Argv)
+			}
+		})
+	}
+}
+
+func containsArg(argv []string, want string) bool {
+	for _, a := range argv {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestIsActive(t *testing.T) {
 	cases := []struct {
 		name      string

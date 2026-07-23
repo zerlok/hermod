@@ -19,11 +19,12 @@ type Session interface {
 
 // Config describes the session to prepare.
 type Config struct {
-	Host    string
-	Session string
-	Dir     string   // sandbox working directory
-	Command []string // passthrough command; nil runs the default shell
-	Env     []string // git identity carried into the session
+	Host           string
+	Session        string
+	Dir            string   // sandbox working directory
+	Command        []string // passthrough command; nil runs the default shell
+	Env            []string // git identity carried into the session
+	ReverseForward string   // opaque ssh -R spec for the notify back-channel; "" disables it
 }
 
 // sandbox is a tmux-over-ssh Session. It wraps the given inner (leaf) shell with
@@ -42,12 +43,19 @@ type sandbox struct {
 // inner (the effective, dry-run-aware shell: the attach is a side effect, and the
 // liveness probe follows a real attach). It does not attach.
 func NewSession(inner shell.Shell, cfg Config) Session {
+	// The reverse forward for the notify back-channel rides the interactive attach
+	// ssh only; the liveness probe never carries it. sandbox forwards an opaque -R
+	// spec the way it already forwards Env, and never imports the notify package.
+	var opts []shell.SSHOption
+	if cfg.ReverseForward != "" {
+		opts = append(opts, shell.WithReverseForward(cfg.ReverseForward))
+	}
 	return &sandbox{
 		session:     cfg.Session,
 		dir:         cfg.Dir,
 		command:     cfg.Command,
 		env:         cfg.Env,
-		interactive: shell.NewLoginShell(shell.NewTmux(shell.NewSSH(inner, cfg.Host, true), cfg.Session)),
+		interactive: shell.NewLoginShell(shell.NewTmux(shell.NewSSH(inner, cfg.Host, true, opts...), cfg.Session)),
 		probe:       shell.NewSSH(inner, cfg.Host, false),
 	}
 }

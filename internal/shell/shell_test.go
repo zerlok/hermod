@@ -25,17 +25,30 @@ func TestSSHRewrite(t *testing.T) {
 		name string
 		host string
 		tty  bool
+		opts []SSHOption
 		in   Command
 		want []string
 	}{
-		{"probe no tty", "prod", false, Command{Argv: []string{"tmux", "has-session", "-t", "api"}}, []string{"ssh", "prod", "tmux has-session -t api"}},
-		{"interactive tty", "prod", true, Command{Argv: []string{"tmux", "new-session", "-A"}}, []string{"ssh", "-t", "prod", "tmux new-session -A"}},
-		{"quotes sandbox arg with space", "box", false, Command{Argv: []string{"tmux", "new-session", "claude --model opus"}}, []string{"ssh", "box", "tmux new-session 'claude --model opus'"}},
+		{"probe no tty", "prod", false, nil, Command{Argv: []string{"tmux", "has-session", "-t", "api"}}, []string{"ssh", "prod", "tmux has-session -t api"}},
+		{"interactive tty", "prod", true, nil, Command{Argv: []string{"tmux", "new-session", "-A"}}, []string{"ssh", "-t", "prod", "tmux new-session -A"}},
+		{"quotes sandbox arg with space", "box", false, nil, Command{Argv: []string{"tmux", "new-session", "claude --model opus"}}, []string{"ssh", "box", "tmux new-session 'claude --model opus'"}},
+		{
+			"reverse forward after tty before host",
+			"prod", true, []SSHOption{WithReverseForward("/r/s.sock:/l/s.sock")},
+			Command{Argv: []string{"tmux", "attach"}},
+			[]string{"ssh", "-t", "-R", "/r/s.sock:/l/s.sock", "-o", "StreamLocalBindUnlink=yes", "-o", "StreamLocalBindMask=0177", "prod", "tmux attach"},
+		},
+		{
+			"two reverse forwards accumulate",
+			"prod", true, []SSHOption{WithReverseForward("/r/a.sock:/l/a.sock"), WithReverseForward("/r/b.sock:/l/b.sock")},
+			Command{Argv: []string{"tmux", "attach"}},
+			[]string{"ssh", "-t", "-R", "/r/a.sock:/l/a.sock", "-o", "StreamLocalBindUnlink=yes", "-o", "StreamLocalBindMask=0177", "-R", "/r/b.sock:/l/b.sock", "-o", "StreamLocalBindUnlink=yes", "-o", "StreamLocalBindMask=0177", "prod", "tmux attach"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			inner := &recShell{}
-			NewSSH(inner, tc.host, tc.tty).Run(context.Background(), tc.in)
+			NewSSH(inner, tc.host, tc.tty, tc.opts...).Run(context.Background(), tc.in)
 			if !reflect.DeepEqual(inner.got.Argv, tc.want) {
 				t.Errorf("argv = %q, want %q", inner.got.Argv, tc.want)
 			}

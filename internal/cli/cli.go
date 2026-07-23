@@ -9,17 +9,20 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
 
 	"github.com/zerlok/hermod/internal/control"
+	"github.com/zerlok/hermod/internal/notify"
 )
 
 // app holds the seams the root command depends on, injected so parsing and
 // hand-off can be tested without touching real hosts or the real environment.
 type app struct {
 	run  func(ctx context.Context, sandbox string, opts ...control.Option) error
+	send func(ctx context.Context, m notify.Message) error
 	cwd  func() (string, error)
 	home func() (string, error)
 }
@@ -31,7 +34,7 @@ func Run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	a := app{run: control.Run, cwd: os.Getwd, home: os.UserHomeDir}
+	a := app{run: control.Run, send: notify.Send, cwd: os.Getwd, home: os.UserHomeDir}
 	if err := newRootCmd(a).ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "hermod:", err)
 		return 1
@@ -41,10 +44,11 @@ func Run() int {
 
 func newRootCmd(a app) *cobra.Command {
 	var (
-		session string
-		dir     string
-		dryRun  bool
-		quiet   bool
+		session  string
+		dir      string
+		dryRun   bool
+		quiet    bool
+		notifyOn bool
 	)
 	cmd := &cobra.Command{
 		Use:   "hermod <sandbox> [flags] [-- <sandbox command>...]",
@@ -79,6 +83,7 @@ func newRootCmd(a app) *cobra.Command {
 				control.WithCommand(passthrough),
 				control.WithDryRun(dryRun),
 				control.WithQuiet(quiet),
+				control.WithNotify(notifyOn),
 			)
 		},
 	}
@@ -86,6 +91,35 @@ func newRootCmd(a app) *cobra.Command {
 	cmd.Flags().StringVarP(&dir, "directory", "C", "", "directory to mirror (default: current directory)")
 	cmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "print the commands that would run without executing side effects")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress step logging")
+	cmd.Flags().BoolVarP(&notifyOn, "notify", "N", false, "open a reverse tunnel so a sandbox process can raise a local desktop notification")
+	cmd.AddCommand(newNotifyCmd(a))
+	return cmd
+}
+
+// newNotifyCmd is the `hermod notify` sender, run on the sandbox to raise a
+// notification on the local machine over the session back-channel. It is a
+// sibling of the root run command and unaffected by the root's flags.
+func newNotifyCmd(a app) *cobra.Command {
+	var (
+		title   string
+		urgency string
+	)
+	cmd := &cobra.Command{
+		Use:           "notify [flags] <body>...",
+		Short:         "Send a desktop notification to the local machine over the session back-channel",
+		Args:          cobra.MinimumNArgs(1),
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.send(cmd.Context(), notify.Message{
+				Title:   title,
+				Urgency: urgency,
+				Body:    strings.Join(args, " "),
+			})
+		},
+	}
+	cmd.Flags().StringVarP(&title, "title", "t", "", "notification title (default: hermod)")
+	cmd.Flags().StringVarP(&urgency, "urgency", "u", "", "urgency: low, normal, or critical (default: normal)")
 	return cmd
 }
 

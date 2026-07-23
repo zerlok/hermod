@@ -20,6 +20,7 @@ type Options struct {
 	Command   []string // passthrough sandbox command; nil runs the default shell
 	DryRun    bool     // print side-effecting commands instead of executing them
 	Quiet     bool     // suppress step logging
+	Notify    bool     // open the reverse-SSH local-notification back-channel
 }
 
 // Option applies one setting to the Options being built.
@@ -64,6 +65,10 @@ func WithDryRun(on bool) Option { return func(o *Options) { o.DryRun = on } }
 
 // WithQuiet suppresses step logging.
 func WithQuiet(on bool) Option { return func(o *Options) { o.Quiet = on } }
+
+// WithNotify opens the reverse-SSH back-channel so a sandbox process can raise a
+// local desktop notification.
+func WithNotify(on bool) Option { return func(o *Options) { o.Notify = on } }
 
 // remoteDir maps a local project directory to a home-relative path on the
 // sandbox. A directory under the local home mirrors its home-relative path

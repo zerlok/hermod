@@ -64,6 +64,7 @@ hermod prod-box                     # mirror cwd, attach to a tmux session named
 hermod prod-box -s my-session       # explicit session name for tmux + mutagen
 hermod prod-box -C ~/work/api       # mirror a directory other than the current one
 hermod prod-box -- claude --model opus     # pass args through to the agent CLI on the sandbox
+hermod prod-box -N -- claude        # -N opens the notification back-channel (see below)
 hermod prod-box -n                  # dry run: print the commands it would run, run nothing
 ```
 
@@ -105,7 +106,40 @@ attribute your commits. Hermod does exactly those two things and stays out of ev
 
 Because Hermod is the process running *locally*, it is also the natural place to bridge signals
 back from the box to your desktop — turning a "done" from the remote into a native notification
-on the machine in front of you.
+on the machine in front of you. That is exactly what the notification back-channel does.
+
+## Notifications from the sandbox
+
+Terminal notification escapes (OSC 9/777) don't survive the `tmux → ssh` path, and some terminals
+(e.g. Ubuntu's GNOME Terminal) don't implement them at all — so a "your agent is done" from the
+box never reaches your desktop. Only a **local** process can raise a desktop notification, and
+Hermod is that process. The `-N` flag opens a back-channel for it:
+
+```bash
+hermod prod-box -N -- claude        # opens the reverse-SSH notification channel for the session
+```
+
+Then, from anywhere inside that session on the box, send a notification to your local desktop:
+
+```bash
+hermod notify done                          # toast on your local machine
+hermod notify --urgency critical "blocked"  # e.g. when the agent needs input
+```
+
+Wire it into an agent hook (`hermod notify done || true`) so a long run pings you when it finishes
+or gets stuck — even if you've switched to your browser.
+
+**How it works.** `-N` adds an `ssh -R` reverse forward on the attach connection, mapping a
+per-session unix socket on the box to one on your machine; Hermod listens locally and raises the
+toast (via `notify-send` on Linux or `osascript` on macOS) plus a sound. The socket lives in a
+`0700` directory on both ends, so only you can reach it. The socket path is exported into the
+session as `$HERMOD_NOTIFY_SOCK`.
+
+- **Requirements:** locally, `notify-send` (libnotify) on Linux — macOS needs nothing extra. On the
+  box, either the `hermod` binary (for `hermod notify`) or, with no install, `socat`:
+  `printf '%s' '{"body":"done"}' | socat - UNIX-CONNECT:"$HERMOD_NOTIFY_SOCK"`.
+- **Best-effort:** off by default, and it never affects your session — if the channel can't be set
+  up or a notification can't be raised, Hermod logs it and carries on.
 
 ## Development
 
