@@ -176,12 +176,14 @@ func TestDryRunLeafPrintsAndDoesNotExecute(t *testing.T) {
 
 func TestSubprocessCapture(t *testing.T) {
 	cases := []struct {
-		name string
-		argv []string
-		want string
+		name       string
+		argv       []string
+		wantStdout string
+		wantStderr string
 	}{
-		{"printf no newline", []string{"printf", "hello"}, "hello"},
-		{"echo with newline", []string{"echo", "sync-ok"}, "sync-ok\n"},
+		{"printf no newline", []string{"printf", "hello"}, "hello", ""},
+		{"echo with newline", []string{"echo", "sync-ok"}, "sync-ok\n", ""},
+		{"stderr captured separately", []string{"sh", "-c", "echo out; echo err >&2"}, "out\n", "err\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -189,8 +191,11 @@ func TestSubprocessCapture(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if res.Stdout != tc.want {
-				t.Errorf("Stdout = %q, want %q", res.Stdout, tc.want)
+			if res.Stdout != tc.wantStdout {
+				t.Errorf("Stdout = %q, want %q", res.Stdout, tc.wantStdout)
+			}
+			if res.Stderr != tc.wantStderr {
+				t.Errorf("Stderr = %q, want %q", res.Stderr, tc.wantStderr)
 			}
 		})
 	}

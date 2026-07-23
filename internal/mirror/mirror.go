@@ -106,26 +106,25 @@ func (m *mutagen) verb(ctx context.Context, verb string) error {
 	return err
 }
 
-// Status reports the current sync state without mutating it. It reports Absent
-// only on positive confirmation that no session exists: a focused probe failure
-// is disambiguated with a list-all probe, and only a reachable daemon that lists
-// no such session is read as Absent. Any other failure is surfaced, so the caller
-// aborts opening rather than creating a new session over an existing one.
+// notFoundMarker is what `mutagen sync list <name>` reports when no session
+// matches the name. It is the positive signal that a session is Absent, read
+// from the probe's own output rather than inferred from the exit status.
+const notFoundMarker = "unable to locate requested sessions"
+
+// Status reports the current sync state without mutating it. Absence is read
+// from the probe's own output: `mutagen sync list <name>` reports the not-found
+// marker when no such session exists, which we read as Absent so the caller can
+// create it. Any other failure is surfaced, so an ambiguous probe aborts opening
+// rather than creating a new session over an existing one.
 func (m *mutagen) Status(ctx context.Context) (State, error) {
 	res, err := m.probe.Run(ctx, shell.Command{
 		Argv:    []string{"mutagen", "sync", "list", m.name},
 		Capture: true,
 	})
+	if strings.Contains(res.Stdout, notFoundMarker) || strings.Contains(res.Stderr, notFoundMarker) {
+		return Absent, nil
+	}
 	if err != nil {
-		// The focused query failed. Disambiguate: if a list-all probe succeeds the
-		// daemon is reachable and only our named session was missing (Absent);
-		// otherwise the failure is ambiguous (daemon down / transport) — surface it.
-		if _, allErr := m.probe.Run(ctx, shell.Command{
-			Argv:    []string{"mutagen", "sync", "list"},
-			Capture: true,
-		}); allErr == nil {
-			return Absent, nil
-		}
 		return Absent, err
 	}
 	if strings.Contains(res.Stdout, "Paused") {

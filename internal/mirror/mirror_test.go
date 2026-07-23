@@ -4,62 +4,48 @@ import (
 	"context"
 	"errors"
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/zerlok/hermod/internal/shell"
 )
 
-// reply is a canned (result, error) a fake shell returns for a given argv.
+// reply is a canned (result, error) a fake shell returns.
 type reply struct {
 	ret shell.Result
 	err error
 }
 
-// recShell records every argv it runs and answers from a per-argv script keyed
-// by the joined argv, falling back to def when no script entry matches. The
-// script lets a single probe vary its response between the focused
-// `sync list <name>` query and the list-all `sync list` disambiguation.
+// recShell records every argv it runs and returns a canned result/error.
 type recShell struct {
-	def    reply
-	script map[string]reply
-	seen   [][]string
+	ret  shell.Result
+	err  error
+	seen [][]string
 }
 
 func (r *recShell) Run(_ context.Context, cmd shell.Command) (shell.Result, error) {
 	r.seen = append(r.seen, cmd.Argv)
-	if rp, ok := r.script[strings.Join(cmd.Argv, " ")]; ok {
-		return rp.ret, rp.err
-	}
-	return r.def.ret, r.def.err
+	return r.ret, r.err
 }
 
 func testConfig() Config {
 	return Config{Name: "api", Host: "prod-box", RemotePath: "dev/api", LocalPath: "/home/u/api"}
 }
 
-// probeScript wires a probe fake whose focused query keys on the config name and
-// whose list-all query keys on the bare `mutagen sync list`.
-func probeScript(focused, listAll reply) *recShell {
-	return &recShell{script: map[string]reply{
-		"mutagen sync list api": focused,
-		"mutagen sync list":     listAll,
-	}}
-}
+// notFound is the probe reply for a session Mutagen cannot locate: it carries
+// the not-found marker on stderr and the non-zero exit that accompanies it.
+var notFound = reply{ret: shell.Result{Stderr: notFoundMarker}, err: errors.New(notFoundMarker)}
 
 func TestNewMutagenSessionOpens(t *testing.T) {
-	probeErr := errors.New("mutagen daemon unavailable")
+	ambiguous := reply{err: errors.New("mutagen daemon unavailable")}
 	cases := []struct {
 		name     string
-		focused  reply
-		listAll  reply
+		probe    reply
 		wantErr  bool
 		wantExec [][]string
 	}{
 		{
-			name:    "absent provisions root then creates",
-			focused: reply{err: probeErr},
-			listAll: reply{},
+			name:  "absent provisions root then creates",
+			probe: notFound,
 			wantExec: [][]string{
 				{"ssh", "prod-box", "mkdir", "-p", "dev/api"},
 				{"mutagen", "sync", "create", "--name", "api", "/home/u/api", "prod-box:dev/api"},
@@ -67,18 +53,17 @@ func TestNewMutagenSessionOpens(t *testing.T) {
 		},
 		{
 			name:     "paused resumes without provisioning",
-			focused:  reply{ret: shell.Result{Stdout: "Name: api\nStatus: Paused\n"}},
+			probe:    reply{ret: shell.Result{Stdout: "Name: api\nStatus: Paused\n"}},
 			wantExec: [][]string{{"mutagen", "sync", "resume", "api"}},
 		},
 		{
 			name:     "running resumes without provisioning",
-			focused:  reply{ret: shell.Result{Stdout: "Name: api\nStatus: Watching for changes\n"}},
+			probe:    reply{ret: shell.Result{Stdout: "Name: api\nStatus: Watching for changes\n"}},
 			wantExec: [][]string{{"mutagen", "sync", "resume", "api"}},
 		},
 		{
 			name:     "ambiguous probe aborts open without create",
-			focused:  reply{err: probeErr},
-			listAll:  reply{err: probeErr},
+			probe:    ambiguous,
 			wantErr:  true,
 			wantExec: nil,
 		},
@@ -86,7 +71,7 @@ func TestNewMutagenSessionOpens(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			exec := &recShell{}
-			probe := probeScript(tc.focused, tc.listAll)
+			probe := &recShell{ret: tc.probe.ret, err: tc.probe.err}
 			_, err := NewMutagenSession(context.Background(), exec, probe, testConfig())
 			if tc.wantErr {
 				if err == nil {
@@ -117,7 +102,7 @@ func TestLifecycleArgv(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			exec := &recShell{}
 			// A running session resumes on open, leaving one prior side effect.
-			probe := probeScript(reply{ret: shell.Result{Stdout: "Status: Watching for changes"}}, reply{})
+			probe := &recShell{ret: shell.Result{Stdout: "Status: Watching for changes"}}
 			s, err := NewMutagenSession(ctx, exec, probe, testConfig())
 			if err != nil {
 				t.Fatalf("NewMutagenSession() error: %v", err)
@@ -134,23 +119,21 @@ func TestLifecycleArgv(t *testing.T) {
 }
 
 func TestStatusIsReadOnly(t *testing.T) {
-	probeErr := errors.New("mutagen daemon unavailable")
 	cases := []struct {
 		name    string
-		focused reply
-		listAll reply
+		probe   reply
 		want    State
 		wantErr bool
 	}{
-		{"focused success paused", reply{ret: shell.Result{Stdout: "Status: Paused\n"}}, reply{}, Paused, false},
-		{"focused success running", reply{ret: shell.Result{Stdout: "Status: Watching for changes\n"}}, reply{}, Running, false},
-		{"focused error, list-all confirms absent", reply{err: probeErr}, reply{}, Absent, false},
-		{"focused error, list-all error surfaced", reply{err: probeErr}, reply{err: probeErr}, Absent, true},
+		{"not-found marker reads absent", notFound, Absent, false},
+		{"paused", reply{ret: shell.Result{Stdout: "Status: Paused\n"}}, Paused, false},
+		{"running", reply{ret: shell.Result{Stdout: "Status: Watching for changes\n"}}, Running, false},
+		{"ambiguous error surfaced", reply{err: errors.New("mutagen daemon unavailable")}, Absent, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			exec := &recShell{}
-			probe := probeScript(tc.focused, tc.listAll)
+			probe := &recShell{ret: tc.probe.ret, err: tc.probe.err}
 			// Query Status directly on the concrete type to avoid the open side
 			// effects a constructed Session would issue first.
 			m := &mutagen{name: "api", probe: probe, exec: exec}

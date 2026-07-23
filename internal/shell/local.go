@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -49,8 +50,10 @@ func runSubprocess(ctx context.Context, cmd Command) (Result, error) {
 		c.Env = append(os.Environ(), cmd.Env...)
 	}
 	if cmd.Capture {
-		out, err := c.Output()
-		return Result{Stdout: string(out)}, err
+		var stdout, stderr bytes.Buffer
+		c.Stdout, c.Stderr = &stdout, &stderr
+		err := c.Run()
+		return Result{Stdout: stdout.String(), Stderr: stderr.String()}, err
 	}
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return Result{}, c.Run()

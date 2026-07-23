@@ -19,6 +19,7 @@ type Command struct {
 // Result is the outcome of running a Command.
 type Result struct {
 	Stdout string // populated only when Command.Capture was set
+	Stderr string // populated only when Command.Capture was set
 }
 
 // Shell runs a command in a particular place. Decorators wrap the argv and call
