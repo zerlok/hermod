@@ -40,11 +40,15 @@ Absence is read from the focused probe's **own output**, not from a separate liv
 
 1. Run the focused query `mutagen sync list <name>`, capturing stdout **and stderr**.
 2. If the output carries the not-found marker → `Absent`.
-3. Otherwise, if the command errored → surface the error (ambiguous: daemon down / transport).
+3. Otherwise, if the command errored → return `Unknown` and surface the error (ambiguous: daemon
+   down / transport). The state is **not** `Absent` — an error that is not the not-found marker must
+   never be read as "no session" and trigger a create over an existing one.
 4. Otherwise the session exists — parse `Paused` vs `Running` from stdout, unchanged.
 
-This required exposing captured stderr on `shell.Result` (Mutagen prints the marker on stderr); the
-leaf shell now captures stdout and stderr separately under `Capture`.
+`State` gains an `Unknown` zero value for step 3, so a State is never taken for `Absent` without a
+positive not-found signal. This also required exposing captured stderr on `shell.Result` (Mutagen
+prints the marker on stderr); the leaf shell now captures stdout and stderr separately under
+`Capture`.
 
 - **Alternative — a second `mutagen sync list` (list-all) probe to disambiguate** (the first
   implementation): reviewer feedback on PR #6 called out using "does the daemon list at all" as an

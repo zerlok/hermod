@@ -128,7 +128,9 @@ func TestStatusIsReadOnly(t *testing.T) {
 		{"not-found marker reads absent", notFound, Absent, false},
 		{"paused", reply{ret: shell.Result{Stdout: "Status: Paused\n"}}, Paused, false},
 		{"running", reply{ret: shell.Result{Stdout: "Status: Watching for changes\n"}}, Running, false},
-		{"ambiguous error surfaced", reply{err: errors.New("mutagen daemon unavailable")}, Absent, true},
+		// An error that is not the not-found marker is Unknown, never Absent, so it
+		// can't be mistaken for "no session" and trigger a create over an existing one.
+		{"ambiguous error is unknown, not absent", reply{err: errors.New("mutagen daemon unavailable")}, Unknown, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -138,17 +140,11 @@ func TestStatusIsReadOnly(t *testing.T) {
 			// effects a constructed Session would issue first.
 			m := &mutagen{name: "api", probe: probe, exec: exec}
 			got, err := m.Status(context.Background())
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("Status() error = nil, want non-nil (ambiguous probe must surface)")
-				}
-			} else {
-				if err != nil {
-					t.Fatalf("Status() error: %v", err)
-				}
-				if got != tc.want {
-					t.Errorf("State = %v, want %v", got, tc.want)
-				}
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Status() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Errorf("State = %v, want %v", got, tc.want)
 			}
 			if len(exec.seen) != 0 {
 				t.Errorf("status mutated state via %v", exec.seen)

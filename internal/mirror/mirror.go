@@ -13,8 +13,12 @@ import (
 type State int
 
 const (
+	// Unknown means the state could not be determined — the probe failed for a
+	// reason other than the session being absent. It is the zero value, so a
+	// State is never taken for Absent without a positive not-found signal.
+	Unknown State = iota
 	// Absent means no session exists for the name.
-	Absent State = iota
+	Absent
 	// Paused means the session exists but synchronization is suspended.
 	Paused
 	// Running means the session exists and is synchronizing.
@@ -125,7 +129,10 @@ func (m *mutagen) Status(ctx context.Context) (State, error) {
 		return Absent, nil
 	}
 	if err != nil {
-		return Absent, err
+		// A failure that is not the not-found marker is ambiguous (daemon down /
+		// transport): the state is Unknown, not Absent — never let it be read as
+		// "no session" and trigger a create over an existing one.
+		return Unknown, err
 	}
 	if strings.Contains(res.Stdout, "Paused") {
 		return Paused, nil
