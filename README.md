@@ -81,6 +81,32 @@ Hermod is the connection, not the server.
 - It does **not** use git as a transport between hosts. Files move over Mutagen; git identity
 is carried only as environment so your commits are attributed correctly on the remote.
 
+## Where Hermod fits
+
+Hermod is the **sync-and-attach layer**, not a place to run your agents. It gets you — your
+files and your git identity — onto the box and manages the sync lifecycle around one session.
+What you run *on* the box is a separate concern: a bare shell, tmux, a build, or an agent
+multiplexer like [herdr](https://herdr.dev). Those own a **different layer**, so they don't
+compete with Hermod — they compose with it:
+
+```bash
+hermod prod-box -- herdr      # Hermod mirrors + carries identity; herdr runs the herd on the box
+```
+
+A multiplexer manages *sessions and agents*; it does not mirror your working tree to the box or
+attribute your commits. Hermod does exactly those two things and stays out of everything else:
+
+- **Files, not a screen.** Hermod mirrors your working directory both ways, so your local editor
+  and tooling operate on real files — and it **pauses or tears the sync down on detach**, keyed
+  on whether the session outlived you. A multiplexer's "remote" mode streams a remote terminal
+  and leaves file sync for you to wire up.
+- **Commits that are yours.** Hermod carries your git identity into the session, so commits made
+  on the box are attributed to you — something a multiplexer never touches.
+
+Because Hermod is the process running *locally*, it is also the natural place to bridge signals
+back from the box to your desktop — turning a "done" from the remote into a native notification
+on the machine in front of you.
+
 ## Development
 
 **Language:** Go (single binary, no runtime dependencies).
