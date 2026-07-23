@@ -28,27 +28,31 @@ func NewNotifier(sh shell.Shell) Notifier {
 
 // linuxNotifier raises a toast via notify-send and plays a sound via paplay. The
 // untrusted body is an argv element run with no intermediate shell, so it cannot
-// inject a command.
+// inject a command; a `--` end-of-options guard stops a leading-dash title or body
+// from being parsed as a notify-send option. Commands run with Capture set so their
+// stdio is buffered (and discarded) rather than bleeding into the live attach
+// terminal the notification fires over.
 type linuxNotifier struct{ sh shell.Shell }
 
 func (n linuxNotifier) Notify(ctx context.Context, m Message) error {
-	_, _ = n.sh.Run(ctx, shell.Command{Argv: []string{
+	_, _ = n.sh.Run(ctx, shell.Command{Capture: true, Argv: []string{
 		"notify-send", "--app-name=hermod", "--urgency=" + urgency(m.Urgency),
-		orDefault(m.Title, "hermod"), m.Body,
+		"--", orDefault(m.Title, "hermod"), m.Body,
 	}})
-	_, _ = n.sh.Run(ctx, shell.Command{Argv: []string{"paplay", soundFile}})
+	_, _ = n.sh.Run(ctx, shell.Command{Capture: true, Argv: []string{"paplay", soundFile}})
 	return nil
 }
 
 // darwinNotifier raises a toast (with a sound) via osascript. The body and title
-// are quoted into AppleScript string literals by asAppleStr.
+// are quoted into AppleScript string literals by asAppleStr. Capture keeps its
+// stdio off the attach terminal.
 type darwinNotifier struct{ sh shell.Shell }
 
 func (n darwinNotifier) Notify(ctx context.Context, m Message) error {
 	script := "display notification " + asAppleStr(m.Body) +
 		" with title " + asAppleStr(orDefault(m.Title, "hermod")) +
 		` sound name "Glass"`
-	_, _ = n.sh.Run(ctx, shell.Command{Argv: []string{"osascript", "-e", script}})
+	_, _ = n.sh.Run(ctx, shell.Command{Capture: true, Argv: []string{"osascript", "-e", script}})
 	return nil
 }
 

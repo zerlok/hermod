@@ -103,6 +103,16 @@ unconditionally; the flow continues as a plain session. `stopNotify` sits before
   `HERMOD_NOTIFY_SOCK`; documented, and `hermod notify` reports it clearly.
 - **Extra ssh options + one remote probe per notify-enabled run** → negligible, and only when `-N`
   is set; with `-N` off, none of this code runs.
+- **`notify` is a reserved subcommand name** → because `hermod notify …` is the sender subcommand,
+  a sandbox host aliased literally `notify` cannot be reached as `hermod notify`; cobra routes the
+  word to the subcommand. This is inherent to giving the sender a verb, and `notify` is by far the
+  most natural one; treated as a known, documented limitation rather than reworked into a `run`
+  subcommand that would spoil the primary `hermod <host>` ergonomics.
+- **Remote-base probe output is validated before use** → the probe result is spliced into the
+  `ssh -R <remoteSock>:<localSock>` spec as a raw argv element, where ssh's own forward parser
+  splits on `:`. `probeRemoteBase` therefore rejects a base that is not a clean absolute path (no
+  `:` or whitespace), degrading to a plain session, so a surprising remote environment cannot alter
+  the forward's meaning.
 
 ## Open Questions
 

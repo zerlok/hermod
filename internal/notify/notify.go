@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // EnvSock names the environment variable carrying the remote socket path into the
@@ -24,6 +25,10 @@ const EnvSock = "HERMOD_NOTIFY_SOCK"
 
 // maxMessage bounds a single message read so a rogue sender cannot exhaust memory.
 const maxMessage = 8 << 10
+
+// readTimeout bounds a single connection's read so a peer that connects but never
+// sends a complete message cannot wedge the channel or leak its handler goroutine.
+const readTimeout = 5 * time.Second
 
 // Message is the entire wire payload — deliberately tiny, and the single source of
 // truth for both the on-box sender and the local listener.
@@ -106,7 +111,9 @@ func (c *Channel) Listen(ctx context.Context) (stop func() error, err error) {
 			if err != nil {
 				return // listener closed
 			}
-			c.handle(ctx, conn)
+			// Handle in its own goroutine so a slow or stalled peer cannot starve
+			// Accept and wedge the channel for the rest of the session.
+			go c.handle(ctx, conn)
 		}
 	}()
 	return stop, nil
@@ -114,9 +121,11 @@ func (c *Channel) Listen(ctx context.Context) (stop func() error, err error) {
 
 // handle reads one bounded message from conn and dispatches it. A malformed,
 // oversized, or empty-body message is dropped without a notification, and no error
-// escapes to affect the session.
+// escapes to affect the session. A read deadline bounds a stalled sender so this
+// goroutine always returns.
 func (c *Channel) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 	data, _ := io.ReadAll(io.LimitReader(conn, maxMessage))
 	var m Message
 	if err := json.Unmarshal(data, &m); err != nil || m.Body == "" {

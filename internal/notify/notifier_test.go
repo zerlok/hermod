@@ -24,19 +24,23 @@ func TestLinuxNotifierArgv(t *testing.T) {
 		want [][]string
 	}{
 		{"defaults title and urgency", Message{Body: "done"}, [][]string{
-			{"notify-send", "--app-name=hermod", "--urgency=normal", "hermod", "done"},
+			{"notify-send", "--app-name=hermod", "--urgency=normal", "--", "hermod", "done"},
 			{"paplay", soundFile},
 		}},
 		{"explicit title and critical urgency", Message{Title: "agent", Body: "blocked", Urgency: "critical"}, [][]string{
-			{"notify-send", "--app-name=hermod", "--urgency=critical", "agent", "blocked"},
+			{"notify-send", "--app-name=hermod", "--urgency=critical", "--", "agent", "blocked"},
 			{"paplay", soundFile},
 		}},
 		{"low urgency preserved", Message{Body: "x", Urgency: "low"}, [][]string{
-			{"notify-send", "--app-name=hermod", "--urgency=low", "hermod", "x"},
+			{"notify-send", "--app-name=hermod", "--urgency=low", "--", "hermod", "x"},
 			{"paplay", soundFile},
 		}},
 		{"unknown urgency normalises to normal", Message{Body: "x", Urgency: "bogus"}, [][]string{
-			{"notify-send", "--app-name=hermod", "--urgency=normal", "hermod", "x"},
+			{"notify-send", "--app-name=hermod", "--urgency=normal", "--", "hermod", "x"},
+			{"paplay", soundFile},
+		}},
+		{"leading-dash title is not parsed as an option", Message{Title: "--icon=/etc/passwd", Body: "x"}, [][]string{
+			{"notify-send", "--app-name=hermod", "--urgency=normal", "--", "--icon=/etc/passwd", "x"},
 			{"paplay", soundFile},
 		}},
 	}

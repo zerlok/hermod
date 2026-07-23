@@ -84,7 +84,8 @@ func TestListenDispatch(t *testing.T) {
 		{"raw urgency passes through unnormalised", `{"body":"b","urgency":"bogus"}`, Message{Body: "b", Urgency: "bogus"}, false},
 		{"missing body dropped", `{"title":"t"}`, Message{}, true},
 		{"malformed json dropped", `{not json`, Message{}, true},
-		{"oversized dropped", `{"body":"` + strings.Repeat("x", 9000) + `"}`, Message{}, true},
+		{"large body just under the cap dispatches", `{"body":"` + strings.Repeat("x", maxMessage-32) + `"}`, Message{Body: strings.Repeat("x", maxMessage-32)}, false},
+		{"body over the cap is truncated and dropped", `{"body":"` + strings.Repeat("x", maxMessage) + `"}`, Message{}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

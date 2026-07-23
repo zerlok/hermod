@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -145,6 +146,32 @@ func TestOpenNotifyProvisions(t *testing.T) {
 	}
 }
 
+// TestOpenNotifyUniquePerSession asserts the per-session token gives two runs to
+// the same host distinct socket names, so concurrent sessions never collide.
+func TestOpenNotifyUniquePerSession(t *testing.T) {
+	cases := []struct {
+		name string
+	}{
+		{"two opens yield distinct socket names"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := cannedShell{stdout: "/run/user/1000"}
+			a, err := openNotify(context.Background(), probe, &recLeaf{}, "prod", discardLog())
+			if err != nil {
+				t.Fatalf("openNotify() a: %v", err)
+			}
+			b, err := openNotify(context.Background(), probe, &recLeaf{}, "prod", discardLog())
+			if err != nil {
+				t.Fatalf("openNotify() b: %v", err)
+			}
+			if a.ReverseSpec() == b.ReverseSpec() {
+				t.Errorf("expected distinct per-session socket names, both were %q", a.ReverseSpec())
+			}
+		})
+	}
+}
+
 // TestSetupNotify asserts the best-effort wiring: off is a pure passthrough; on
 // appends the address env and a spec and binds a listener; dry-run appends env and
 // a spec but binds nothing; a probe failure degrades to a plain session.
@@ -157,11 +184,12 @@ func TestSetupNotify(t *testing.T) {
 		wantEnvKey bool
 		wantSpec   bool
 		wantBound  bool
+		wantNote   bool
 	}{
-		{"notify off is passthrough", Options{Sandbox: "prod"}, cannedShell{stdout: "/run/user/1000"}, false, false, false},
-		{"notify on appends env, spec, binds", Options{Sandbox: "prod", Notify: true}, cannedShell{stdout: "/run/user/1000"}, true, true, true},
-		{"dry-run appends env and spec, binds nothing", Options{Sandbox: "prod", Notify: true, DryRun: true}, cannedShell{stdout: "/run/user/1000"}, true, true, false},
-		{"probe failure degrades to plain", Options{Sandbox: "prod", Notify: true}, cannedShell{err: errors.New("unreachable")}, false, false, false},
+		{"notify off is passthrough", Options{Sandbox: "prod"}, cannedShell{stdout: "/run/user/1000"}, false, false, false, false},
+		{"notify on appends env, spec, binds", Options{Sandbox: "prod", Notify: true}, cannedShell{stdout: "/run/user/1000"}, true, true, true, false},
+		{"dry-run appends env and spec, binds nothing", Options{Sandbox: "prod", Notify: true, DryRun: true}, cannedShell{stdout: "/run/user/1000"}, true, true, false, true},
+		{"probe failure degrades to plain", Options{Sandbox: "prod", Notify: true}, cannedShell{err: errors.New("unreachable")}, false, false, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -173,8 +201,13 @@ func TestSetupNotify(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = os.RemoveAll(tmp) })
 			t.Setenv("XDG_RUNTIME_DIR", tmp)
-			env, spec, stop := setupNotify(context.Background(), tc.probe, &recLeaf{}, tc.opts, base, discardLog())
+			var logbuf bytes.Buffer
+			env, spec, stop := setupNotify(context.Background(), tc.probe, &recLeaf{}, tc.opts, base, log.New(&logbuf, "", 0))
 			defer func() { _ = stop() }()
+
+			if gotNote := strings.Contains(logbuf.String(), "would listen"); gotNote != tc.wantNote {
+				t.Errorf("dry-run listener note logged = %v, want %v (log=%q)", gotNote, tc.wantNote, logbuf.String())
+			}
 
 			if len(env) == 0 || env[0] != base[0] {
 				t.Errorf("base env not preserved: %q", env)

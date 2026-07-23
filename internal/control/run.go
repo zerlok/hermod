@@ -197,6 +197,13 @@ func probeRemoteBase(ctx context.Context, real shell.Shell, host string) (string
 	if base == "" {
 		return "", errors.New("empty remote runtime dir")
 	}
+	// The base flows into the `ssh -R <remoteSock>:<localSock>` spec as a raw argv
+	// element (not a shell word), where ssh's own forward parser splits on ':'. A
+	// colon or whitespace in the base could change the forward's meaning, so require
+	// a clean absolute path and otherwise degrade to a plain session.
+	if !filepath.IsAbs(base) || strings.ContainsAny(base, ": \t\n") {
+		return "", fmt.Errorf("unexpected remote runtime dir %q", base)
+	}
 	return base, nil
 }
 
