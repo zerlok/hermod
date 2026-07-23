@@ -9,6 +9,12 @@ import (
 	"github.com/zerlok/hermod/internal/shell"
 )
 
+// reply is a canned (result, error) a fake shell returns.
+type reply struct {
+	ret shell.Result
+	err error
+}
+
 // recShell records every argv it runs and returns a canned result/error.
 type recShell struct {
 	ret  shell.Result
@@ -25,27 +31,57 @@ func testConfig() Config {
 	return Config{Name: "api", Host: "prod-box", RemotePath: "dev/api", LocalPath: "/home/u/api"}
 }
 
+// notFound is the probe reply for a session Mutagen cannot locate: it carries
+// the not-found marker on stderr and the non-zero exit that accompanies it.
+var notFound = reply{ret: shell.Result{Stderr: notFoundMarker}, err: errors.New(notFoundMarker)}
+
 func TestNewMutagenSessionOpens(t *testing.T) {
-	notFound := errors.New("unable to locate requested sessions")
+	ambiguous := reply{err: errors.New("mutagen daemon unavailable")}
 	cases := []struct {
 		name     string
-		probeRet shell.Result
-		probeErr error
-		want     []string
+		probe    reply
+		wantErr  bool
+		wantExec [][]string
 	}{
-		{"absent creates", shell.Result{}, notFound, []string{"mutagen", "sync", "create", "--name", "api", "/home/u/api", "prod-box:dev/api"}},
-		{"paused resumes", shell.Result{Stdout: "Name: api\nStatus: Paused\n"}, nil, []string{"mutagen", "sync", "resume", "api"}},
-		{"running resumes", shell.Result{Stdout: "Name: api\nStatus: Watching for changes\n"}, nil, []string{"mutagen", "sync", "resume", "api"}},
+		{
+			name:  "absent provisions root then creates",
+			probe: notFound,
+			wantExec: [][]string{
+				{"ssh", "prod-box", "mkdir", "-p", "dev/api"},
+				{"mutagen", "sync", "create", "--name", "api", "/home/u/api", "prod-box:dev/api"},
+			},
+		},
+		{
+			name:     "paused resumes without provisioning",
+			probe:    reply{ret: shell.Result{Stdout: "Name: api\nStatus: Paused\n"}},
+			wantExec: [][]string{{"mutagen", "sync", "resume", "api"}},
+		},
+		{
+			name:     "running resumes without provisioning",
+			probe:    reply{ret: shell.Result{Stdout: "Name: api\nStatus: Watching for changes\n"}},
+			wantExec: [][]string{{"mutagen", "sync", "resume", "api"}},
+		},
+		{
+			name:     "ambiguous probe aborts open without create",
+			probe:    ambiguous,
+			wantErr:  true,
+			wantExec: nil,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			exec := &recShell{}
-			probe := &recShell{ret: tc.probeRet, err: tc.probeErr}
-			if _, err := NewMutagenSession(context.Background(), exec, probe, testConfig()); err != nil {
+			probe := &recShell{ret: tc.probe.ret, err: tc.probe.err}
+			_, err := NewMutagenSession(context.Background(), exec, probe, testConfig())
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("NewMutagenSession() error = nil, want non-nil")
+				}
+			} else if err != nil {
 				t.Fatalf("NewMutagenSession() error: %v", err)
 			}
-			if len(exec.seen) != 1 || !reflect.DeepEqual(exec.seen[0], tc.want) {
-				t.Errorf("open side effect = %v, want single %v", exec.seen, tc.want)
+			if !reflect.DeepEqual(exec.seen, tc.wantExec) {
+				t.Errorf("open side effects = %v, want %v", exec.seen, tc.wantExec)
 			}
 		})
 	}
@@ -83,27 +119,29 @@ func TestLifecycleArgv(t *testing.T) {
 }
 
 func TestStatusIsReadOnly(t *testing.T) {
-	notFound := errors.New("unable to locate requested sessions")
 	cases := []struct {
-		name     string
-		probeRet shell.Result
-		probeErr error
-		want     State
+		name    string
+		probe   reply
+		want    State
+		wantErr bool
 	}{
-		{"absent", shell.Result{}, notFound, Absent},
-		{"paused", shell.Result{Stdout: "Status: Paused\n"}, nil, Paused},
-		{"running", shell.Result{Stdout: "Status: Watching for changes\n"}, nil, Running},
+		{"not-found marker reads absent", notFound, Absent, false},
+		{"paused", reply{ret: shell.Result{Stdout: "Status: Paused\n"}}, Paused, false},
+		{"running", reply{ret: shell.Result{Stdout: "Status: Watching for changes\n"}}, Running, false},
+		// An error that is not the not-found marker is Unknown, never Absent, so it
+		// can't be mistaken for "no session" and trigger a create over an existing one.
+		{"ambiguous error is unknown, not absent", reply{err: errors.New("mutagen daemon unavailable")}, Unknown, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			exec := &recShell{}
-			probe := &recShell{ret: tc.probeRet, err: tc.probeErr}
+			probe := &recShell{ret: tc.probe.ret, err: tc.probe.err}
 			// Query Status directly on the concrete type to avoid the open side
 			// effects a constructed Session would issue first.
 			m := &mutagen{name: "api", probe: probe, exec: exec}
 			got, err := m.Status(context.Background())
-			if err != nil {
-				t.Fatalf("Status() error: %v", err)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Status() error = %v, wantErr %v", err, tc.wantErr)
 			}
 			if got != tc.want {
 				t.Errorf("State = %v, want %v", got, tc.want)

@@ -13,8 +13,12 @@ import (
 type State int
 
 const (
+	// Unknown means the state could not be determined — the probe failed for a
+	// reason other than the session being absent. It is the zero value, so a
+	// State is never taken for Absent without a positive not-found signal.
+	Unknown State = iota
 	// Absent means no session exists for the name.
-	Absent State = iota
+	Absent
 	// Paused means the session exists but synchronization is suspended.
 	Paused
 	// Running means the session exists and is synchronizing.
@@ -78,6 +82,14 @@ func NewMutagenSession(ctx context.Context, exec, probe shell.Shell, cfg Config)
 		}
 		return m, nil
 	}
+	// Mutagen creates the sync root but not its parent directories; ensure the
+	// remote root (and any missing parents) exists before creating the session,
+	// otherwise a home-relative remote path with an absent parent stalls the sync.
+	if _, err := m.exec.Run(ctx, shell.Command{
+		Argv: []string{"ssh", cfg.Host, "mkdir", "-p", cfg.RemotePath},
+	}); err != nil {
+		return nil, err
+	}
 	_, err = m.exec.Run(ctx, shell.Command{
 		Argv: []string{"mutagen", "sync", "create", "--name", m.name, m.localPath, m.endpoint},
 	})
@@ -98,16 +110,29 @@ func (m *mutagen) verb(ctx context.Context, verb string) error {
 	return err
 }
 
-// Status reports the current sync state without mutating it. A missing session
-// is not an error: Mutagen exits non-zero when it cannot locate the named
-// session, which we read as Absent so the caller can create it.
+// notFoundMarker is what `mutagen sync list <name>` reports when no session
+// matches the name. It is the positive signal that a session is Absent, read
+// from the probe's own output rather than inferred from the exit status.
+const notFoundMarker = "unable to locate requested sessions"
+
+// Status reports the current sync state without mutating it. Absence is read
+// from the probe's own output: `mutagen sync list <name>` reports the not-found
+// marker when no such session exists, which we read as Absent so the caller can
+// create it. Any other failure is surfaced, so an ambiguous probe aborts opening
+// rather than creating a new session over an existing one.
 func (m *mutagen) Status(ctx context.Context) (State, error) {
 	res, err := m.probe.Run(ctx, shell.Command{
 		Argv:    []string{"mutagen", "sync", "list", m.name},
 		Capture: true,
 	})
-	if err != nil {
+	if strings.Contains(res.Stdout, notFoundMarker) || strings.Contains(res.Stderr, notFoundMarker) {
 		return Absent, nil
+	}
+	if err != nil {
+		// A failure that is not the not-found marker is ambiguous (daemon down /
+		// transport): the state is Unknown, not Absent — never let it be read as
+		// "no session" and trigger a create over an existing one.
+		return Unknown, err
 	}
 	if strings.Contains(res.Stdout, "Paused") {
 		return Paused, nil
