@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -96,100 +95,24 @@ func TestTeardownByLiveness(t *testing.T) {
 	}
 }
 
-// TestOpenNotifyProvisions asserts openNotify probes the remote base (real leaf),
-// creates the remote dir via the effective leaf, and derives matching socket
-// addresses. The socket basename carries a random token, so the deterministic
-// parts (the mkdir argv, the remote dir prefix, matching basenames) are asserted.
-func TestOpenNotifyProvisions(t *testing.T) {
-	cases := []struct {
-		name          string
-		remoteBase    string
-		host          string
-		wantMkdir     []string
-		wantRemotePre string
-	}{
-		{
-			"xdg runtime dir", "/run/user/1000\n", "prod",
-			[]string{"ssh", "prod", "mkdir -p -m 700 /run/user/1000/hermod"},
-			"/run/user/1000/hermod/hermod-notify-",
-		},
-		{
-			"home fallback base", "/home/u/.hermod/run", "box",
-			[]string{"ssh", "box", "mkdir -p -m 700 /home/u/.hermod/run/hermod"},
-			"/home/u/.hermod/run/hermod/hermod-notify-",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			eff := &recLeaf{}
-			ch, err := openNotify(context.Background(), cannedShell{stdout: tc.remoteBase}, eff, tc.host, discardLog())
-			if err != nil {
-				t.Fatalf("openNotify() error: %v", err)
-			}
-			if !reflect.DeepEqual(eff.got.Argv, tc.wantMkdir) {
-				t.Errorf("mkdir argv = %q, want %q", eff.got.Argv, tc.wantMkdir)
-			}
-			remote, local, found := strings.Cut(ch.ReverseSpec(), ":")
-			if !found {
-				t.Fatalf("ReverseSpec() = %q, want remote:local", ch.ReverseSpec())
-			}
-			if !strings.HasPrefix(remote, tc.wantRemotePre) || !strings.HasSuffix(remote, ".sock") {
-				t.Errorf("remote sock = %q, want prefix %q and .sock suffix", remote, tc.wantRemotePre)
-			}
-			if filepath.Base(local) != filepath.Base(remote) {
-				t.Errorf("local/remote basenames differ: %q vs %q", filepath.Base(local), filepath.Base(remote))
-			}
-			if want := []string{notify.EnvSock + "=" + remote}; !reflect.DeepEqual(ch.Env(), want) {
-				t.Errorf("Env() = %q, want %q", ch.Env(), want)
-			}
-		})
-	}
-}
-
-// TestOpenNotifyUniquePerSession asserts the per-session token gives two runs to
-// the same host distinct socket names, so concurrent sessions never collide.
-func TestOpenNotifyUniquePerSession(t *testing.T) {
-	cases := []struct {
-		name string
-	}{
-		{"two opens yield distinct socket names"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			probe := cannedShell{stdout: "/run/user/1000"}
-			a, err := openNotify(context.Background(), probe, &recLeaf{}, "prod", discardLog())
-			if err != nil {
-				t.Fatalf("openNotify() a: %v", err)
-			}
-			b, err := openNotify(context.Background(), probe, &recLeaf{}, "prod", discardLog())
-			if err != nil {
-				t.Fatalf("openNotify() b: %v", err)
-			}
-			if a.ReverseSpec() == b.ReverseSpec() {
-				t.Errorf("expected distinct per-session socket names, both were %q", a.ReverseSpec())
-			}
-		})
-	}
-}
-
-// TestSetupNotify asserts the best-effort wiring: off is a pure passthrough; on
-// appends the address env and a spec and binds a listener; dry-run appends env and
-// a spec but binds nothing; a probe failure degrades to a plain session.
+// TestSetupNotify asserts the switch and the best-effort guarantee: on, it opens a
+// channel, carries its address in the env, and binds the local listener; off,
+// under dry-run, or on any failure it hands back a plain session — the base env,
+// no channel, and nothing bound.
 func TestSetupNotify(t *testing.T) {
 	base := []string{"GIT_AUTHOR_NAME=Jane Doe"}
 	cases := []struct {
-		name       string
-		opts       Options
-		probe      shell.Shell
-		wantEnvKey bool
-		wantSpec   bool
-		wantBound  bool
-		wantNote   bool
+		name        string
+		opts        Options
+		probe       shell.Shell
+		wantChannel bool
+		wantBound   bool
+		wantNote    bool
 	}{
-		{"notify off is passthrough", Options{Sandbox: "prod"}, cannedShell{stdout: "/run/user/1000"}, false, false, false, false},
-		{"notify on appends env, spec, binds", Options{Sandbox: "prod", Notify: true}, cannedShell{stdout: "/run/user/1000"}, true, true, true, false},
-		{"dry-run appends env and spec, binds nothing", Options{Sandbox: "prod", Notify: true, DryRun: true}, cannedShell{stdout: "/run/user/1000"}, true, true, false, true},
-		{"probe failure degrades to plain", Options{Sandbox: "prod", Notify: true}, cannedShell{err: errors.New("unreachable")}, false, false, false, false},
+		{"notify off is a passthrough", Options{Sandbox: "prod"}, cannedShell{stdout: "/run/user/1000"}, false, false, false},
+		{"notify on opens and binds", Options{Sandbox: "prod", Notify: true}, cannedShell{stdout: "/run/user/1000"}, true, true, false},
+		{"dry-run opens nothing", Options{Sandbox: "prod", Notify: true, DryRun: true}, cannedShell{stdout: "/run/user/1000"}, false, false, true},
+		{"probe failure degrades to plain", Options{Sandbox: "prod", Notify: true}, cannedShell{err: errors.New("unreachable")}, false, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -202,13 +125,16 @@ func TestSetupNotify(t *testing.T) {
 			t.Cleanup(func() { _ = os.RemoveAll(tmp) })
 			t.Setenv("XDG_RUNTIME_DIR", tmp)
 			var logbuf bytes.Buffer
-			env, spec, stop := setupNotify(context.Background(), tc.probe, &recLeaf{}, tc.opts, base, log.New(&logbuf, "", 0))
+			eff := &recLeaf{}
+			env, ch, stop := setupNotify(context.Background(), tc.probe, eff, tc.opts, base, log.New(&logbuf, "", 0))
 			defer func() { _ = stop() }()
 
-			if gotNote := strings.Contains(logbuf.String(), "would listen"); gotNote != tc.wantNote {
-				t.Errorf("dry-run listener note logged = %v, want %v (log=%q)", gotNote, tc.wantNote, logbuf.String())
+			if gotNote := strings.Contains(logbuf.String(), "--dry-run"); gotNote != tc.wantNote {
+				t.Errorf("dry-run note logged = %v, want %v (log=%q)", gotNote, tc.wantNote, logbuf.String())
 			}
-
+			if tc.opts.DryRun && eff.got.Argv != nil {
+				t.Errorf("dry-run must not provision the sandbox end, got %q", eff.got.Argv)
+			}
 			if len(env) == 0 || env[0] != base[0] {
 				t.Errorf("base env not preserved: %q", env)
 			}
@@ -218,17 +144,19 @@ func TestSetupNotify(t *testing.T) {
 					hasKey = true
 				}
 			}
-			if hasKey != tc.wantEnvKey {
-				t.Errorf("env carries %s = %v, want %v (env=%q)", notify.EnvSock, hasKey, tc.wantEnvKey, env)
+			if hasKey != tc.wantChannel {
+				t.Errorf("env carries %s = %v, want %v (env=%q)", notify.EnvSock, hasKey, tc.wantChannel, env)
 			}
-			if (spec != "") != tc.wantSpec {
-				t.Errorf("spec = %q, want non-empty %v", spec, tc.wantSpec)
+			if got := !ch.IsZero(); got != tc.wantChannel {
+				t.Errorf("channel opened = %v, want %v (%+v)", got, tc.wantChannel, ch)
 			}
-			if tc.wantSpec {
-				_, local, _ := strings.Cut(spec, ":")
-				_, statErr := os.Stat(local)
+			if tc.wantChannel {
+				if want := notify.Env(ch.Remote)[0]; env[len(env)-1] != want {
+					t.Errorf("carried address = %q, want %q", env[len(env)-1], want)
+				}
+				_, statErr := os.Stat(ch.Local)
 				if bound := statErr == nil; bound != tc.wantBound {
-					t.Errorf("socket bound = %v, want %v (local=%q)", bound, tc.wantBound, local)
+					t.Errorf("socket bound = %v, want %v (local=%q)", bound, tc.wantBound, ch.Local)
 				}
 			}
 		})

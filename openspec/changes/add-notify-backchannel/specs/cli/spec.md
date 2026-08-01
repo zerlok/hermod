@@ -1,17 +1,16 @@
 ## ADDED Requirements
 
-### Requirement: Notify flag
-The CLI SHALL accept a `-N`/`--notify` flag (default off). When set, the resolved intent SHALL be
-marked to open the notification back-channel for the run. The flag SHALL compose with dry-run: under
-`-n -N` the intent is both dry-run and notify-enabled, so the channel plan is printed rather than
-executed.
+### Requirement: Notify opt-out flag
+The CLI SHALL open the notification back-channel by default and SHALL accept a `-N`/`--no-notify`
+flag that suppresses it. The flag SHALL compose with dry-run, which opens no channel of its own
+accord.
 
-#### Scenario: Notify requested
-- **WHEN** the user runs `hermod prod-box -N`
-- **THEN** the resolved intent is marked to open the notification back-channel
+#### Scenario: Notify on by default
+- **WHEN** the user runs `hermod prod-box`
+- **THEN** the resolved intent opens the notification back-channel
 
-#### Scenario: Notify off by default
-- **WHEN** the user runs `hermod prod-box` without `-N`
+#### Scenario: Opted out
+- **WHEN** the user runs `hermod prod-box --no-notify`
 - **THEN** the resolved intent opens no notification back-channel
 
 ### Requirement: Notify sender subcommand

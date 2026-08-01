@@ -21,14 +21,16 @@ Everything below is in service of that sentence.
 ## Domain objects
 
 Each lives in one package; dependencies point downward only
-(`cli → control → git/mirror/sandbox → shell`).
+(`cli → control → git/mirror/sandbox/notify → shell`).
 
 | Object                 | Responsibility                                                                                                                                                                                                                                      | Collaborators                      |
 |------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------|
 | `control.Options`      | The fully-resolved intent of one invocation: sandbox host, session name, local dir, remote dir, passthrough command, dry-run, quiet. Immutable.                                                                                                     | built by the CLI edge              |
 | `sandbox.Session`      | The remote interactive session — a tmux window on `host`, reached over SSH. `NewSession` **prepares** it (wraps a leaf shell in ssh + tmux) without attaching; `Attach` blocks until detach, `IsActive` probes liveness.                            | its ssh + tmux `Shell` stack       |
 | `mirror.Session`       | The file mirror between the local dir and `host:remotePath`. `NewMutagenSession` **opens** it (create **or** resume) at construction; the interface then exposes `Flush`, `Pause`, `Close` (terminate), `Status`. Backed by a private Mutagen impl. | a side-effecting + a probe `Shell` |
+| `sandbox.Channel`      | An endpoint pair between local and sandbox — a unix socket on each end — that a `Session` carries as a reverse forward on its attach connection. `OpenChannel` provisions it, one per sandbox *user*; what travels over it is the caller's business.  | a probe + a side-effecting `Shell` |
 | `git.Git` / `Identity` | Read-only discovery of `user.name` / `user.email` from the mirrored directory. `New(shell, dir).Read()` returns an `Identity`; it does not build environment.                                                                                       | a probe `Shell`                    |
+| `notify.Notifier`      | Raises one native desktop notification locally (toast + sound). `Listen` serves a channel's local end and dispatches each message to it; `Send` is the sandbox-side half. Best-effort: no failure escapes.                                          | a side-effecting `Shell`           |
 | `shell.Shell`          | **Where** a command runs (local / over ssh / inside tmux), and at the leaf **how** it runs — for real or, under dry-run, printed. A decorator the caller nests.                                                                                     | —                                  |
 
 `control` is the composition layer: it reads identity, builds the two leaf shells (real vs

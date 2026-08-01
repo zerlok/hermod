@@ -61,15 +61,16 @@ func TestParseIntoOptions(t *testing.T) {
 		wantQuiet   bool
 		wantNotify  bool
 	}{
-		{"defaults from cwd", "prod", "prod", "api", "/home/u/api", "api", nil, false, false, false},
-		{"explicit session", "prod -s my-session", "prod", "my-session", "/home/u/api", "api", nil, false, false, false},
-		{"explicit directory slug session", "prod -C /home/u/work/svc", "prod", "work-svc", "/home/u/work/svc", "work/svc", nil, false, false, false},
-		{"dry-run flag", "prod -n", "prod", "api", "/home/u/api", "api", nil, true, false, false},
-		{"quiet flag", "prod -q", "prod", "api", "/home/u/api", "api", nil, false, true, false},
-		{"notify flag", "prod -N", "prod", "api", "/home/u/api", "api", nil, false, false, true},
-		{"dry-run and notify compose", "prod -n -N", "prod", "api", "/home/u/api", "api", nil, true, false, true},
-		{"passthrough verbatim", "prod -- claude --model opus", "prod", "api", "/home/u/api", "api", []string{"claude", "--model", "opus"}, false, false, false},
-		{"flags then passthrough", "prod -n -- claude --model opus", "prod", "api", "/home/u/api", "api", []string{"claude", "--model", "opus"}, true, false, false},
+		{"defaults from cwd", "prod", "prod", "api", "/home/u/api", "api", nil, false, false, true},
+		{"explicit session", "prod -s my-session", "prod", "my-session", "/home/u/api", "api", nil, false, false, true},
+		{"explicit directory slug session", "prod -C /home/u/work/svc", "prod", "work-svc", "/home/u/work/svc", "work/svc", nil, false, false, true},
+		{"dry-run flag", "prod -n", "prod", "api", "/home/u/api", "api", nil, true, false, true},
+		{"quiet flag", "prod -q", "prod", "api", "/home/u/api", "api", nil, false, true, true},
+		{"no-notify short flag opts out", "prod -N", "prod", "api", "/home/u/api", "api", nil, false, false, false},
+		{"no-notify long flag opts out", "prod --no-notify", "prod", "api", "/home/u/api", "api", nil, false, false, false},
+		{"dry-run and no-notify compose", "prod -n -N", "prod", "api", "/home/u/api", "api", nil, true, false, false},
+		{"passthrough verbatim", "prod -- claude --model opus", "prod", "api", "/home/u/api", "api", []string{"claude", "--model", "opus"}, false, false, true},
+		{"flags then passthrough", "prod -n -- claude --model opus", "prod", "api", "/home/u/api", "api", []string{"claude", "--model", "opus"}, true, false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

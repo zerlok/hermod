@@ -64,7 +64,7 @@ hermod prod-box                     # mirror cwd, attach to a tmux session named
 hermod prod-box -s my-session       # explicit session name for tmux + mutagen
 hermod prod-box -C ~/work/api       # mirror a directory other than the current one
 hermod prod-box -- claude --model opus     # pass args through to the agent CLI on the sandbox
-hermod prod-box -N -- claude        # -N opens the notification back-channel (see below)
+hermod prod-box -N                  # opt out of the notification back-channel (on by default)
 hermod prod-box -n                  # dry run: print the commands it would run, run nothing
 ```
 
@@ -113,13 +113,9 @@ on the machine in front of you. That is exactly what the notification back-chann
 Terminal notification escapes (OSC 9/777) don't survive the `tmux → ssh` path, and some terminals
 (e.g. Ubuntu's GNOME Terminal) don't implement them at all — so a "your agent is done" from the
 box never reaches your desktop. Only a **local** process can raise a desktop notification, and
-Hermod is that process. The `-N` flag opens a back-channel for it:
+Hermod is that process, so every session opens a back-channel for it by default.
 
-```bash
-hermod prod-box -N -- claude        # opens the reverse-SSH notification channel for the session
-```
-
-Then, from anywhere inside that session on the box, send a notification to your local desktop:
+From anywhere inside the session on the box, send a notification to your local desktop:
 
 ```bash
 hermod notify done                          # toast on your local machine
@@ -129,17 +125,22 @@ hermod notify --urgency critical "blocked"  # e.g. when the agent needs input
 Wire it into an agent hook (`hermod notify done || true`) so a long run pings you when it finishes
 or gets stuck — even if you've switched to your browser.
 
-**How it works.** `-N` adds an `ssh -R` reverse forward on the attach connection, mapping a
-per-session unix socket on the box to one on your machine; Hermod listens locally and raises the
-toast (via `notify-send` on Linux or `osascript` on macOS) plus a sound. The socket lives in a
-`0700` directory on both ends, so only you can reach it. The socket path is exported into the
-session as `$HERMOD_NOTIFY_SOCK`.
+**How it works.** The attach connection carries an `ssh -R` reverse forward mapping a unix socket
+on the box to one on your machine; Hermod listens locally and raises the toast (via `notify-send`
+on Linux or `osascript` on macOS) plus a sound. The socket lives in a `0700` directory on both
+ends, so only you can reach it, and its path is exported into the session as
+`$HERMOD_NOTIFY_SOCK`. It is **one socket per sandbox user**, not per project, so its address is
+the same for every session you run on that box.
 
 - **Requirements:** locally, `notify-send` (libnotify) on Linux — macOS needs nothing extra. On the
   box, either the `hermod` binary (for `hermod notify`) or, with no install, `socat`:
   `printf '%s' '{"body":"done"}' | socat - UNIX-CONNECT:"$HERMOD_NOTIFY_SOCK"`.
-- **Best-effort:** off by default, and it never affects your session — if the channel can't be set
-  up or a notification can't be raised, Hermod logs it and carries on.
+  Installing Hermod on the sandbox is a manual step today; the
+  [remote-agent proposal](openspec/changes/add-remote-agent/proposal.md) removes it by shipping
+  and upgrading the binary on attach, the way Mutagen does with its agent.
+- **Best-effort:** the channel never affects your session — if it can't be opened, or a
+  notification can't be raised, Hermod logs it and carries on. Opt out with `-N`/`--no-notify`,
+  which is also implied by `--dry-run` (a dry run provisions nothing and binds nothing).
 
 ## Development
 
@@ -168,6 +169,7 @@ internal/
   control/               resolve defaults, run sync → attach → pause/teardown, decide the branch
   git/                   read local author identity to carry into the remote
   mirror/                the Mutagen file mirror: open (create/resume), flush, pause, close
-  sandbox/               the tmux-over-ssh session: attach-or-create, liveness probe
+  notify/                the local end of the notification back-channel: listen, dispatch, send
+  sandbox/               the tmux-over-ssh session: attach-or-create, liveness probe, local↔sandbox channel
   shell/                 where a command runs (ssh/tmux decorators) and how (real vs printed leaf)
 ```

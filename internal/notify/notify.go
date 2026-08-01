@@ -1,8 +1,12 @@
 // Package notify is the local notification back-channel: a sandbox process sends
-// one short message over a per-session unix socket (reverse-forwarded by the
-// attach ssh) and Hermod, running locally, raises a native desktop notification.
-// It is a leaf-tier package — it imports only shell and the standard library, and
-// never runs a remote shell itself (control owns remote-endpoint provisioning).
+// one short message over a unix socket (reverse-forwarded by the attach ssh) and
+// Hermod, running locally, raises a native desktop notification.
+//
+// It is a leaf-tier package and deliberately knows nothing about how the socket
+// gets there: it imports only shell and the standard library, never runs a remote
+// shell, and never addresses or provisions an endpoint (sandbox owns the channel
+// between local and remote). It binds a socket it is handed, and it sends to a
+// socket the environment names.
 package notify
 
 import (
@@ -19,8 +23,14 @@ import (
 	"time"
 )
 
-// EnvSock names the environment variable carrying the remote socket path into the
-// session (via sandbox.Config.Env → tmux -e). `hermod notify` reads it on the box.
+// ChannelName is the name Hermod asks the sandbox for when opening the endpoint
+// this package listens on. One channel per sandbox user, so the address is the
+// same for every project on the box.
+const ChannelName = "notify"
+
+// EnvSock names the environment variable carrying the sandbox-side socket path
+// into the session (via sandbox.Config.Env → tmux -e). `hermod notify` reads it
+// on the box.
 const EnvSock = "HERMOD_NOTIFY_SOCK"
 
 // maxMessage bounds a single message read so a rogue sender cannot exhaust memory.
@@ -47,56 +57,32 @@ type Notifier interface {
 	Notify(ctx context.Context, m Message) error
 }
 
-// SocketName is the per-session socket basename, shared by both ends so the local
-// and remote paths stay in lockstep. token is caller-supplied entropy.
-func SocketName(token string) string { return "hermod-notify-" + token + ".sock" }
+// Env is the session environment entry telling on-box senders where to write;
+// sock is the channel's sandbox-side path.
+func Env(sock string) []string { return []string{EnvSock + "=" + sock} }
 
-// Channel is the local half of the back-channel for one session. New only records
-// paths and the notifier; it binds nothing. Listen does the binding. This split is
-// why notify needs no dry-run flag: control calls Listen only on the real path and
-// prints a note under --dry-run.
-type Channel struct {
-	n          Notifier
-	localSock  string
-	remoteSock string
-	log        *log.Logger
-}
-
-// New builds a channel from already-resolved absolute socket paths: localSock in a
-// local 0700 dir and remoteSock in the sandbox's 0700 dir, both resolved by control.
-func New(n Notifier, localSock, remoteSock string, logger *log.Logger) *Channel {
-	return &Channel{n: n, localSock: localSock, remoteSock: remoteSock, log: logger}
-}
-
-// ReverseSpec is the `ssh -R` argument mapping the remote socket to the local one.
-func (c *Channel) ReverseSpec() string { return c.remoteSock + ":" + c.localSock }
-
-// Env is the session environment entry telling on-box senders where to write.
-func (c *Channel) Env() []string { return []string{EnvSock + "=" + c.remoteSock} }
-
-// LocalSock is the local socket path, used for the dry-run listener note.
-func (c *Channel) LocalSock() string { return c.localSock }
-
-// Listen binds the local unix socket (0600, in a 0700 dir) and serves an accept
-// loop in a background goroutine until ctx is done. It returns stop, which unlinks
-// and closes the socket and is safe to call more than once. Only control's
-// non-dry-run path calls Listen; every post-bind error is logged and swallowed.
-func (c *Channel) Listen(ctx context.Context) (stop func() error, err error) {
-	if err := os.MkdirAll(filepath.Dir(c.localSock), 0o700); err != nil {
+// Listen binds sock (0600, in a 0700 dir) and serves an accept loop in a
+// background goroutine until ctx is done, raising a notification for each message
+// that arrives. It returns stop, which unlinks and closes the socket and is safe
+// to call more than once. Every post-bind error is logged and swallowed, so a
+// bound channel can never fail the session; only the bind itself can error.
+func Listen(ctx context.Context, sock string, n Notifier, logger *log.Logger) (stop func() error, err error) {
+	if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
 		return nil, err
 	}
-	_ = os.Remove(c.localSock) // clear a stale socket from a prior run
-	ln, err := net.Listen("unix", c.localSock)
+	_ = os.Remove(sock) // clear a stale socket from a prior run
+	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		return nil, err
 	}
-	_ = os.Chmod(c.localSock, 0o600)
+	_ = os.Chmod(sock, 0o600)
 
+	l := &listener{n: n, log: logger}
 	var once sync.Once
 	stop = func() error {
 		once.Do(func() {
 			_ = ln.Close()
-			_ = os.Remove(c.localSock)
+			_ = os.Remove(sock)
 		})
 		return nil
 	}
@@ -113,28 +99,35 @@ func (c *Channel) Listen(ctx context.Context) (stop func() error, err error) {
 			}
 			// Handle in its own goroutine so a slow or stalled peer cannot starve
 			// Accept and wedge the channel for the rest of the session.
-			go c.handle(ctx, conn)
+			go l.handle(ctx, conn)
 		}
 	}()
 	return stop, nil
+}
+
+// listener is the serving half of a bound channel: what to do with a message and
+// where to log a dropped one.
+type listener struct {
+	n   Notifier
+	log *log.Logger
 }
 
 // handle reads one bounded message from conn and dispatches it. A malformed,
 // oversized, or empty-body message is dropped without a notification, and no error
 // escapes to affect the session. A read deadline bounds a stalled sender so this
 // goroutine always returns.
-func (c *Channel) handle(ctx context.Context, conn net.Conn) {
+func (l *listener) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 	data, _ := io.ReadAll(io.LimitReader(conn, maxMessage))
 	var m Message
 	if err := json.Unmarshal(data, &m); err != nil || m.Body == "" {
-		if c.log != nil {
-			c.log.Printf("notify: dropped a malformed or empty message")
+		if l.log != nil {
+			l.log.Printf("notify: dropped a malformed or empty message")
 		}
 		return
 	}
-	_ = c.n.Notify(ctx, m) // best-effort; never escapes
+	_ = l.n.Notify(ctx, m) // best-effort; never escapes
 }
 
 // Send is the remote half: dial the socket named by EnvSock and write one Message.
@@ -142,7 +135,7 @@ func (c *Channel) handle(ctx context.Context, conn net.Conn) {
 func Send(ctx context.Context, m Message) error {
 	sock := os.Getenv(EnvSock)
 	if sock == "" {
-		return errors.New("notify: " + EnvSock + " unset (run inside a hermod --notify session)")
+		return errors.New("notify: " + EnvSock + " unset (run inside a hermod session with notifications enabled)")
 	}
 	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", sock)
 	if err != nil {

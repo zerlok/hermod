@@ -48,7 +48,7 @@ func newRootCmd(a app) *cobra.Command {
 		dir      string
 		dryRun   bool
 		quiet    bool
-		notifyOn bool
+		noNotify bool
 	)
 	cmd := &cobra.Command{
 		Use:   "hermod <sandbox> [flags] [-- <sandbox command>...]",
@@ -83,7 +83,7 @@ func newRootCmd(a app) *cobra.Command {
 				control.WithCommand(passthrough),
 				control.WithDryRun(dryRun),
 				control.WithQuiet(quiet),
-				control.WithNotify(notifyOn),
+				control.WithNotify(!noNotify),
 			)
 		},
 	}
@@ -91,7 +91,7 @@ func newRootCmd(a app) *cobra.Command {
 	cmd.Flags().StringVarP(&dir, "directory", "C", "", "directory to mirror (default: current directory)")
 	cmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "print the commands that would run without executing side effects")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress step logging")
-	cmd.Flags().BoolVarP(&notifyOn, "notify", "N", false, "open a reverse tunnel so a sandbox process can raise a local desktop notification")
+	cmd.Flags().BoolVarP(&noNotify, "no-notify", "N", false, "do not open the back-channel that lets a sandbox process raise a local desktop notification")
 	cmd.AddCommand(newNotifyCmd(a))
 	return cmd
 }

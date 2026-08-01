@@ -66,29 +66,34 @@ func TestAttachComposesSshTmuxLine(t *testing.T) {
 	}
 }
 
-// TestReverseForwardOnInteractiveOnly asserts the notify -R spec rides the attach
-// ssh and never the liveness probe.
-func TestReverseForwardOnInteractiveOnly(t *testing.T) {
+// TestChannelRidesInteractiveOnly asserts a carried channel becomes a reverse
+// forward on the attach ssh and never on the liveness probe.
+func TestChannelRidesInteractiveOnly(t *testing.T) {
 	cases := []struct {
-		name           string
-		reverseForward string
-		wantInAttach   bool
+		name         string
+		channel      Channel
+		wantInAttach bool
+		wantSpec     string
 	}{
-		{"no spec leaves attach unchanged", "", false},
-		{"spec adds -R to attach", "/r/s.sock:/l/s.sock", true},
+		{"no channel leaves attach unchanged", Channel{}, false, ""},
+		{"half a channel is no channel", Channel{Remote: "/r/s.sock"}, false, ""},
+		{"channel adds -R to attach", Channel{Local: "/l/s.sock", Remote: "/r/s.sock"}, true, "/r/s.sock:/l/s.sock"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			attach := &recShell{}
-			NewSession(attach, Config{Host: "prod", Session: "api", Dir: "/home/u/api", ReverseForward: tc.reverseForward}).
+			NewSession(attach, Config{Host: "prod", Session: "api", Dir: "/home/u/api", Channel: tc.channel}).
 				Attach(context.Background())
 			hasR := containsArg(attach.got.Argv, "-R")
 			if hasR != tc.wantInAttach {
 				t.Errorf("attach argv -R present = %v, want %v (argv=%q)", hasR, tc.wantInAttach, attach.got.Argv)
 			}
+			if tc.wantSpec != "" && !containsArg(attach.got.Argv, tc.wantSpec) {
+				t.Errorf("attach argv missing forward spec %q, got %q", tc.wantSpec, attach.got.Argv)
+			}
 
 			probe := &recShell{}
-			NewSession(probe, Config{Host: "prod", Session: "api", ReverseForward: tc.reverseForward}).
+			NewSession(probe, Config{Host: "prod", Session: "api", Channel: tc.channel}).
 				IsActive(context.Background())
 			if containsArg(probe.got.Argv, "-R") {
 				t.Errorf("probe argv must never carry -R, got %q", probe.got.Argv)

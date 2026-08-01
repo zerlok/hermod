@@ -1,6 +1,10 @@
 // Package sandbox is the interactive session on the sandbox: a persistent tmux
 // window reached over SSH. Constructing a session prepares the transport but
 // does not attach; Attach joins it and IsActive probes its liveness.
+//
+// It also owns the transport back the other way: OpenChannel provisions a
+// local↔sandbox endpoint pair that a session carries on its attach connection,
+// so callers ask for a channel by name and never build ssh forwards themselves.
 package sandbox
 
 import (
@@ -19,12 +23,12 @@ type Session interface {
 
 // Config describes the session to prepare.
 type Config struct {
-	Host           string
-	Session        string
-	Dir            string   // sandbox working directory
-	Command        []string // passthrough command; nil runs the default shell
-	Env            []string // git identity carried into the session
-	ReverseForward string   // opaque ssh -R spec for the notify back-channel; "" disables it
+	Host    string
+	Session string
+	Dir     string   // sandbox working directory
+	Command []string // passthrough command; nil runs the default shell
+	Env     []string // git identity carried into the session
+	Channel Channel  // local↔sandbox channel to carry on the attach; zero carries none
 }
 
 // sandbox is a tmux-over-ssh Session. It wraps the given inner (leaf) shell with
@@ -43,20 +47,19 @@ type sandbox struct {
 // inner (the effective, dry-run-aware shell: the attach is a side effect, and the
 // liveness probe follows a real attach). It does not attach.
 func NewSession(inner shell.Shell, cfg Config) Session {
-	// The reverse forward for the notify back-channel rides the interactive attach
-	// ssh only; the liveness probe never carries it. sandbox forwards an opaque -R
-	// spec the way it already forwards Env, and never imports the notify package.
-	var opts []shell.SSHOption
-	if cfg.ReverseForward != "" {
-		opts = append(opts, shell.WithReverseForward(cfg.ReverseForward))
+	// A channel is carried by the interactive attach ssh only — its forward lives
+	// exactly as long as the attach — and never by the liveness probe.
+	opts := []shell.SSHOption{shell.WithTty()}
+	if !cfg.Channel.IsZero() {
+		opts = append(opts, shell.WithReverseForward(cfg.Channel.reverseSpec()))
 	}
 	return &sandbox{
 		session:     cfg.Session,
 		dir:         cfg.Dir,
 		command:     cfg.Command,
 		env:         cfg.Env,
-		interactive: shell.NewLoginShell(shell.NewTmux(shell.NewSSH(inner, cfg.Host, true, opts...), cfg.Session)),
-		probe:       shell.NewSSH(inner, cfg.Host, false),
+		interactive: shell.NewLoginShell(shell.NewTmux(shell.NewSSH(inner, cfg.Host, opts...), cfg.Session)),
+		probe:       shell.NewSSH(inner, cfg.Host),
 	}
 }
 

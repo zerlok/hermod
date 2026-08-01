@@ -1,21 +1,20 @@
 ## ADDED Requirements
 
-### Requirement: Opt-in reverse notification channel
-Hermod SHALL provide an opt-in back-channel, enabled by a `-N`/`--notify` flag (default off), that
-lets a process on the sandbox raise a desktop notification on the local machine. When enabled,
-Hermod SHALL open a reverse forward on the interactive attach connection and carry the channel's
-address into the session environment; when not enabled, Hermod SHALL open no channel and add nothing
-to the attach or the environment.
+### Requirement: Notification channel on by default
+Hermod SHALL open, by default, a back-channel that lets a process on the sandbox raise a desktop
+notification on the local machine, and SHALL provide a flag to opt out. When enabled, Hermod SHALL
+ask the sandbox session for a channel and carry that channel's address into the session environment;
+when opted out, Hermod SHALL open no channel and add nothing to the attach or the environment.
 
-#### Scenario: Enabled adds the reverse forward and carried address
-- **WHEN** the user runs `hermod prod-box -N`
-- **THEN** the interactive attach connection carries a reverse forward for the channel
+#### Scenario: Enabled by default
+- **WHEN** the user runs `hermod prod-box`
+- **THEN** the interactive attach connection carries a forward for the notification channel
 - **AND** the session environment carries the channel's socket address (`HERMOD_NOTIFY_SOCK`) alongside the git identity
 - **AND** a message sent to that address from the sandbox raises a desktop notification on the local machine
 
-#### Scenario: Disabled by default
-- **WHEN** the user runs `hermod prod-box` without `-N`
-- **THEN** no reverse forward is added to the attach
+#### Scenario: Opted out
+- **WHEN** the user runs `hermod prod-box` with the opt-out flag
+- **THEN** no channel is opened and no forward is added to the attach
 - **AND** the session environment carries no channel address
 - **AND** no local listener is started
 
@@ -24,9 +23,10 @@ The notification channel SHALL never affect the session or the pause-vs-teardown
 failure to resolve the address, provision the endpoint, bind the listener, establish the forward,
 or raise a notification SHALL be logged and the session SHALL proceed normally without
 notifications. The pause-vs-teardown decision SHALL remain keyed solely on remote-session liveness.
+Because it is best-effort, being on by default costs a session that cannot use it one log line.
 
 #### Scenario: Setup failure degrades to a plain session
-- **WHEN** `-N` is set but the channel cannot be provisioned or bound
+- **WHEN** the channel cannot be provisioned or bound
 - **THEN** Hermod logs that notifications are disabled
 - **AND** the sync-and-attach flow runs normally without a channel
 - **AND** the mirror is still settled by remote-session liveness
@@ -36,25 +36,14 @@ notifications. The pause-vs-teardown decision SHALL remain keyed solely on remot
 - **THEN** it is dropped without raising a notification
 - **AND** no error escapes to affect the session
 
-### Requirement: Channel endpoint is reachable only by the session user
-The channel SHALL use a unix-domain socket inside a `0700` directory on both the local and the
-sandbox end, addressed by a per-session unique name, so that only the session user can reach it and
-concurrent sessions to the same host do not collide. Hermod SHALL NOT expose the channel on a
-loopback TCP port.
-
-#### Scenario: Per-session isolation
-- **WHEN** two `-N` sessions run against the same sandbox host
-- **THEN** each uses a distinct socket name on each end
-- **AND** neither can reach the other's channel
-
 ### Requirement: Sandbox-side sender
 Hermod SHALL provide a `hermod notify [--title <t>] [--urgency low|normal|critical] <body>`
 subcommand that sends one message over the channel using the carried address. When the carried
 address is absent from the environment, the subcommand SHALL fail with a clear error and SHALL NOT
 affect any other process.
 
-#### Scenario: Send from inside a notify-enabled session
-- **WHEN** `hermod notify --urgency critical "agent blocked"` runs in a session started with `-N`
+#### Scenario: Send from inside a session
+- **WHEN** `hermod notify --urgency critical "agent blocked"` runs in a session with the channel open
 - **THEN** the message is delivered over the channel
 - **AND** the local machine raises a notification with that body and urgency
 
@@ -63,13 +52,13 @@ affect any other process.
 - **THEN** the subcommand exits with a clear error
 - **AND** nothing else is affected
 
-### Requirement: Dry-run prints the channel plan without binding
-Under `--dry-run`, the channel's side effects SHALL be printed as copy-pasteable shell lines and
-nothing SHALL be bound or served. The address-resolving probe (a read-only probe) SHALL run for
-real so the printed plan carries the true address.
+### Requirement: Dry-run opens no channel
+Under `--dry-run` Hermod SHALL NOT open the notification channel: it SHALL neither probe nor
+provision the sandbox endpoint, nor bind a local listener, and the planned session SHALL carry no
+channel. Hermod SHALL note the omission so the printed plan is not read as complete.
 
-#### Scenario: Dry-run with notify enabled
-- **WHEN** the user runs `hermod prod-box -N -n`
-- **THEN** the remote directory-creation command and the attach's reverse forward (carrying the real socket address) are printed
-- **AND** the session environment line carries the real `HERMOD_NOTIFY_SOCK`
-- **AND** no local listener is bound and no notification is raised
+#### Scenario: Dry run
+- **WHEN** the user runs `hermod prod-box -n`
+- **THEN** no endpoint is provisioned on the sandbox and no local listener is bound
+- **AND** the printed attach carries no forward and no channel address
+- **AND** Hermod notes that the back-channel was not opened under dry-run

@@ -2,15 +2,10 @@ package control
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/zerlok/hermod/internal/git"
 	"github.com/zerlok/hermod/internal/mirror"
@@ -23,7 +18,7 @@ import (
 // the flow. Under dry-run, side-effecting commands are printed to stdout as a
 // copy-pasteable plan while probes still run for real.
 func Run(ctx context.Context, host string, opts ...Option) error {
-	o := Options{Sandbox: host}
+	o := Options{Sandbox: host, Notify: true}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -39,18 +34,18 @@ func Run(ctx context.Context, host string, opts ...Option) error {
 	logger.Printf("git identity: %s", describe(gitIdentity))
 
 	// The notification back-channel is best-effort: setupNotify returns a plain
-	// session (identity-only env, empty spec, no-op stop) on any failure, so it
+	// session (identity-only env, no channel, no-op stop) on any failure, so it
 	// can never affect the sync-and-attach flow or the pause/teardown decision.
-	env, reverseSpec, stopNotify := setupNotify(ctx, real, effective, o, identityEnv(gitIdentity), logger)
+	env, channel, stopNotify := setupNotify(ctx, real, effective, o, identityEnv(gitIdentity), logger)
 	defer func() { _ = stopNotify() }()
 
 	remote := sandbox.NewSession(effective, sandbox.Config{
-		Host:           o.Sandbox,
-		Session:        o.Session,
-		Dir:            o.RemoteDir,
-		Command:        o.Command,
-		Env:            env,
-		ReverseForward: reverseSpec,
+		Host:    o.Sandbox,
+		Session: o.Session,
+		Dir:     o.RemoteDir,
+		Command: o.Command,
+		Env:     env,
+		Channel: channel,
 	})
 
 	session, err := mirror.NewMutagenSession(ctx, effective, real, mirror.Config{
@@ -124,106 +119,36 @@ func identityEnv(id git.Identity) []string {
 	return env
 }
 
-// setupNotify wires the notification back-channel when enabled, returning the
-// session env (identity plus the channel address), the ssh -R spec, and a stop
-// func that closes the local listener. It is best-effort: any failure logs and
-// falls back to a plain session (base env, empty spec, no-op stop). Under dry-run
-// it prints the plan — the -R spec and env ride the effective leaf through the
-// sandbox stack — and logs a listener note without binding anything.
-func setupNotify(ctx context.Context, real, effective shell.Shell, o Options, baseEnv []string, logger *log.Logger) (env []string, reverseSpec string, stop func() error) {
+// setupNotify turns the local-notification back-channel on or off, returning the
+// session env (the git identity, plus the channel address when on), the channel
+// for the attach to carry, and a stop func for the local listener. How the channel
+// is addressed and provisioned belongs to sandbox, and what arrives on it belongs
+// to notify; this is only the switch and the best-effort guarantee — every failure
+// logs and falls back to a plain session (base env, no channel, no-op stop).
+func setupNotify(ctx context.Context, real, effective shell.Shell, o Options, baseEnv []string, logger *log.Logger) ([]string, sandbox.Channel, func() error) {
 	noop := func() error { return nil }
+	plain := func() ([]string, sandbox.Channel, func() error) { return baseEnv, sandbox.Channel{}, noop }
+
 	if !o.Notify {
-		return baseEnv, "", noop
+		return plain()
 	}
-	ch, err := openNotify(ctx, real, effective, o.Sandbox, logger)
-	if err != nil {
-		logger.Printf("notifications disabled: %v", err)
-		return baseEnv, "", noop
-	}
-	env = append(append([]string(nil), baseEnv...), ch.Env()...)
-	reverseSpec = ch.ReverseSpec()
 	if o.DryRun {
-		logger.Printf("# notify: would listen on %s and raise a desktop notification on each message", ch.LocalSock())
-		return env, reverseSpec, noop
+		// Opening the channel would provision an endpoint on the sandbox and bind a
+		// local socket; a dry run does neither, so it plans a plain session.
+		logger.Printf("# notify: back-channel not opened under --dry-run")
+		return plain()
 	}
-	stop, err = ch.Listen(ctx)
+	ch, err := sandbox.OpenChannel(ctx, real, effective, o.Sandbox, notify.ChannelName)
 	if err != nil {
 		logger.Printf("notifications disabled: %v", err)
-		return baseEnv, "", noop
+		return plain()
 	}
-	return env, reverseSpec, stop
-}
-
-// openNotify provisions the back-channel endpoints and builds the local Channel.
-// The remote base directory is discovered with a real probe (a probe that shapes
-// the plan stays real under dry-run) and created through the dry-run-aware
-// effective shell, reusing the remote-provisioning pattern; the local socket path
-// is derived under the local runtime dir. A crypto-random per-session token gives
-// both ends a unique socket name, so concurrent sessions never collide.
-func openNotify(ctx context.Context, real, effective shell.Shell, host string, logger *log.Logger) (*notify.Channel, error) {
-	token, err := randToken()
+	stop, err := notify.Listen(ctx, ch.Local, notify.NewNotifier(effective), logger)
 	if err != nil {
-		return nil, err
+		logger.Printf("notifications disabled: %v", err)
+		return plain()
 	}
-	name := notify.SocketName(token)
-
-	remoteBase, err := probeRemoteBase(ctx, real, host)
-	if err != nil {
-		return nil, fmt.Errorf("probe remote runtime dir: %w", err)
-	}
-	remoteDir := remoteBase + "/hermod"
-	if _, err := shell.NewSSH(effective, host, false).Run(ctx, shell.Command{
-		Argv: []string{"mkdir", "-p", "-m", "700", remoteDir},
-	}); err != nil {
-		return nil, fmt.Errorf("create remote notify dir: %w", err)
-	}
-	remoteSock := remoteDir + "/" + name
-	localSock := filepath.Join(localRuntimeDir(), "hermod", name)
-
-	return notify.New(notify.NewNotifier(effective), localSock, remoteSock, logger), nil
-}
-
-// probeRemoteBase reads the sandbox's runtime directory (XDG_RUNTIME_DIR, or a
-// per-user fallback under $HOME) with a read-only ssh probe.
-func probeRemoteBase(ctx context.Context, real shell.Shell, host string) (string, error) {
-	res, err := shell.NewSSH(real, host, false).Run(ctx, shell.Command{
-		Argv:    []string{"sh", "-c", `printf %s "${XDG_RUNTIME_DIR:-$HOME/.hermod/run}"`},
-		Capture: true,
-	})
-	if err != nil {
-		return "", err
-	}
-	base := strings.TrimSpace(res.Stdout)
-	if base == "" {
-		return "", errors.New("empty remote runtime dir")
-	}
-	// The base flows into the `ssh -R <remoteSock>:<localSock>` spec as a raw argv
-	// element (not a shell word), where ssh's own forward parser splits on ':'. A
-	// colon or whitespace in the base could change the forward's meaning, so require
-	// a clean absolute path and otherwise degrade to a plain session.
-	if !filepath.IsAbs(base) || strings.ContainsAny(base, ": \t\n") {
-		return "", fmt.Errorf("unexpected remote runtime dir %q", base)
-	}
-	return base, nil
-}
-
-// randToken returns 8 bytes of crypto-random entropy as hex, the per-session
-// socket-name token.
-func randToken() (string, error) {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b[:]), nil
-}
-
-// localRuntimeDir is the base for the local notify socket: XDG_RUNTIME_DIR when
-// set, else the OS temp dir.
-func localRuntimeDir() string {
-	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
-		return d
-	}
-	return os.TempDir()
+	return append(append([]string(nil), baseEnv...), notify.Env(ch.Remote)...), ch, stop
 }
 
 func newLogger(quiet bool) *log.Logger {

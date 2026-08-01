@@ -17,6 +17,12 @@ type ssh struct {
 // none and are unaffected.
 type SSHOption func(*ssh)
 
+func WithTty() SSHOption {
+	return func(s *ssh) {
+		s.tty = true
+	}
+}
+
 // WithReverseForward adds an `ssh -R <spec>` reverse forward (remote → local),
 // with the StreamLocalBind hardening for a unix-socket endpoint: unlink a stale
 // socket and bind it 0600 (owner only). spec is "<remoteSock>:<localSock>";
@@ -35,8 +41,8 @@ func WithReverseForward(spec string) SSHOption {
 // NewSSH wraps inner so its command runs on host over ssh. Set tty to request a
 // sandbox pty (-t) for an interactive attach; leave it false for probes. Options
 // (e.g. WithReverseForward) tune the transport.
-func NewSSH(inner Shell, host string, tty bool, opts ...SSHOption) Shell {
-	s := ssh{inner: inner, host: host, tty: tty}
+func NewSSH(inner Shell, host string, opts ...SSHOption) Shell {
+	s := ssh{inner: inner, host: host}
 	for _, o := range opts {
 		o(&s)
 	}
