@@ -1,6 +1,10 @@
 // Package sandbox is the interactive session on the sandbox: a persistent tmux
 // window reached over SSH. Constructing a session prepares the transport but
 // does not attach; Attach joins it and IsActive probes its liveness.
+//
+// It also owns the transport back the other way: OpenChannel provisions a
+// local↔sandbox endpoint pair that a session carries on its attach connection,
+// so callers ask for a channel by name and never build ssh forwards themselves.
 package sandbox
 
 import (
@@ -21,9 +25,10 @@ type Session interface {
 type Config struct {
 	Host    string
 	Session string
-	Dir     string   // sandbox working directory
-	Command []string // passthrough command; nil runs the default shell
-	Env     []string // git identity carried into the session
+	Dir     string    // sandbox working directory
+	Command []string  // passthrough command; nil runs the default shell
+	Env     []string  // git identity carried into the session
+	Channel Channeler // local↔sandbox channel to carry on the attach; nil carries none
 }
 
 // sandbox is a tmux-over-ssh Session. It wraps the given inner (leaf) shell with
@@ -42,13 +47,21 @@ type sandbox struct {
 // inner (the effective, dry-run-aware shell: the attach is a side effect, and the
 // liveness probe follows a real attach). It does not attach.
 func NewSession(inner shell.Shell, cfg Config) Session {
+	// A channel is carried by the interactive attach ssh only — its forward lives
+	// exactly as long as the attach — and never by the liveness probe.
+	opts := []shell.SSHOption{shell.WithTty()}
+	if cfg.Channel != nil {
+		if ch := cfg.Channel.Channel(); !ch.IsZero() {
+			opts = append(opts, shell.WithReverseForward(ch.reverseSpec()))
+		}
+	}
 	return &sandbox{
 		session:     cfg.Session,
 		dir:         cfg.Dir,
 		command:     cfg.Command,
 		env:         cfg.Env,
-		interactive: shell.NewLoginShell(shell.NewTmux(shell.NewSSH(inner, cfg.Host, true), cfg.Session)),
-		probe:       shell.NewSSH(inner, cfg.Host, false),
+		interactive: shell.NewLoginShell(shell.NewTmux(shell.NewSSH(inner, cfg.Host, opts...), cfg.Session)),
+		probe:       shell.NewSSH(inner, cfg.Host),
 	}
 }
 

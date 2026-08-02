@@ -8,13 +8,15 @@ import (
 	"testing"
 
 	"github.com/zerlok/hermod/internal/control"
+	"github.com/zerlok/hermod/internal/notify"
 )
 
-// capture records the arguments the runner was handed.
+// capture records the arguments the runner (or notify sender) was handed.
 type capture struct {
 	called  bool
 	sandbox string
 	opts    []control.Option
+	sent    *notify.Message
 }
 
 // resolved replays the captured options into an Options, exactly as control.Run
@@ -37,6 +39,10 @@ func testApp(c *capture) app {
 			c.opts = opts
 			return nil
 		},
+		send: func(_ context.Context, m notify.Message) error {
+			c.sent = &m
+			return nil
+		},
 		cwd:  func() (string, error) { return "/home/u/api", nil },
 		home: func() (string, error) { return "/home/u", nil },
 	}
@@ -53,14 +59,18 @@ func TestParseIntoOptions(t *testing.T) {
 		wantCommand []string
 		wantDryRun  bool
 		wantQuiet   bool
+		wantNotify  bool
 	}{
-		{"defaults from cwd", "prod", "prod", "api", "/home/u/api", "api", nil, false, false},
-		{"explicit session", "prod -s my-session", "prod", "my-session", "/home/u/api", "api", nil, false, false},
-		{"explicit directory slug session", "prod -C /home/u/work/svc", "prod", "work-svc", "/home/u/work/svc", "work/svc", nil, false, false},
-		{"dry-run flag", "prod -n", "prod", "api", "/home/u/api", "api", nil, true, false},
-		{"quiet flag", "prod -q", "prod", "api", "/home/u/api", "api", nil, false, true},
-		{"passthrough verbatim", "prod -- claude --model opus", "prod", "api", "/home/u/api", "api", []string{"claude", "--model", "opus"}, false, false},
-		{"flags then passthrough", "prod -n -- claude --model opus", "prod", "api", "/home/u/api", "api", []string{"claude", "--model", "opus"}, true, false},
+		{"defaults from cwd", "prod", "prod", "api", "/home/u/api", "api", nil, false, false, true},
+		{"explicit session", "prod -s my-session", "prod", "my-session", "/home/u/api", "api", nil, false, false, true},
+		{"explicit directory slug session", "prod -C /home/u/work/svc", "prod", "work-svc", "/home/u/work/svc", "work/svc", nil, false, false, true},
+		{"dry-run flag", "prod -n", "prod", "api", "/home/u/api", "api", nil, true, false, true},
+		{"quiet flag", "prod -q", "prod", "api", "/home/u/api", "api", nil, false, true, true},
+		{"no-notify short flag opts out", "prod -N", "prod", "api", "/home/u/api", "api", nil, false, false, false},
+		{"no-notify long flag opts out", "prod --no-notify", "prod", "api", "/home/u/api", "api", nil, false, false, false},
+		{"dry-run and no-notify compose", "prod -n -N", "prod", "api", "/home/u/api", "api", nil, true, false, false},
+		{"passthrough verbatim", "prod -- claude --model opus", "prod", "api", "/home/u/api", "api", []string{"claude", "--model", "opus"}, false, false, true},
+		{"flags then passthrough", "prod -n -- claude --model opus", "prod", "api", "/home/u/api", "api", []string{"claude", "--model", "opus"}, true, false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -83,6 +93,7 @@ func TestParseIntoOptions(t *testing.T) {
 				Command:   tc.wantCommand,
 				DryRun:    tc.wantDryRun,
 				Quiet:     tc.wantQuiet,
+				Notify:    tc.wantNotify,
 			}
 			if got := c.resolved(); !reflect.DeepEqual(got, want) {
 				t.Errorf("Options = %+v, want %+v", got, want)
@@ -112,6 +123,66 @@ func TestMissingOrExtraSandboxFails(t *testing.T) {
 			}
 			if c.called {
 				t.Error("runner was called despite an argument error")
+			}
+		})
+	}
+}
+
+func TestNotifySubcommandSends(t *testing.T) {
+	cases := []struct {
+		name        string
+		commandLine string
+		wantTitle   string
+		wantUrgency string
+		wantBody    string
+	}{
+		{"body from positional args", "notify build finished", "", "", "build finished"},
+		{"title and urgency long flags", "notify --title CI --urgency critical failed", "CI", "critical", "failed"},
+		{"title and urgency short flags", "notify -t CI -u low done", "CI", "low", "done"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var c capture
+			cmd := newRootCmd(testApp(&c))
+			cmd.SetArgs(strings.Fields(tc.commandLine))
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("Execute() error: %v", err)
+			}
+			if c.called {
+				t.Error("root runner was called for a notify subcommand")
+			}
+			if c.sent == nil {
+				t.Fatal("notify sender was not called")
+			}
+			want := notify.Message{Title: tc.wantTitle, Urgency: tc.wantUrgency, Body: tc.wantBody}
+			if *c.sent != want {
+				t.Errorf("sent = %+v, want %+v", *c.sent, want)
+			}
+		})
+	}
+}
+
+func TestNotifySubcommandRequiresBody(t *testing.T) {
+	cases := []struct {
+		name        string
+		commandLine string
+	}{
+		{"no body argument", "notify"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var c capture
+			cmd := newRootCmd(testApp(&c))
+			cmd.SetArgs(strings.Fields(tc.commandLine))
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
+			if err := cmd.Execute(); err == nil {
+				t.Fatal("expected an error when no body is given")
+			}
+			if c.sent != nil {
+				t.Error("sender called despite missing body")
 			}
 		})
 	}

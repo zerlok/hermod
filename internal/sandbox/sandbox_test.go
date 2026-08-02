@@ -66,6 +66,58 @@ func TestAttachComposesSshTmuxLine(t *testing.T) {
 	}
 }
 
+// fixedChannel is a Channeler with a fixed channel, standing in for whatever is
+// serving one.
+type fixedChannel struct{ ch Channel }
+
+func (f fixedChannel) Channel() Channel { return f.ch }
+
+// TestChannelRidesInteractiveOnly asserts a carried channel becomes a reverse
+// forward on the attach ssh and never on the liveness probe.
+func TestChannelRidesInteractiveOnly(t *testing.T) {
+	cases := []struct {
+		name         string
+		channel      Channeler
+		wantInAttach bool
+		wantSpec     string
+	}{
+		{"nothing to carry leaves attach unchanged", nil, false, ""},
+		{"a zero channel carries nothing", fixedChannel{}, false, ""},
+		{"half a channel is no channel", fixedChannel{Channel{Remote: "/r/s.sock"}}, false, ""},
+		{"channel adds -R to attach", fixedChannel{Channel{Local: "/l/s.sock", Remote: "/r/s.sock"}}, true, "/r/s.sock:/l/s.sock"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			attach := &recShell{}
+			NewSession(attach, Config{Host: "prod", Session: "api", Dir: "/home/u/api", Channel: tc.channel}).
+				Attach(context.Background())
+			hasR := containsArg(attach.got.Argv, "-R")
+			if hasR != tc.wantInAttach {
+				t.Errorf("attach argv -R present = %v, want %v (argv=%q)", hasR, tc.wantInAttach, attach.got.Argv)
+			}
+			if tc.wantSpec != "" && !containsArg(attach.got.Argv, tc.wantSpec) {
+				t.Errorf("attach argv missing forward spec %q, got %q", tc.wantSpec, attach.got.Argv)
+			}
+
+			probe := &recShell{}
+			NewSession(probe, Config{Host: "prod", Session: "api", Channel: tc.channel}).
+				IsActive(context.Background())
+			if containsArg(probe.got.Argv, "-R") {
+				t.Errorf("probe argv must never carry -R, got %q", probe.got.Argv)
+			}
+		})
+	}
+}
+
+func containsArg(argv []string, want string) bool {
+	for _, a := range argv {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestIsActive(t *testing.T) {
 	cases := []struct {
 		name      string

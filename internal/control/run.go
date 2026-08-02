@@ -17,7 +17,7 @@ import (
 // the flow. Under dry-run, side-effecting commands are printed to stdout as a
 // copy-pasteable plan while probes still run for real.
 func Run(ctx context.Context, host string, opts ...Option) error {
-	o := Options{Sandbox: host}
+	o := Options{Sandbox: host, Notify: true}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -32,12 +32,22 @@ func Run(ctx context.Context, host string, opts ...Option) error {
 	gitIdentity := git.New(real, o.LocalDir).Read(ctx)
 	logger.Printf("git identity: %s", describe(gitIdentity))
 
+	// The notification back-channel is best-effort: a failure to open it leaves the
+	// zero notifier — no channel, no environment, nothing to stop — so it can never
+	// affect the sync-and-attach flow or the pause/teardown decision.
+	notifier, err := openNotify(ctx, real, effective, o, logger)
+	if err != nil {
+		logger.Printf("notifications disabled: %v", err)
+	}
+	defer func() { _ = notifier.Stop() }()
+
 	remote := sandbox.NewSession(effective, sandbox.Config{
 		Host:    o.Sandbox,
 		Session: o.Session,
 		Dir:     o.RemoteDir,
 		Command: o.Command,
-		Env:     identityEnv(gitIdentity),
+		Env:     append(identityEnv(gitIdentity), notifier.Env()...),
+		Channel: notifier,
 	})
 
 	session, err := mirror.NewMutagenSession(ctx, effective, real, mirror.Config{
