@@ -66,18 +66,25 @@ func TestAttachComposesSshTmuxLine(t *testing.T) {
 	}
 }
 
+// fixedChannel is a Channeler with a fixed channel, standing in for whatever is
+// serving one.
+type fixedChannel struct{ ch Channel }
+
+func (f fixedChannel) Channel() Channel { return f.ch }
+
 // TestChannelRidesInteractiveOnly asserts a carried channel becomes a reverse
 // forward on the attach ssh and never on the liveness probe.
 func TestChannelRidesInteractiveOnly(t *testing.T) {
 	cases := []struct {
 		name         string
-		channel      Channel
+		channel      Channeler
 		wantInAttach bool
 		wantSpec     string
 	}{
-		{"no channel leaves attach unchanged", Channel{}, false, ""},
-		{"half a channel is no channel", Channel{Remote: "/r/s.sock"}, false, ""},
-		{"channel adds -R to attach", Channel{Local: "/l/s.sock", Remote: "/r/s.sock"}, true, "/r/s.sock:/l/s.sock"},
+		{"nothing to carry leaves attach unchanged", nil, false, ""},
+		{"a zero channel carries nothing", fixedChannel{}, false, ""},
+		{"half a channel is no channel", fixedChannel{Channel{Remote: "/r/s.sock"}}, false, ""},
+		{"channel adds -R to attach", fixedChannel{Channel{Local: "/l/s.sock", Remote: "/r/s.sock"}}, true, "/r/s.sock:/l/s.sock"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

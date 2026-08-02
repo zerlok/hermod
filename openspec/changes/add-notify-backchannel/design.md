@@ -98,19 +98,21 @@ read/write deadlines, and shutdown — none of which is worth hand-rolling, and 
 defect in the hand-rolled version (an unbounded `go handle(conn)` per accept, a manual read
 deadline, no graceful stop).
 
-- **Bounded concurrency**: `http.Server` still runs a goroutine per connection, so the listener is
-  wrapped in a `limitListener` that takes a slot before each accept and releases it on close —
-  capping in-flight senders (and goroutines) at 8. Beyond that, connections wait in the kernel's
-  backlog instead of becoming work in this process. Closing the listener releases anything waiting,
-  so shutdown leaks nothing.
 - **Two timeouts, not one**: the server's read/write deadlines bound a slow *peer*; a separate
   `notifyTimeout` bounds raising the notification, so a wedged `notify-send` is killed (the leaf
-  runs under `exec.CommandContext`) rather than holding a slot forever.
+  runs under `exec.CommandContext`) rather than holding the request open forever.
+- **Contexts come from the request**: the handler derives its context from `r.Context()`, and the
+  server's `BaseContext` is the channel's, so one context carries both signals — the sender hanging
+  up and the session ending. (An earlier revision stashed the channel context in the handler struct
+  to keep a hang-up from cancelling a toast in flight; storing a context in a struct to defeat the
+  standard mechanism is the wrong trade, and it was dropped on review.)
 - **The handler answers after the notification is raised**, so a sender learns whether its message
   landed instead of reporting success into the void.
-- **Keep-alives are off on the sender**: one message is one connection. An idle connection would
-  otherwise hold a server slot until the idle timeout — measurably so; it turned up as a 10-second
-  test before it could turn up as a wedged channel.
+- **Keep-alives are off on the sender**: one message is one connection, so the server is not left
+  holding an idle one until its timeout.
+- **No concurrency limiter for now.** `http.Server` runs a goroutine per connection; bounding that
+  is a listener-wrapper away if it ever matters, but nothing about a per-user notification socket
+  suggests it will, and an unused limiter is a moving part with its own shutdown edge cases.
 
 ### Decision: `hermod notify` subcommand as the sender, any HTTP client as the fallback
 The subcommand keeps the wire an internal contract (encoder/decoder share the one `Message`) and

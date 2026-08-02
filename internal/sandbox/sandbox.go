@@ -25,10 +25,10 @@ type Session interface {
 type Config struct {
 	Host    string
 	Session string
-	Dir     string   // sandbox working directory
-	Command []string // passthrough command; nil runs the default shell
-	Env     []string // git identity carried into the session
-	Channel Channel  // local↔sandbox channel to carry on the attach; zero carries none
+	Dir     string    // sandbox working directory
+	Command []string  // passthrough command; nil runs the default shell
+	Env     []string  // git identity carried into the session
+	Channel Channeler // local↔sandbox channel to carry on the attach; nil carries none
 }
 
 // sandbox is a tmux-over-ssh Session. It wraps the given inner (leaf) shell with
@@ -50,8 +50,10 @@ func NewSession(inner shell.Shell, cfg Config) Session {
 	// A channel is carried by the interactive attach ssh only — its forward lives
 	// exactly as long as the attach — and never by the liveness probe.
 	opts := []shell.SSHOption{shell.WithTty()}
-	if !cfg.Channel.IsZero() {
-		opts = append(opts, shell.WithReverseForward(cfg.Channel.reverseSpec()))
+	if cfg.Channel != nil {
+		if ch := cfg.Channel.Channel(); !ch.IsZero() {
+			opts = append(opts, shell.WithReverseForward(ch.reverseSpec()))
+		}
 	}
 	return &sandbox{
 		session:     cfg.Session,

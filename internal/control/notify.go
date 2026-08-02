@@ -14,6 +14,9 @@ import (
 // to write, and the local listener to shut down afterwards. The zero value is a
 // run without notifications and every method on it is safe, so a caller never
 // branches on whether the channel came up.
+//
+// It satisfies sandbox.Channeler, so the session takes the notifier itself rather
+// than being handed a channel picked out of it.
 type notifier struct {
 	channel sandbox.Channel
 	stop    func() error

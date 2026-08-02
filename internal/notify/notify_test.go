@@ -258,15 +258,13 @@ func TestSendUnsetEnvErrors(t *testing.T) {
 	}
 }
 
-// TestConcurrentSendersAreQueuedNotDropped asserts the concurrency bound holds
-// senders back rather than losing their messages: more senders than slots, every
-// message still delivered.
-func TestConcurrentSendersAreQueuedNotDropped(t *testing.T) {
+// TestConcurrentSendersAllDelivered asserts a burst of senders costs no messages.
+func TestConcurrentSendersAllDelivered(t *testing.T) {
 	cases := []struct {
 		name    string
 		senders int
 	}{
-		{"more senders than slots", maxInFlight * 3},
+		{"a burst of senders", 24},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

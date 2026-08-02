@@ -5,7 +5,9 @@ The remote session SHALL provide the means to establish a named communication ch
 local machine and the sandbox, so callers can exchange messages with a sandbox process without
 constructing transports themselves. Opening a channel SHALL yield an address for each end; carrying
 a channel SHALL forward the sandbox end to the local end for exactly the lifetime of the attach
-connection. What travels over a channel is the caller's concern, not the session's.
+connection. A session SHALL accept whatever is serving a channel as the thing that has one, rather
+than requiring the caller to take it apart. What travels over a channel is the caller's concern, not
+the session's.
 
 #### Scenario: A carried channel is forwarded by the attach
 - **WHEN** a session is prepared with a channel

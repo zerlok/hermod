@@ -20,6 +20,13 @@ type Channel struct {
 	Remote string // path inside the sandbox that a process writes to
 }
 
+// Channeler is anything that has a channel for a session to carry — whoever is
+// serving one names itself here rather than being taken apart by the caller. A
+// nil Channeler, or one whose Channel is zero, carries nothing.
+type Channeler interface {
+	Channel() Channel
+}
+
 // IsZero reports whether the channel is absent (nothing to forward or serve).
 func (c Channel) IsZero() bool { return c.Local == "" || c.Remote == "" }
 

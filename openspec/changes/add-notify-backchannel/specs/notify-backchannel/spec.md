@@ -65,12 +65,11 @@ with no Hermod binary can still raise a notification. The address SHALL be all a
 - **WHEN** a generally available tool sends a well-formed message to the carried address
 - **THEN** the local machine raises the notification, exactly as it would for `hermod notify`
 
-### Requirement: Concurrent senders are bounded but not lost
-The channel SHALL bound the work it does at once, so a burst of senders cannot grow the local
-process without limit. Senders beyond that bound SHALL wait rather than lose their messages.
+### Requirement: Concurrent senders lose no messages
+Senders that reach the channel at the same time SHALL each have their message delivered.
 
-#### Scenario: More senders than the channel serves at once
-- **WHEN** more senders than the concurrency bound send at the same time
+#### Scenario: A burst of senders
+- **WHEN** many senders send at the same time
 - **THEN** every message is delivered
 - **AND** no sender reports a failure
 

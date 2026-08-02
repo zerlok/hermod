@@ -47,7 +47,7 @@ func Run(ctx context.Context, host string, opts ...Option) error {
 		Dir:     o.RemoteDir,
 		Command: o.Command,
 		Env:     append(identityEnv(gitIdentity), notifier.Env()...),
-		Channel: notifier.Channel(),
+		Channel: notifier,
 	})
 
 	session, err := mirror.NewMutagenSession(ctx, effective, real, mirror.Config{

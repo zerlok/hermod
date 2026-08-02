@@ -48,15 +48,11 @@ const apiPath = "/notify"
 const (
 	// maxMessage bounds a request body so a rogue sender cannot exhaust memory.
 	maxMessage = 8 << 10
-	// maxInFlight bounds how many senders are served at once, and with it the
-	// goroutines the server runs. Beyond it, connections wait in the kernel's
-	// backlog rather than becoming work in this process.
-	maxInFlight = 8
 	// requestTimeout bounds reading and answering one request, so a peer that
-	// connects but never finishes cannot hold a slot.
+	// connects but never finishes is not kept around.
 	requestTimeout = 5 * time.Second
-	// notifyTimeout bounds raising one notification, so a wedged desktop tool
-	// cannot hold a slot either — the tool is killed and the message dropped.
+	// notifyTimeout bounds raising one notification, so a wedged desktop tool is
+	// killed and the message dropped rather than holding the request open.
 	notifyTimeout = 10 * time.Second
 )
 
@@ -99,7 +95,7 @@ func Listen(ctx context.Context, sock string, n Notifier, logger *log.Logger) (s
 	_ = os.Chmod(sock, 0o600)
 
 	mux := http.NewServeMux()
-	mux.Handle("POST "+apiPath, &handler{base: ctx, n: n, log: logger})
+	mux.Handle("POST "+apiPath, &handler{n: n, log: logger})
 	srv := &http.Server{
 		Handler:           mux,
 		ReadTimeout:       requestTimeout,
@@ -107,6 +103,9 @@ func Listen(ctx context.Context, sock string, n Notifier, logger *log.Logger) (s
 		WriteTimeout:      requestTimeout + notifyTimeout,
 		IdleTimeout:       requestTimeout,
 		ErrorLog:          logger,
+		// Every request context descends from the channel's, so ending the session
+		// cancels whatever it is in the middle of.
+		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 
 	var once sync.Once
@@ -125,18 +124,16 @@ func Listen(ctx context.Context, sock string, n Notifier, logger *log.Logger) (s
 	go func() {
 		// Serve owns the accept loop and the per-connection goroutines; it returns
 		// only once the listener is closed, which is what stop does.
-		_ = srv.Serve(limit(ln, maxInFlight))
+		_ = srv.Serve(ln)
 	}()
 	return stop, nil
 }
 
-// handler turns one request into one notification. It answers as soon as the
-// message has been raised, so a sender learns whether it landed; base is the
-// channel's context, so a sender that hangs up mid-toast does not cancel it.
+// handler turns one request into one notification, answering once the message has
+// been raised so a sender learns whether it landed.
 type handler struct {
-	base context.Context
-	n    Notifier
-	log  *log.Logger
+	n   Notifier
+	log *log.Logger
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -148,7 +145,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "malformed or empty message", http.StatusBadRequest)
 		return
 	}
-	ctx, cancel := context.WithTimeout(h.base, notifyTimeout)
+	// The request's context carries both the sender hanging up and the channel
+	// closing; the timeout bounds a desktop tool that answers neither.
+	ctx, cancel := context.WithTimeout(r.Context(), notifyTimeout)
 	defer cancel()
 	_ = h.n.Notify(ctx, m) // best-effort; never escapes
 	w.WriteHeader(http.StatusNoContent)
@@ -184,8 +183,8 @@ func Send(ctx context.Context, m Message) error {
 
 // unixTransport dials the given unix socket for every request, whatever the URL's
 // host says — over a unix socket the host is only there to make a valid URL.
-// Keep-alives are off: one message is one connection, and an idle connection left
-// open would hold one of the server's slots for nothing.
+// Keep-alives are off: one message is one connection, so the server is not left
+// holding an idle one until its timeout.
 func unixTransport(sock string) *http.Transport {
 	return &http.Transport{
 		DisableKeepAlives: true,
@@ -193,51 +192,6 @@ func unixTransport(sock string) *http.Transport {
 			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 		},
 	}
-}
-
-// limitListener caps the connections served at once, and with them the goroutines
-// the server runs: a slot is taken before each accept and released when the
-// connection closes. Closing it releases anything waiting for a slot.
-type limitListener struct {
-	net.Listener
-	sem  chan struct{}
-	done chan struct{}
-	once sync.Once
-}
-
-func limit(ln net.Listener, n int) net.Listener {
-	return &limitListener{Listener: ln, sem: make(chan struct{}, n), done: make(chan struct{})}
-}
-
-func (l *limitListener) Accept() (net.Conn, error) {
-	select {
-	case l.sem <- struct{}{}:
-	case <-l.done:
-		return nil, net.ErrClosed
-	}
-	conn, err := l.Listener.Accept()
-	if err != nil {
-		<-l.sem
-		return nil, err
-	}
-	return &limitConn{Conn: conn, release: sync.OnceFunc(func() { <-l.sem })}, nil
-}
-
-func (l *limitListener) Close() error {
-	l.once.Do(func() { close(l.done) })
-	return l.Listener.Close()
-}
-
-// limitConn releases its slot when closed — which http.Server always does, once,
-// per connection it accepted.
-type limitConn struct {
-	net.Conn
-	release func()
-}
-
-func (c *limitConn) Close() error {
-	defer c.release()
-	return c.Conn.Close()
 }
 
 // urgency normalises the wire urgency to a notify-send value, defaulting to normal.
