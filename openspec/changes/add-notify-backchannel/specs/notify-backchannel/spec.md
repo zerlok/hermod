@@ -34,13 +34,18 @@ Because it is best-effort, being on by default costs a session that cannot use i
 #### Scenario: A malformed or oversized message is dropped
 - **WHEN** a message that is empty, malformed, or exceeds the size cap arrives on the channel
 - **THEN** it is dropped without raising a notification
+- **AND** the sender is told it was refused
 - **AND** no error escapes to affect the session
+
+#### Scenario: A wedged desktop tool does not wedge the channel
+- **WHEN** raising a notification does not complete within its time limit
+- **THEN** the attempt is abandoned and the channel goes on serving later messages
 
 ### Requirement: Sandbox-side sender
 Hermod SHALL provide a `hermod notify [--title <t>] [--urgency low|normal|critical] <body>`
-subcommand that sends one message over the channel using the carried address. When the carried
-address is absent from the environment, the subcommand SHALL fail with a clear error and SHALL NOT
-affect any other process.
+subcommand that sends one message over the channel using the carried address, and SHALL report to
+the sender whether the message was accepted. When the carried address is absent from the
+environment, the subcommand SHALL fail with a clear error and SHALL NOT affect any other process.
 
 #### Scenario: Send from inside a session
 - **WHEN** `hermod notify --urgency critical "agent blocked"` runs in a session with the channel open
@@ -51,6 +56,23 @@ affect any other process.
 - **WHEN** `hermod notify done` runs where `HERMOD_NOTIFY_SOCK` is unset
 - **THEN** the subcommand exits with a clear error
 - **AND** nothing else is affected
+
+### Requirement: The channel is reachable without the Hermod binary
+The channel SHALL speak a protocol that commonly available tools can already produce, so a sandbox
+with no Hermod binary can still raise a notification. The address SHALL be all a sender needs.
+
+#### Scenario: Sending from a box with no Hermod installed
+- **WHEN** a generally available tool sends a well-formed message to the carried address
+- **THEN** the local machine raises the notification, exactly as it would for `hermod notify`
+
+### Requirement: Concurrent senders are bounded but not lost
+The channel SHALL bound the work it does at once, so a burst of senders cannot grow the local
+process without limit. Senders beyond that bound SHALL wait rather than lose their messages.
+
+#### Scenario: More senders than the channel serves at once
+- **WHEN** more senders than the concurrency bound send at the same time
+- **THEN** every message is delivered
+- **AND** no sender reports a failure
 
 ### Requirement: Dry-run opens no channel
 Under `--dry-run` Hermod SHALL NOT open the notification channel: it SHALL neither probe nor

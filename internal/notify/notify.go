@@ -2,20 +2,28 @@
 // one short message over a unix socket (reverse-forwarded by the attach ssh) and
 // Hermod, running locally, raises a native desktop notification.
 //
+// The local end is an ordinary net/http server bound to that socket, so the
+// accept loop, per-connection lifecycle, read timeouts and graceful shutdown are
+// the standard library's rather than hand-rolled. A sender is therefore any HTTP
+// client that can reach a unix socket — `hermod notify` is the convenient one, but
+// a bare box can use curl.
+//
 // It is a leaf-tier package and deliberately knows nothing about how the socket
 // gets there: it imports only shell and the standard library, never runs a remote
 // shell, and never addresses or provisions an endpoint (sandbox owns the channel
-// between local and remote). It binds a socket it is handed, and it sends to a
+// between local and remote). It serves a socket it is handed, and it sends to a
 // socket the environment names.
 package notify
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
+	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,8 +32,8 @@ import (
 )
 
 // ChannelName is the name Hermod asks the sandbox for when opening the endpoint
-// this package listens on. One channel per sandbox user, so the address is the
-// same for every project on the box.
+// this package serves. One channel per sandbox user, so the address is the same
+// for every project on the box.
 const ChannelName = "notify"
 
 // EnvSock names the environment variable carrying the sandbox-side socket path
@@ -33,15 +41,27 @@ const ChannelName = "notify"
 // on the box.
 const EnvSock = "HERMOD_NOTIFY_SOCK"
 
-// maxMessage bounds a single message read so a rogue sender cannot exhaust memory.
-const maxMessage = 8 << 10
+// apiPath is the one endpoint on the channel. The host in a request URL is
+// meaningless over a unix socket, so any host reaches it.
+const apiPath = "/notify"
 
-// readTimeout bounds a single connection's read so a peer that connects but never
-// sends a complete message cannot wedge the channel or leak its handler goroutine.
-const readTimeout = 5 * time.Second
+const (
+	// maxMessage bounds a request body so a rogue sender cannot exhaust memory.
+	maxMessage = 8 << 10
+	// maxInFlight bounds how many senders are served at once, and with it the
+	// goroutines the server runs. Beyond it, connections wait in the kernel's
+	// backlog rather than becoming work in this process.
+	maxInFlight = 8
+	// requestTimeout bounds reading and answering one request, so a peer that
+	// connects but never finishes cannot hold a slot.
+	requestTimeout = 5 * time.Second
+	// notifyTimeout bounds raising one notification, so a wedged desktop tool
+	// cannot hold a slot either — the tool is killed and the message dropped.
+	notifyTimeout = 10 * time.Second
+)
 
 // Message is the entire wire payload — deliberately tiny, and the single source of
-// truth for both the on-box sender and the local listener.
+// truth for both the on-box sender and the local server.
 type Message struct {
 	Title   string `json:"title,omitempty"`
 	Body    string `json:"body"`
@@ -61,11 +81,12 @@ type Notifier interface {
 // sock is the channel's sandbox-side path.
 func Env(sock string) []string { return []string{EnvSock + "=" + sock} }
 
-// Listen binds sock (0600, in a 0700 dir) and serves an accept loop in a
-// background goroutine until ctx is done, raising a notification for each message
-// that arrives. It returns stop, which unlinks and closes the socket and is safe
-// to call more than once. Every post-bind error is logged and swallowed, so a
-// bound channel can never fail the session; only the bind itself can error.
+// Listen serves the channel on sock (bound 0600, in a 0700 dir) until ctx is done,
+// raising a notification for each message that arrives. It returns stop, which
+// shuts the server down and unlinks the socket, and is safe to call more than
+// once. Only the bind can fail: once served, every error — malformed request,
+// stalled peer, broken notify tool — is logged and swallowed, so the channel can
+// never fail the session.
 func Listen(ctx context.Context, sock string, n Notifier, logger *log.Logger) (stop func() error, err error) {
 	if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
 		return nil, err
@@ -77,11 +98,21 @@ func Listen(ctx context.Context, sock string, n Notifier, logger *log.Logger) (s
 	}
 	_ = os.Chmod(sock, 0o600)
 
-	l := &listener{n: n, log: logger}
+	mux := http.NewServeMux()
+	mux.Handle("POST "+apiPath, &handler{base: ctx, n: n, log: logger})
+	srv := &http.Server{
+		Handler:           mux,
+		ReadTimeout:       requestTimeout,
+		ReadHeaderTimeout: requestTimeout,
+		WriteTimeout:      requestTimeout + notifyTimeout,
+		IdleTimeout:       requestTimeout,
+		ErrorLog:          logger,
+	}
+
 	var once sync.Once
 	stop = func() error {
 		once.Do(func() {
-			_ = ln.Close()
+			_ = srv.Close()
 			_ = os.Remove(sock)
 		})
 		return nil
@@ -92,57 +123,121 @@ func Listen(ctx context.Context, sock string, n Notifier, logger *log.Logger) (s
 		_ = stop()
 	}()
 	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return // listener closed
-			}
-			// Handle in its own goroutine so a slow or stalled peer cannot starve
-			// Accept and wedge the channel for the rest of the session.
-			go l.handle(ctx, conn)
-		}
+		// Serve owns the accept loop and the per-connection goroutines; it returns
+		// only once the listener is closed, which is what stop does.
+		_ = srv.Serve(limit(ln, maxInFlight))
 	}()
 	return stop, nil
 }
 
-// listener is the serving half of a bound channel: what to do with a message and
-// where to log a dropped one.
-type listener struct {
-	n   Notifier
-	log *log.Logger
+// handler turns one request into one notification. It answers as soon as the
+// message has been raised, so a sender learns whether it landed; base is the
+// channel's context, so a sender that hangs up mid-toast does not cancel it.
+type handler struct {
+	base context.Context
+	n    Notifier
+	log  *log.Logger
 }
 
-// handle reads one bounded message from conn and dispatches it. A malformed,
-// oversized, or empty-body message is dropped without a notification, and no error
-// escapes to affect the session. A read deadline bounds a stalled sender so this
-// goroutine always returns.
-func (l *listener) handle(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
-	data, _ := io.ReadAll(io.LimitReader(conn, maxMessage))
+func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var m Message
-	if err := json.Unmarshal(data, &m); err != nil || m.Body == "" {
-		if l.log != nil {
-			l.log.Printf("notify: dropped a malformed or empty message")
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxMessage)).Decode(&m); err != nil || m.Body == "" {
+		if h.log != nil {
+			h.log.Printf("notify: dropped a malformed or empty message")
 		}
+		http.Error(w, "malformed or empty message", http.StatusBadRequest)
 		return
 	}
-	_ = l.n.Notify(ctx, m) // best-effort; never escapes
+	ctx, cancel := context.WithTimeout(h.base, notifyTimeout)
+	defer cancel()
+	_ = h.n.Notify(ctx, m) // best-effort; never escapes
+	w.WriteHeader(http.StatusNoContent)
 }
 
-// Send is the remote half: dial the socket named by EnvSock and write one Message.
+// Send is the sandbox half: POST one Message to the socket named by EnvSock.
 // Errors are the sender's concern and never affect any other process on the box.
 func Send(ctx context.Context, m Message) error {
 	sock := os.Getenv(EnvSock)
 	if sock == "" {
 		return errors.New("notify: " + EnvSock + " unset (run inside a hermod session with notifications enabled)")
 	}
-	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", sock)
+	body, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
-	return json.NewEncoder(conn).Encode(m)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://hermod"+apiPath, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{Transport: unixTransport(sock)}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("notify: channel refused the message (%s)", resp.Status)
+	}
+	return nil
+}
+
+// unixTransport dials the given unix socket for every request, whatever the URL's
+// host says — over a unix socket the host is only there to make a valid URL.
+// Keep-alives are off: one message is one connection, and an idle connection left
+// open would hold one of the server's slots for nothing.
+func unixTransport(sock string) *http.Transport {
+	return &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		},
+	}
+}
+
+// limitListener caps the connections served at once, and with them the goroutines
+// the server runs: a slot is taken before each accept and released when the
+// connection closes. Closing it releases anything waiting for a slot.
+type limitListener struct {
+	net.Listener
+	sem  chan struct{}
+	done chan struct{}
+	once sync.Once
+}
+
+func limit(ln net.Listener, n int) net.Listener {
+	return &limitListener{Listener: ln, sem: make(chan struct{}, n), done: make(chan struct{})}
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	select {
+	case l.sem <- struct{}{}:
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		<-l.sem
+		return nil, err
+	}
+	return &limitConn{Conn: conn, release: sync.OnceFunc(func() { <-l.sem })}, nil
+}
+
+func (l *limitListener) Close() error {
+	l.once.Do(func() { close(l.done) })
+	return l.Listener.Close()
+}
+
+// limitConn releases its slot when closed — which http.Server always does, once,
+// per connection it accepted.
+type limitConn struct {
+	net.Conn
+	release func()
+}
+
+func (c *limitConn) Close() error {
+	defer c.release()
+	return c.Conn.Close()
 }
 
 // urgency normalises the wire urgency to a notify-send value, defaulting to normal.

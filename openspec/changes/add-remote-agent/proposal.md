@@ -1,7 +1,7 @@
 ## Why
 
 Hermod's sandbox-side features assume a `hermod` binary on the box. `hermod notify` is the first
-one, and it lands with a documented `socat` fallback precisely because nothing installs it.
+one, and it lands with a documented `curl` fallback precisely because nothing installs it.
 
 Nobody installs a helper binary on every sandbox by hand — and if they do, nobody keeps it in step
 with the local one as Hermod changes. The wire between the two ends is an internal contract; an
@@ -25,7 +25,7 @@ binary the same way turns "install hermod on the sandbox first" into nothing the
   without depending on the box's `PATH`; where the sandbox has a conventional user `bin` directory
   on `PATH`, Hermod also links it there so plain `hermod notify done` works.
 - Bootstrapping is **best-effort and never fatal**, exactly like the notification channel: any
-  failure to probe, upload, or link is logged and the session runs normally — with the `socat`
+  failure to probe, upload, or link is logged and the session runs normally — with the `curl`
   fallback still documented for a box Hermod could not provision.
 - The local binary is only uploadable to a box of the **same platform**. Hermod SHALL detect a
   mismatch and skip cleanly rather than install a binary that cannot run; serving per-platform

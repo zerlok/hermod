@@ -5,8 +5,8 @@ Hermod runs locally and composes `mutagen + ssh + tmux` around a single interact
 stack of argv-rewriting decorators (`ssh`, `tmux`, `loginShell`) over a local leaf whose
 `NewLocal(dryRun)` either executes or **prints** — that leaf swap is the only dry-run seam. The
 interactive attach ssh is built in `sandbox.NewSession` as
-`NewLoginShell(NewTmux(NewSSH(inner, host, tty=true), session))`; a separate plain `NewSSH(...,
-false)` serves the liveness probe. Session environment (the git identity) is carried in via
+`NewLoginShell(NewTmux(NewSSH(inner, host, WithTty()), session))`; a separate plain `NewSSH(inner,
+host)` serves the liveness probe. Session environment (the git identity) is carried in via
 `sandbox.Config.Env → tmux -e`. A read-only probe stays real even under dry-run; side effects go
 through the dry-run-aware leaf.
 
@@ -32,8 +32,8 @@ that process. The gap is a transport from a sandbox process back to it. This des
 
 ## Decisions
 
-The full decided design (with Go signatures and exact argv) is the single source of truth and lives
-in the judge-panel synthesis captured in `tasks.md`'s references; the load-bearing decisions:
+`tasks.md` carries the implementation shape (Go signatures and exact argv); the load-bearing
+decisions are here:
 
 ### Decision: `sandbox` owns the channel; `notify` owns what travels over it
 The two concerns split along the layering, and `control` wires them without knowing either one's
@@ -91,11 +91,34 @@ ssh, and `StreamLocalBindUnlink=yes` clears any stale socket at the next bind.
   never own. The cost is that two concurrent sessions to the *same* sandbox user share one endpoint
   (see Risks).
 
-### Decision: `hermod notify` subcommand as the sender, `socat` as the zero-install fallback
-The subcommand keeps the wire an internal versioned contract (encoder/decoder share the one
-`Message`) and fits the single-static-binary ethos. Because the transport is a unix socket, bash
-`/dev/tcp` cannot address it, so the documented fallback is
-`printf '%s' '{"body":"done"}' | socat - UNIX-CONNECT:"$HERMOD_NOTIFY_SOCK"`.
+### Decision: The local end is a `net/http` server on the unix socket
+`notify.Listen` binds the socket and hands it to `http.Server` with one route,
+`POST /notify`. The standard library then owns the accept loop, the per-connection goroutines,
+read/write deadlines, and shutdown — none of which is worth hand-rolling, and each of which was a
+defect in the hand-rolled version (an unbounded `go handle(conn)` per accept, a manual read
+deadline, no graceful stop).
+
+- **Bounded concurrency**: `http.Server` still runs a goroutine per connection, so the listener is
+  wrapped in a `limitListener` that takes a slot before each accept and releases it on close —
+  capping in-flight senders (and goroutines) at 8. Beyond that, connections wait in the kernel's
+  backlog instead of becoming work in this process. Closing the listener releases anything waiting,
+  so shutdown leaks nothing.
+- **Two timeouts, not one**: the server's read/write deadlines bound a slow *peer*; a separate
+  `notifyTimeout` bounds raising the notification, so a wedged `notify-send` is killed (the leaf
+  runs under `exec.CommandContext`) rather than holding a slot forever.
+- **The handler answers after the notification is raised**, so a sender learns whether its message
+  landed instead of reporting success into the void.
+- **Keep-alives are off on the sender**: one message is one connection. An idle connection would
+  otherwise hold a server slot until the idle timeout — measurably so; it turned up as a 10-second
+  test before it could turn up as a wedged channel.
+
+### Decision: `hermod notify` subcommand as the sender, any HTTP client as the fallback
+The subcommand keeps the wire an internal contract (encoder/decoder share the one `Message`) and
+fits the single-static-binary ethos. Speaking HTTP means the zero-install fallback is no longer an
+obscure `socat` incantation but
+`curl --unix-socket "$HERMOD_NOTIFY_SOCK" -d '{"body":"done"}' http://hermod/notify` — and curl is
+on far more boxes than socat. The URL's host is meaningless over a unix socket; any host reaches
+the endpoint.
 
 ### Decision: On by default, with `-N`/`--no-notify` to opt out
 `control.Run` defaults `Options.Notify` on. The feature only earns its keep if it is already there
@@ -114,12 +137,21 @@ will never use — real cost for a line the user cannot copy-paste to any effect
   "would listen" note): rejected on review. A dry run should touch the sandbox as little as it can.
 
 ### Decision: Best-effort lifecycle owned by `control`, fenced off from `settle`
-`setupNotify` is a switch and nothing more: on, it asks `sandbox` for the channel and hands its
-local end to `notify.Listen`; off, under dry-run, or on any failure it returns the plain session
-(base env, zero channel, no-op stop). Every failure — probe, `mkdir`, bind, forward collision,
-accept/parse/dispatch — is logged and discarded; `Notify` returns nil unconditionally; the flow
-continues as a plain session. `stopNotify` is deferred before the mirror `settle`, which still keys
-the mirror's fate solely on session liveness.
+`openNotify` returns a `notifier` — the run's handle on the channel, exposing what the session
+carries (`Channel()`), what it contributes to the environment (`Env()`), and how it ends (`Stop()`).
+The **zero value is a run without notifications** and every method on it is safe, so `Run` never
+branches on whether the channel came up: it logs the error, defers `Stop`, and combines `Env()` with
+the git identity the way it combines any other contribution to the session environment. Composing
+the session's environment stays the runner's job; the channel only contributes its own entry.
+
+- **Alternative — pass the base environment into the setup and get the combined one back** (as first
+  built): rejected on review. It inverted the relationship: a channel does not own the session's
+  environment, and threading identity through it made a notification concern look like the
+  environment's owner.
+
+Every failure — probe, `mkdir`, bind, forward collision, request, dispatch — is logged and
+discarded; `Notify` returns nil unconditionally; the flow continues as a plain session. `Stop` is
+deferred before the mirror `settle`, which still keys the mirror's fate solely on session liveness.
 
 ## Risks / Trade-offs
 
@@ -146,7 +178,7 @@ the mirror's fate solely on session liveness.
   `:`. `probeRuntimeDir` therefore rejects a base that is not a clean absolute path (no `:` or
   whitespace), refusing the channel, so a surprising sandbox environment cannot alter the forward's
   meaning.
-- **The sandbox needs the `hermod` binary to use `hermod notify`** → the `socat` fallback covers a
+- **The sandbox needs the `hermod` binary to use `hermod notify`** → the `curl` fallback covers a
   bare box, but the ergonomic answer is `add-remote-agent`, which ships and upgrades the binary on
   attach the way Mutagen does.
 

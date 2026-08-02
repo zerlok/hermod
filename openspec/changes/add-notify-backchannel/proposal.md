@@ -25,8 +25,8 @@ No existing capability covers a remote→local signal channel, so this is a genu
   carried into the session as `HERMOD_NOTIFY_SOCK`, riding the same `tmux -e` path that already
   carries the git identity.
 - A new **`hermod notify [--title T] [--urgency low|normal|critical] <body>`** subcommand sends one
-  message from the sandbox. A `socat` one-liner is documented as a zero-install fallback, so the box
-  never strictly needs the Hermod binary. (Shipping the binary automatically is the separate
+  message from the sandbox. Because the channel speaks HTTP over its unix socket, a `curl` one-liner
+  is the zero-install fallback, so the box never strictly needs the Hermod binary. (Shipping the binary automatically is the separate
   `add-remote-agent` proposal.)
 - The back-channel is **best-effort and never fatal**: any failure to provision, bind, or notify is
   logged and the session runs normally without notifications. Under `--dry-run` no channel is opened

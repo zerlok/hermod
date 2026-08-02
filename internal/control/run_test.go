@@ -95,24 +95,23 @@ func TestTeardownByLiveness(t *testing.T) {
 	}
 }
 
-// TestSetupNotify asserts the switch and the best-effort guarantee: on, it opens a
-// channel, carries its address in the env, and binds the local listener; off,
-// under dry-run, or on any failure it hands back a plain session — the base env,
-// no channel, and nothing bound.
-func TestSetupNotify(t *testing.T) {
-	base := []string{"GIT_AUTHOR_NAME=Jane Doe"}
+// TestOpenNotify asserts the switch and the best-effort guarantee: on, it opens a
+// channel, contributes the address to the session environment, and serves the
+// local end; off, under dry-run, or on failure it yields the zero notifier and an
+// error the run is expected only to log.
+func TestOpenNotify(t *testing.T) {
 	cases := []struct {
 		name        string
 		opts        Options
 		probe       shell.Shell
 		wantChannel bool
-		wantBound   bool
+		wantErr     bool
 		wantNote    bool
 	}{
-		{"notify off is a passthrough", Options{Sandbox: "prod"}, cannedShell{stdout: "/run/user/1000"}, false, false, false},
-		{"notify on opens and binds", Options{Sandbox: "prod", Notify: true}, cannedShell{stdout: "/run/user/1000"}, true, true, false},
+		{"notify off yields the zero notifier", Options{Sandbox: "prod"}, cannedShell{stdout: "/run/user/1000"}, false, false, false},
+		{"notify on opens and serves", Options{Sandbox: "prod", Notify: true}, cannedShell{stdout: "/run/user/1000"}, true, false, false},
 		{"dry-run opens nothing", Options{Sandbox: "prod", Notify: true, DryRun: true}, cannedShell{stdout: "/run/user/1000"}, false, false, true},
-		{"probe failure degrades to plain", Options{Sandbox: "prod", Notify: true}, cannedShell{err: errors.New("unreachable")}, false, false, false},
+		{"probe failure reports and opens nothing", Options{Sandbox: "prod", Notify: true}, cannedShell{err: errors.New("unreachable")}, false, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -126,38 +125,58 @@ func TestSetupNotify(t *testing.T) {
 			t.Setenv("XDG_RUNTIME_DIR", tmp)
 			var logbuf bytes.Buffer
 			eff := &recLeaf{}
-			env, ch, stop := setupNotify(context.Background(), tc.probe, eff, tc.opts, base, log.New(&logbuf, "", 0))
-			defer func() { _ = stop() }()
+			n, err := openNotify(context.Background(), tc.probe, eff, tc.opts, log.New(&logbuf, "", 0))
+			defer func() { _ = n.Stop() }()
 
+			if (err != nil) != tc.wantErr {
+				t.Errorf("err = %v, wantErr %v", err, tc.wantErr)
+			}
 			if gotNote := strings.Contains(logbuf.String(), "--dry-run"); gotNote != tc.wantNote {
 				t.Errorf("dry-run note logged = %v, want %v (log=%q)", gotNote, tc.wantNote, logbuf.String())
 			}
-			if tc.opts.DryRun && eff.got.Argv != nil {
-				t.Errorf("dry-run must not provision the sandbox end, got %q", eff.got.Argv)
+			if !tc.wantChannel && eff.got.Argv != nil {
+				t.Errorf("nothing may be provisioned without a channel, got %q", eff.got.Argv)
 			}
-			if len(env) == 0 || env[0] != base[0] {
-				t.Errorf("base env not preserved: %q", env)
+			if got := !n.Channel().IsZero(); got != tc.wantChannel {
+				t.Errorf("channel opened = %v, want %v (%+v)", got, tc.wantChannel, n.Channel())
 			}
-			hasKey := false
-			for _, e := range env {
-				if strings.HasPrefix(e, notify.EnvSock+"=") {
-					hasKey = true
-				}
-			}
-			if hasKey != tc.wantChannel {
-				t.Errorf("env carries %s = %v, want %v (env=%q)", notify.EnvSock, hasKey, tc.wantChannel, env)
-			}
-			if got := !ch.IsZero(); got != tc.wantChannel {
-				t.Errorf("channel opened = %v, want %v (%+v)", got, tc.wantChannel, ch)
+			if want := tc.wantChannel; (n.Env() != nil) != want {
+				t.Errorf("env contribution = %q, want any %v", n.Env(), want)
 			}
 			if tc.wantChannel {
-				if want := notify.Env(ch.Remote)[0]; env[len(env)-1] != want {
-					t.Errorf("carried address = %q, want %q", env[len(env)-1], want)
+				if want := notify.Env(n.Channel().Remote); !reflect.DeepEqual(n.Env(), want) {
+					t.Errorf("env contribution = %q, want %q", n.Env(), want)
 				}
-				_, statErr := os.Stat(ch.Local)
-				if bound := statErr == nil; bound != tc.wantBound {
-					t.Errorf("socket bound = %v, want %v (local=%q)", bound, tc.wantBound, ch.Local)
+				if _, err := os.Stat(n.Channel().Local); err != nil {
+					t.Errorf("local end not served: %v", err)
 				}
+			}
+		})
+	}
+}
+
+// TestZeroNotifier pins what lets Run use the handle without ever branching on
+// whether the channel came up.
+func TestZeroNotifier(t *testing.T) {
+	cases := []struct {
+		name string
+		n    notifier
+	}{
+		{"zero value", notifier{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !tc.n.Channel().IsZero() {
+				t.Errorf("Channel() = %+v, want zero", tc.n.Channel())
+			}
+			if tc.n.Env() != nil {
+				t.Errorf("Env() = %q, want none", tc.n.Env())
+			}
+			if err := tc.n.Stop(); err != nil {
+				t.Errorf("Stop() error: %v", err)
+			}
+			if err := tc.n.Stop(); err != nil {
+				t.Errorf("second Stop() error: %v", err)
 			}
 		})
 	}

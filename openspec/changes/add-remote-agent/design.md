@@ -7,7 +7,7 @@ through the dry-run-aware effective leaf. `control.Run` is the composition layer
 transport to the box; `shell` decorators rewrite argv down to a leaf that either executes or prints.
 
 `add-notify-backchannel` introduced the first feature whose *sandbox* half is a Hermod command
-(`hermod notify`), and shipped with a `socat` one-liner as the zero-install fallback — an admission
+(`hermod notify`), and shipped with a `curl` one-liner as the zero-install fallback — an admission
 that nothing puts the binary there. This change removes the premise.
 
 Two facts shape the design. Hermod has **no version concept at all** today: no build stamp, no
@@ -89,7 +89,7 @@ points into `~/.hermod/bin` — Hermod never replaces a `hermod` the user put th
 ### Decision: Bootstrapping is one more best-effort step in `control`
 It sits beside `setupNotify`, before attach, and returns nothing the flow depends on. Probe failure,
 platform mismatch, a full disk, a read-only home — each logs one line and the session continues,
-with the `socat` fallback still documented. A `--no-agent` flag skips it entirely for a box that
+with the `curl` fallback still documented. A `--no-agent` flag skips it entirely for a box that
 must not be written to.
 
 ## Risks / Trade-offs

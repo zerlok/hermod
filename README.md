@@ -126,15 +126,16 @@ Wire it into an agent hook (`hermod notify done || true`) so a long run pings yo
 or gets stuck — even if you've switched to your browser.
 
 **How it works.** The attach connection carries an `ssh -R` reverse forward mapping a unix socket
-on the box to one on your machine; Hermod listens locally and raises the toast (via `notify-send`
-on Linux or `osascript` on macOS) plus a sound. The socket lives in a `0700` directory on both
-ends, so only you can reach it, and its path is exported into the session as
-`$HERMOD_NOTIFY_SOCK`. It is **one socket per sandbox user**, not per project, so its address is
+on the box to one on your machine; Hermod serves a small HTTP endpoint on that socket and raises
+the toast (via `notify-send` on Linux or `osascript` on macOS) plus a sound. The socket lives in a
+`0700` directory on both ends, so only you can reach it, and its path is exported into the session
+as `$HERMOD_NOTIFY_SOCK`. It is **one socket per sandbox user**, not per project, so its address is
 the same for every session you run on that box.
 
 - **Requirements:** locally, `notify-send` (libnotify) on Linux — macOS needs nothing extra. On the
-  box, either the `hermod` binary (for `hermod notify`) or, with no install, `socat`:
-  `printf '%s' '{"body":"done"}' | socat - UNIX-CONNECT:"$HERMOD_NOTIFY_SOCK"`.
+  box, either the `hermod` binary (for `hermod notify`) or, with no install, anything that speaks
+  HTTP to a unix socket:
+  `curl --unix-socket "$HERMOD_NOTIFY_SOCK" -d '{"body":"done"}' http://hermod/notify`.
   Installing Hermod on the sandbox is a manual step today; the
   [remote-agent proposal](openspec/changes/add-remote-agent/proposal.md) removes it by shipping
   and upgrading the binary on attach, the way Mutagen does with its agent.

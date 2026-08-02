@@ -4,11 +4,12 @@
 - [x] 1.2 Add per-OS notifiers (`linuxNotifier` `notify-send --app-name=hermod --urgency=… -- <title> <body>` + best-effort `paplay`; `darwinNotifier` `osascript -e 'display notification … with title … sound name "Glass"'`; `noopNotifier`) in one file, selected by `runtime.GOOS` in `NewNotifier` (the notifiers are pure argv builders, so all compile and unit-test on any host — cleaner than build tags). All run tools through the injected `shell.Shell` with `Capture` set so their stdio never bleeds into the attach terminal; `Notify` returns nil unconditionally (best-effort).
 - [x] 1.3 `urgency` maps `low|normal|critical` (default `normal`); `orDefault` fills the `hermod` title; `asAppleStr` strips control chars and quotes the AppleScript literal.
 
-## 2. notify package — local listener + sandbox-side send
+## 2. notify package — local server + sandbox-side send
 
-- [x] 2.1 `Listen(ctx, sock string, n Notifier, log *log.Logger) (stop func() error, err error)`: bind the socket it is handed (`0600`, dir `0700`), accept-loop in a goroutine until ctx is done; `stop` unlinks + closes, idempotent. Post-bind errors (accept/parse/dispatch) are logged and swallowed.
-- [x] 2.2 `listener.handle`: read under `io.LimitReader(conn, 8<<10)` behind a read deadline, `json.Unmarshal`; drop on error or empty body; else `Notifier.Notify`. No error escapes.
-- [x] 2.3 `Send(ctx, m Message) error`: read `EnvSock`; error clearly if unset; `net.Dial("unix", …)` and `json.NewEncoder(conn).Encode(m)`.
+- [x] 2.1 `Listen(ctx, sock string, n Notifier, log *log.Logger) (stop func() error, err error)`: bind the socket it is handed (`0600`, dir `0700`) and serve it with `http.Server` (one route, `POST /notify`) until ctx is done; `stop` closes the server and unlinks, idempotent. Only the bind can fail; everything after is logged and swallowed.
+- [x] 2.2 Bound the work: wrap the listener in a `limitListener` (slot taken before accept, released on close) so in-flight senders — and the server's goroutines — cap at 8, waiting rather than dropping; closing it releases anything waiting so shutdown leaks nothing.
+- [x] 2.3 `handler.ServeHTTP`: decode under `http.MaxBytesReader(w, r.Body, 8<<10)`; refuse malformed or empty-body with 400; else raise the notification under its own `notifyTimeout` (so a wedged tool cannot hold a slot) and answer 204. No error escapes.
+- [x] 2.4 `Send(ctx, m Message) error`: read `EnvSock`; error clearly if unset; POST the message over a keep-alive-free unix-socket transport and report a non-204 answer as a refusal.
 
 ## 3. shell — reverse forward option
 
@@ -22,8 +23,9 @@
 ## 5. control — the switch, and nothing else
 
 - [x] 5.1 `options.go`: `Options.Notify bool` + `WithNotify(on bool) Option`; `Run` defaults it **on**.
-- [x] 5.2 `run.go`: `setupNotify` returns `(env, sandbox.Channel, stop)`. Off, under `--dry-run`, or on any failure → the plain session (base env, zero channel, no-op stop) and a log line. On → `sandbox.OpenChannel(…, notify.ChannelName)`, `notify.Listen(ctx, ch.Local, notify.NewNotifier(effective), logger)`, and `notify.Env(ch.Remote)` appended to the session env. No addressing or provisioning detail lives in `control`.
-- [x] 5.3 Confirm `stopNotify` is deferred, idempotent, and sits before the mirror `settle`; the pause/teardown path is untouched.
+- [x] 5.2 `control/notify.go`: a `notifier` handle — `Channel()`, `Env()`, `Stop()` — whose zero value is a run without notifications, so `Run` never branches on whether the channel came up. `openNotify` returns it: off or under `--dry-run` the zero value (plus the dry-run note); otherwise `sandbox.OpenChannel(…, notify.ChannelName)` then `notify.Listen(ctx, channel.Local, notify.NewNotifier(effective), logger)`. Errors are returned for `Run` to log. No addressing or provisioning detail lives in `control`.
+- [x] 5.3 `run.go` composes the session environment itself — `append(identityEnv(gitIdentity), notifier.Env()...)` — rather than handing the identity to the channel to combine.
+- [x] 5.4 Confirm `Stop` is deferred, idempotent, and sits before the mirror `settle`; the pause/teardown path is untouched.
 
 ## 6. cli — flag + sender subcommand
 
@@ -34,16 +36,17 @@
 
 - [x] 7.1 `shell/ssh_test.go`: rows for `WithTty`/`WithReverseForward` argv order + a two-forward row + regression rows asserting probe/plain attach carry no `-R`.
 - [x] 7.2 `notify` notifier argv table (linux + darwin constructed directly): urgency mapping, `hermod` title default, sound line, `--` end-of-options guard.
-- [x] 7.3 `notify` wire/dispatch table over a real in-process bound socket + fake `Notifier`: well-formed, empty-body dropped, unknown-urgency passthrough, oversized dropped, malformed dropped; assert no error escapes.
-- [x] 7.4 `notify` addressing table: `Env` shape, `Send` dials exactly what `Env` carries, unset env errors; `Listen`+`stop` binds then unlinks, idempotent.
-- [x] 7.5 `sandbox/channel_test.go`: `OpenChannel` provisioning argv + both addresses; same host ⇒ same sandbox endpoint, different hosts ⇒ different local endpoints; unusable runtime dir (probe error, empty, relative, colon, space, trailing banner) refuses and provisions nothing.
-- [x] 7.6 `sandbox_test.go`: a carried channel ⇒ `-R` with its spec in the interactive argv, never in the probe; zero/half channel ⇒ today's argv exactly.
-- [x] 7.7 `run_test.go`: notify on ⇒ channel opened, `HERMOD_NOTIFY_SOCK` carried, socket bound; off / dry-run / probe failure ⇒ plain session, nothing provisioned, dry-run note logged.
-- [x] 7.8 `cli_test.go`: `--no-notify`/`-N` opt-out rows (and notify on by default), `hermod notify` arg parsing with `notify.Send` stubbed.
+- [x] 7.3 `notify` request table over a real in-process served socket + fake `Notifier`: well-formed, empty-body refused, unknown-urgency passthrough, oversized refused, malformed refused, wrong path/method refused; assert the status the sender sees and that no error escapes.
+- [x] 7.4 `notify` addressing table: `Env` shape, `Send` reaches exactly what `Env` carries, a refusal is reported to the sender, unset env errors; `Listen`+`stop` binds then unlinks, idempotent.
+- [x] 7.5 `notify`: a hand-written HTTP request over the raw socket dispatches (pins the documented zero-install fallback), and more concurrent senders than slots all get through.
+- [x] 7.6 `sandbox/channel_test.go`: `OpenChannel` provisioning argv + both addresses; same host ⇒ same sandbox endpoint, different hosts ⇒ different local endpoints; unusable runtime dir (probe error, empty, relative, colon, space, trailing banner) refuses and provisions nothing.
+- [x] 7.7 `sandbox_test.go`: a carried channel ⇒ `-R` with its spec in the interactive argv, never in the probe; zero/half channel ⇒ today's argv exactly.
+- [x] 7.8 `run_test.go`: notify on ⇒ channel opened, `HERMOD_NOTIFY_SOCK` carried, socket bound; off / dry-run / probe failure ⇒ plain session, nothing provisioned, dry-run note logged.
+- [x] 7.9 `cli_test.go`: `--no-notify`/`-N` opt-out rows (and notify on by default), `hermod notify` arg parsing with `notify.Send` stubbed.
 
 ## 8. Docs + validate
 
-- [x] 8.1 Add a notification section to `README.md` (default-on, `hermod notify done` on the box, the `socat` fallback, the per-user endpoint) and resolve the README's forward reference to the back-channel.
+- [x] 8.1 Add a notification section to `README.md` (default-on, `hermod notify done` on the box, the `curl --unix-socket` fallback, the per-user endpoint) and resolve the README's forward reference to the back-channel.
 - [x] 8.2 Note the packages in `README.md`'s project structure and `docs/ARCHITECTURE.md`'s domain-object table (`sandbox.Channel`, `notify.Notifier`, the layering line).
 - [x] 8.3 Run `make build`, `make test`, `make lint`.
 - [x] 8.4 Run `openspec validate add-notify-backchannel`.

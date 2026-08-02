@@ -9,7 +9,6 @@ import (
 
 	"github.com/zerlok/hermod/internal/git"
 	"github.com/zerlok/hermod/internal/mirror"
-	"github.com/zerlok/hermod/internal/notify"
 	"github.com/zerlok/hermod/internal/sandbox"
 	"github.com/zerlok/hermod/internal/shell"
 )
@@ -33,19 +32,22 @@ func Run(ctx context.Context, host string, opts ...Option) error {
 	gitIdentity := git.New(real, o.LocalDir).Read(ctx)
 	logger.Printf("git identity: %s", describe(gitIdentity))
 
-	// The notification back-channel is best-effort: setupNotify returns a plain
-	// session (identity-only env, no channel, no-op stop) on any failure, so it
-	// can never affect the sync-and-attach flow or the pause/teardown decision.
-	env, channel, stopNotify := setupNotify(ctx, real, effective, o, identityEnv(gitIdentity), logger)
-	defer func() { _ = stopNotify() }()
+	// The notification back-channel is best-effort: a failure to open it leaves the
+	// zero notifier — no channel, no environment, nothing to stop — so it can never
+	// affect the sync-and-attach flow or the pause/teardown decision.
+	notifier, err := openNotify(ctx, real, effective, o, logger)
+	if err != nil {
+		logger.Printf("notifications disabled: %v", err)
+	}
+	defer func() { _ = notifier.Stop() }()
 
 	remote := sandbox.NewSession(effective, sandbox.Config{
 		Host:    o.Sandbox,
 		Session: o.Session,
 		Dir:     o.RemoteDir,
 		Command: o.Command,
-		Env:     env,
-		Channel: channel,
+		Env:     append(identityEnv(gitIdentity), notifier.Env()...),
+		Channel: notifier.Channel(),
 	})
 
 	session, err := mirror.NewMutagenSession(ctx, effective, real, mirror.Config{
@@ -117,38 +119,6 @@ func identityEnv(id git.Identity) []string {
 		env = append(env, "GIT_AUTHOR_EMAIL="+id.Email, "GIT_COMMITTER_EMAIL="+id.Email)
 	}
 	return env
-}
-
-// setupNotify turns the local-notification back-channel on or off, returning the
-// session env (the git identity, plus the channel address when on), the channel
-// for the attach to carry, and a stop func for the local listener. How the channel
-// is addressed and provisioned belongs to sandbox, and what arrives on it belongs
-// to notify; this is only the switch and the best-effort guarantee — every failure
-// logs and falls back to a plain session (base env, no channel, no-op stop).
-func setupNotify(ctx context.Context, real, effective shell.Shell, o Options, baseEnv []string, logger *log.Logger) ([]string, sandbox.Channel, func() error) {
-	noop := func() error { return nil }
-	plain := func() ([]string, sandbox.Channel, func() error) { return baseEnv, sandbox.Channel{}, noop }
-
-	if !o.Notify {
-		return plain()
-	}
-	if o.DryRun {
-		// Opening the channel would provision an endpoint on the sandbox and bind a
-		// local socket; a dry run does neither, so it plans a plain session.
-		logger.Printf("# notify: back-channel not opened under --dry-run")
-		return plain()
-	}
-	ch, err := sandbox.OpenChannel(ctx, real, effective, o.Sandbox, notify.ChannelName)
-	if err != nil {
-		logger.Printf("notifications disabled: %v", err)
-		return plain()
-	}
-	stop, err := notify.Listen(ctx, ch.Local, notify.NewNotifier(effective), logger)
-	if err != nil {
-		logger.Printf("notifications disabled: %v", err)
-		return plain()
-	}
-	return append(append([]string(nil), baseEnv...), notify.Env(ch.Remote)...), ch, stop
 }
 
 func newLogger(quiet bool) *log.Logger {
