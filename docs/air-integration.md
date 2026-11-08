@@ -7,7 +7,8 @@ an OpenSpec change that does so.
 
 The prototype is [`air-remote-claude`](../air-remote-claude), a bash script standing in for the `claude`
 executable. It talks to the sandbox with plain `ssh` and `mutagen`, without Hermod, so every mechanism below can be
-read in one file.
+read in one file. The [session lifecycle](#session-lifecycle) was recorded with [`air-probe`](../air-probe): a
+stand-in `claude` that answers without a model, and a tap on the ACP stream between Air and the adapter.
 
 Versions observed: GoLand 2026.3 with the Air plugin, `@agentclientprotocol/claude-agent-acp` 0.101.0,
 `@anthropic-ai/claude-agent-sdk` 0.3.318, Claude Code 2.1.318 on the sandbox.
@@ -97,9 +98,42 @@ Chat mode gives everything terminal mode does plus per-turn change cards, edit d
 and **Review Code** with line comments sent back to the session (the Air docs' flow; observed available, sending
 comments from a remote session not yet exercised).
 
-Air also occasionally starts the configured `claude` headless on its own (observed:
-`-p --input-format stream-json --output-format stream-json --verbose`, exiting within seconds). Its purpose is not
-yet known.
+Air also runs the configured `claude` itself, outside any session, to read Claude's settings: the IDE starts
+`claude -p --input-format stream-json --output-format stream-json --verbose` in the project directory with no
+`CLAUDE_*` environment, writes one `get_settings` control request, and closes stdin.
+
+---
+
+## Session lifecycle
+
+Observed in chat mode. Air runs one adapter per IDE run for all chats; the adapter runs one `claude` per chat.
+
+| Air action         | ACP request, Air → adapter                                     | The chat's `claude` gets       |
+|--------------------|----------------------------------------------------------------|--------------------------------|
+| New chat           | `session/new`                                                  | started before any prompt      |
+| Reopen a chat      | `session/resume`                                               | started with `--resume=<uuid>` |
+| Rename             | `_session/rename`                                              | `rename_session` request       |
+| Change mode        | `session/set_config_option`                                    | `set_permission_mode` request  |
+| Close tabs         | `session/close` per chat                                       | `interrupt` request, stdin EOF |
+| Mark done          | `session/close` if open, then `_session/archive`               | only the close                 |
+| Reopen a done chat | `_session/unarchive`, then `session/resume`                    | as for a reopen                |
+| Quit the IDE       | `session/close` per open chat, then EOF and SIGTERM to adapter | as for a close                 |
+
+- **A close always ends the process the same way.** After stdin EOF the SDK waits 2 s, sends SIGTERM, and 5 s later
+  SIGKILL. On an IDE quit the adapter exits right after the closes: it sends SIGTERM to every `claude` left and does
+  not wait, so a process that ignores SIGTERM keeps running, orphaned.
+- **Done reaches only the adapter.** `_session/archive` arrives after the chat's `claude` has exited, so a `claude`
+  stand-in cannot tell a closed tab, a quit IDE and "mark done" apart. "Mark done" is the adapter appending
+  `custom-title` and `agent-name` records with an `[archived] ` prefix to the local transcript. Opening a done chat
+  clears the mark.
+- **Air offers no delete.** The adapter implements `session/delete` (it removes the transcript), but Air's UI has no
+  action that sends it.
+- **The IDE can vanish without a shutdown.** An adapter's ACP stream once stopped between two `session/list` polls
+  with no EOF, signal or exit, and the next IDE run had a new process. What a running chat sees then was not
+  observed.
+- Air polls `session/list` every 60 s for each open project directory.
+
+Terminal mode's lifecycle is not observed yet.
 
 ---
 
@@ -164,7 +198,8 @@ first. Transcript contents keep sandbox paths; nothing observed so far depends o
 ### 8. Pass utility subcommands straight through — proven
 
 `auth`, `mcp`, `--version` and similar run directly on the sandbox, without mirror setup, and use the sandbox's
-Claude login.
+Claude login. Air's own `-p` settings read belongs here too: it carries no session, so it opens no tmux session, and
+it reports the sandbox's settings.
 
 ### 9. MCP servers that run local programs — decided: not bridged
 
@@ -261,10 +296,14 @@ Each Air session runs in a tmux session named `hermod-<uuid>`, so it survives th
   never hands Claude partial JSON. User messages echoed back by `--replay-user-messages` acknowledge input; prompts
   not yet echoed are resent on reattach.
 
-A session is **running** (with zero or more attached clients), **closed** (Claude stopped, transcript kept,
-resumable) or **deleted**. A local process ending — a closed tab, a quit IDE, a dropped connection — is always a
-detach: the session keeps running, and may be driven meanwhile through Claude's Remote Control. Closing and deleting
-happen only by the user's decision; how Air expresses them is open (see below).
+A session is **running** (with zero or more attached clients) or **closed** (Claude stopped, transcript kept,
+resumable). A local process ending — a closed tab, a quit IDE, a dropped connection — is always a detach: the
+session keeps running, and may be driven meanwhile through Claude's Remote Control. Air's `session/close` is such a
+detach, sent on every tab close and IDE quit. Closing happens only by the user's decision, which Air expresses as
+"mark done" (`_session/archive`, undone by opening the chat again); see [Session lifecycle](#session-lifecycle).
+
+Deleting a session is out of scope for now, and Air offers no delete. When added, it stops Claude and the session's
+tmux session, stops the mirror if no other session uses it, and removes the session's files from the sandbox.
 
 ### Reattach attaches to the live session
 
@@ -318,9 +357,14 @@ bridge does not order them.
 
 ### Open questions
 
-- **Close, done, delete.** What a closed chat tab, a quit IDE, "mark done" and deleting a chat each deliver to the
-  bridge (stdin EOF, a signal, a protocol message, or only Air's own session index), and so how a user's close
-  decision reaches the sandbox.
+- **Seeing done.** It reaches only the adapter, after the chat's `claude` has exited. A bridge that ends the
+  sandbox session on it has to sit on the ACP stream (wrapping the adapter, as `acp-tap` does) or watch the local
+  transcript for the archive marker; as the `claude` stand-in alone it never learns of it.
+- **Archive marker and the transcript mirror.** "Mark done" writes to the local copy of a transcript that the
+  one-way mirror owns. A locally changed file is likely a conflict that stops later sandbox writes from reaching it;
+  not yet tested.
+- **Terminal mode.** Not observed yet: switching the agent to terminal mode in Air's agent settings still opened
+  the chat UI.
 - **Attaching to a live chat-mode process.** Whether Air accepts the locally answered `initialize`, the re-delivered
   pending requests, and history from the transcript joined to the live log.
 - **Remote Control in chat mode.** Whether a Claude started headless by the SDK can be driven through Remote Control

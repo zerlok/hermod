@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""acp-tap: runs the ACP adapter and records every message between Air and it.
+
+    acp-tap <node> <claude-agent-acp> [args…]
+
+Logs to $AIR_PROBE_DIR/<time>-<pid>-acp.log (default ~/.cache/air-probe), one
+JSON line per event: each ACP message with its direction (air→agent,
+agent→air), EOF on either side, every signal the tap receives (forwarded to
+the adapter), and the adapter's exit. The adapter's stderr is kept beside it.
+
+The log holds Air's MCP token (in session/new) and prompts: mode 0600.
+"""
+import json, os, signal, subprocess, sys, threading, time
+
+LOG_DIR = os.path.expanduser(os.environ.get("AIR_PROBE_DIR", "~/.cache/air-probe"))
+os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
+base = os.path.join(LOG_DIR, "%s-%d-acp" % (time.strftime("%Y%m%dT%H%M%S"), os.getpid()))
+_log = open(os.open(base + ".log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a", buffering=1)
+_lock = threading.Lock()
+T0 = time.monotonic()
+
+
+def log(event, **kw):
+    kw.update(t=time.strftime("%H:%M:%S"), dt=round(time.monotonic() - T0, 3), ev=event)
+    with _lock:
+        _log.write(json.dumps(kw) + "\n")
+
+
+log("start", argv=sys.argv[1:], cwd=os.getcwd(), pid=os.getpid(), ppid=os.getppid())
+err = open(os.open(base + ".stderr", os.O_WRONLY | os.O_CREAT, 0o600), "w")
+child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err)
+
+
+def summary(msg):
+    """The fields worth scanning for: method, id, and for results/errors the id."""
+    return {k: msg[k] for k in ("id", "method") if k in msg} | ({"error": msg["error"]} if "error" in msg else {})
+
+
+def pump(src, dst, direction):
+    for raw in iter(src.readline, b""):
+        try:
+            msg = json.loads(raw)
+            log("msg", dir=direction, **summary(msg), body=msg)
+        except ValueError:
+            log("raw", dir=direction, line=raw.decode(errors="replace").rstrip("\n"))
+        try:
+            dst.write(raw)
+            dst.flush()
+        except (BrokenPipeError, ValueError):
+            log("write_failed", dir=direction)
+            break
+    log("eof", dir=direction)
+    if direction == "air→agent":
+        child.stdin.close()
+
+
+def on_signal(num, _frame):
+    log("signal", sig=signal.Signals(num).name)
+    if child.poll() is None:
+        child.send_signal(num)
+
+
+for s in ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2"):
+    signal.signal(getattr(signal, s), on_signal)
+
+up = threading.Thread(target=pump, args=(sys.stdin.buffer, child.stdin, "air→agent"), daemon=True)
+down = threading.Thread(target=pump, args=(child.stdout, sys.stdout.buffer, "agent→air"))
+up.start()
+down.start()
+code = child.wait()
+down.join(timeout=2)
+log("exit", code=code)
+sys.exit(code if code >= 0 else 128 - code)
