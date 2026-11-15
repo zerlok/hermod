@@ -62,7 +62,8 @@ Claude through the Claude Agent SDK.
   standalone build, else the SDK's platform package (`@anthropic-ai/claude-agent-sdk-<platform>`, a ~340 MB native
   CLI). With the variable set, the adapter can be installed with `--omit=optional` and carries no second Claude.
 
-Working custom agent:
+Working custom agent (the entry Hermod writes is in the
+[`add-air-bridge` design](../openspec/changes/add-air-bridge/design.md#hermod-air-configure-claude-sandbox)):
 
 ```json
 {
@@ -143,7 +144,9 @@ Each requirement states the mechanism and its status in the prototype.
 
 ### 1. Rewrite the arguments — proven
 
-- `--settings <file>`: the file exists only locally. Pass its contents instead; `--settings` accepts inline JSON.
+- `--settings <file>`: the file exists only locally, so its contents must reach the sandbox. The prototype passes
+  them inline (`--settings` accepts JSON); Hermod writes them to a file in the session's directory, keeping them
+  off the command line.
 - Local paths in any argument (`--add-dir`, project paths) are rewritten to their sandbox form.
 - `--session-id` / `--resume` pass through unchanged; the UUID is the key for transcripts and session naming.
 
@@ -156,19 +159,22 @@ In chat mode the SDK writes `initialize` the moment the process starts. Any setu
 ### 3. Carry the environment — proven
 
 `ssh` does not forward the caller's environment. The bridge passes `CLAUDE_*`, `ANTHROPIC_*` and
-`MAX_THINKING_TOKENS` explicitly (`env K=V … claude`), excluding `CLAUDE_CODE_EXECUTABLE`. On the command line the
-values are visible in the sandbox's process list; a later version should pass them over stdin or `SendEnv`.
+`MAX_THINKING_TOKENS` explicitly (`env K=V … claude`), excluding the variables that name local paths
+(`CLAUDE_CODE_EXECUTABLE`, `CLAUDE_CONFIG_DIR`). On the command line the values are visible in the sandbox's
+process list, so Hermod writes them to a file in the session's directory over ssh stdin instead.
 
 ### 4. Route hook callbacks to the IDE, with paths rewritten — proven
 
 Hook URLs point at `localhost:<port>` on the machine running Claude. The bridge opens the same port on the sandbox
 with `ssh -R <port>:localhost:<proxy>` and points it at a **local proxy** in front of Air. Claude on the sandbox
 reports sandbox paths (`cwd`, `transcript_path`, `tool_input.file_path`, …), which Air cannot place in its project,
-so the proxy rewrites every JSON string sandbox → local on requests and local → sandbox on responses, and passes the
-`Authorization` header through. Observed latency through the tunnel is 2–100 ms, well inside the 1 s timeouts.
+so the proxy rewrites every JSON string sandbox → local on requests and local → sandbox on responses. Observed
+latency through the tunnel is 2–100 ms, well inside the 1 s timeouts.
 
-The settings stay untouched: the sandbox keeps Air's port number. `ControlPath=none` is required on that `ssh`; a
-shared master connection silently drops the new `-R` forwards.
+The prototype leaves the settings untouched — the sandbox keeps Air's port number and token, and the proxy passes
+the `Authorization` header through. Hermod gives each session a port and a token of its own; see
+[Hooks: a sandbox port per session](#hooks-a-sandbox-port-per-session). `ControlPath=none` is required on that
+`ssh`; a shared master connection silently drops the new `-R` forwards.
 
 ### 5. Rewrite the stream — proven
 
@@ -177,9 +183,11 @@ stdout line sandbox → local and each stdin line local → sandbox, unbuffered,
 
 ### 6. Mirror the project — proven
 
-A two-way Mutagen session between the local project and the sandbox directory (local wins conflicts). Edits made on
-the sandbox reach the editor through the mirror; Air's change tracking comes from the hook/stream events, not from
-the files.
+A two-way Mutagen session between the local project and the sandbox directory. Edits made on the sandbox reach the
+editor through the mirror; Air's change tracking comes from the hook/stream events, not from the files. The
+prototype lets local win conflicts (`two-way-resolved`), which silently discards the sandbox's side. Hermod's mirror
+is `two-way-safe`, so the sandbox's changes stay visible and neither side's are lost; see
+[the design](../openspec/changes/add-air-bridge/design.md#the-project-mirror-never-picks-a-winner).
 
 ### 7. Bring transcripts back — proven
 
@@ -192,8 +200,9 @@ sandbox: ~/.claude/projects/-home-<sandbox-user>-dev-<project>/
 ```
 
 A one-way Mutagen session sandbox → local in `one-way-safe` mode (never deletes local-only transcripts) makes the
-sessions visible and resumable in Air. Resuming a chat that exists only locally needs that one file copied up
-first. Transcript contents keep sandbox paths; nothing observed so far depends on them.
+sessions visible and resumable in Air. The local end is Claude's config directory: `~/.claude`, or `CLAUDE_CONFIG_DIR`
+when set, which Hermod uses to keep each sandbox's chats apart. Resuming a chat that exists only locally needs that one
+file copied up first. Transcript contents keep sandbox paths; nothing observed so far depends on them.
 
 ### 8. Pass utility subcommands straight through — proven
 
@@ -291,27 +300,30 @@ resumable). A local process ending — a closed tab, a quit IDE, a dropped conne
 session keeps running, and may be driven meanwhile through Claude's Remote Control. Air's `session/close` is such a
 detach, sent on every tab close and IDE quit. Closing happens only by the user's decision, which Air expresses as
 "mark done" (`_session/archive`, undone by opening the chat again); see [Session lifecycle](#session-lifecycle).
+That message reaches only the adapter, so in chat mode Hermod wraps the adapter and closes the session when it
+passes.
 
 Deleting a session is out of scope for now, and Air offers no delete. When added, it stops Claude and the session's
 tmux session, stops the mirror if no other session uses it, and removes the session's files from the sandbox.
 
 ### Reattach attaches to the live session
 
-When Air reopens a session whose tmux session exists, the bridge attaches to the running Claude instead of
+When Air reopens a session that is still running, the bridge attaches to the running Claude instead of
 starting another: Air loads history from the transcript, the bridge answers the new SDK's `initialize` locally from
 the first response in the log, re-delivers control requests still waiting for an answer (permission prompts
-raised while detached), and streams the log from its end. Only when the tmux session is gone does the bridge start
-`claude --resume <uuid>` in a new one.
+raised while detached), and streams the log from its end. Only when the session is closed does the bridge start
+`claude --resume <uuid>` in a new tmux session. Whether a session is running is Claude's to say, not something
+read from the tmux session alone.
 
 ### Hooks: a sandbox port per session
 
-The sandbox port for a session's hooks is chosen when the session is created, stored in
-`~/.hermod/s/<uuid>/hookport`, inlined into that session's `--settings`, and bound again with `ssh -R` on every
-attach. That keeps concurrent sessions apart and a running Claude's settings valid across reconnects. After an IDE
-restart Air has a new port and token while the running Claude still has the old ones; the local hook proxy targets
-Air's current port and replaces the `Authorization` header. While detached, hooks fail and Air fails open; nothing on
-the sandbox depends on them. A port taken by something else while detached costs that session its hooks, logged,
-not the session.
+The sandbox port for a session's hooks is chosen when the session is created, stored in `~/.hermod/s/<uuid>/hookport`,
+written into that session's settings, and bound again with `ssh -R` on every attach. That keeps concurrent sessions
+apart and a running Claude's settings valid across reconnects. The settings on the sandbox carry a token of the
+session's own, never Air's. After an IDE restart Air has a new port and token while the running Claude keeps its own;
+the local hook proxy accepts only the session's token, targets Air's current port and sets Air's current token in the
+`Authorization` header. While detached, hooks fail and Air fails open; nothing on the sandbox depends on them. A port
+taken by something else while detached costs that session its hooks, logged, not the session.
 
 ### MCP servers run on the sandbox only
 
@@ -347,9 +359,6 @@ bridge does not order them.
 
 ### Open questions
 
-- **Seeing done.** It reaches only the adapter, after the chat's `claude` has exited. A bridge that ends the
-  sandbox session on it has to sit on the ACP stream (wrapping the adapter, as `acp-tap` does) or watch the local
-  transcript for the archive marker; as the `claude` stand-in alone it never learns of it.
 - **Archive marker and the transcript mirror.** "Mark done" writes to the local copy of a transcript that the
   one-way mirror owns. A locally changed file is likely a conflict that stops later sandbox writes from reaching it;
   not yet tested.
@@ -361,8 +370,8 @@ bridge does not order them.
   while detached.
 - **Worktree layout.** Where Air creates worktrees — inside the project root or beside it — which decides how many
   mirrors a project needs.
-- **Edits made locally while paused.** Local wins conflicts on resume, so a local edit to a file the detached
-  session also changed discards the session's edit.
+- **Edits made locally while paused.** A file changed locally and by the detached session is a conflict on resume,
+  which `two-way-safe` leaves unresolved until the user settles it.
 
 ---
 
@@ -372,5 +381,5 @@ bridge does not order them.
   states that third-party products may not offer claude.ai login without approval. Running the adapter without the
   flag uses a Claude subscription outside what Air ships; anyone adopting this should check Anthropic's terms.
 - **Secrets in transit.** Air's hook settings carry a Bearer token, and its MCP config an IDE token. Both are
-  per-IDE-run and local-only by design; the bridge must not log them in clear or place them on the sandbox beyond the
-  agent's own process. (The prototype's log, mode `0600`, still records argv and so the MCP token.)
+  per-IDE-run and local-only by design; the bridge must not log them in clear or send them to the sandbox. (The
+  prototype sends both, and its log, mode `0600`, still records argv and so the MCP token.)

@@ -30,13 +30,14 @@ on it.
 - Resolving sync conflicts between sandboxes; see
   [Concurrent sandboxes](#concurrent-sandboxes-are-allowed-conflicts-are-the-developers).
 - A local record of sessions (state files or a database). Nothing in this design needs one.
+- Choosing the mirror's sync mode, or attaching without the mirror. Both can be added as `attach` options later.
 - Agents other than Claude Code. The command line names the agent (`hermod air acp claude`) so others can be
   added, but only `claude` is implemented.
 
 ## Command line
 
 ```
-hermod attach         [SANDBOX] [-s NAME] [-C DIR] [-n] [--no-sync] [--sync-mode=MODE] [-- COMMAND…]
+hermod attach         [SANDBOX] [-s NAME] [-C DIR] [-n] [-- COMMAND…]
 hermod air configure  {claude} [SANDBOX] [--node=PATH] [--acp=PATH] [--name=NAME] [--origin=NAME] [-n]
 hermod air acp        {claude} [SANDBOX] [--node=PATH] [--acp=PATH]
 claude ARGS…          (a link to hermod)  ≡  hermod attach -- claude ARGS…
@@ -54,13 +55,7 @@ An argument always wins over the environment.
 
 Today's flow under its own name: mirror the directory, attach to the tmux session (created with `COMMAND` if it
 does not exist), pause or tear the mirror down on detach. It replaces the bare `hermod <sandbox>` form. `-s`, `-C`
-and `-n` (dry run) are today's flags. New:
-
-- `--no-sync` connects without touching the mirror: it is neither opened nor settled, so a paused mirror stays
-  paused. For looking at a running session, or for a sandbox that has its own copy of the files.
-- `--sync-mode=MODE` is Mutagen's mode for a mirror being created: `two-way-safe` (the default),
-  `two-way-resolved`, `one-way-safe`, `one-way-replica`. Mutagen cannot change the mode of an existing mirror, so
-  asking for a different one is an error that names the mirror to terminate.
+and `-n` (dry run) are today's flags.
 
 When `COMMAND` is `claude …`, `attach` runs it as an [agent session](#agent-session).
 
@@ -158,7 +153,7 @@ Dependencies point one way: `cli → control → {claude, hook, air, sandbox, mi
 | `hook`    | new       | The local hook proxy: an HTTP handler on a loopback listener that checks the session's token, rewrites bodies through `pathmap`, and forwards to Air's current hook URL with Air's current token. |
 | `air`     | new       | Air's files: merge an entry into `acp.json`, create the stand-in link. |
 | `sandbox` | changed   | Agent sessions keyed by UUID beside today's sessions keyed by name: probe, start (terminal or chat runtime), attach, close. Owns the session directory on the sandbox and every shell line run there, and the TCP reverse forward for hooks. |
-| `mirror`  | changed   | Names that carry the sandbox, the sync mode, one-way transcript mirrors, labels, and a shared lease per mirror. |
+| `mirror`  | changed   | Names that carry the sandbox, one-way transcript mirrors, labels, and a shared lease per mirror. |
 | `shell`   | changed   | `Command` gains explicit stdio (`Stdin`, `Stdout`, `Stderr`), so a caller can pump a stream through a transform instead of inheriting the terminal; `NewSSH` gains an option to refuse a shared master connection. |
 | `notify`  | removed   | See [The notification back-channel is removed](#the-notification-back-channel-is-removed). |
 
@@ -224,8 +219,6 @@ sandbox's login and settings.
 7. **Settle.** Release the leases. The last holder of a mirror settles it by today's rule, with liveness read as
    "any `hermod-*` tmux session tagged with a directory under this root".
 
-With `--no-sync`, steps 2 and 7 are skipped.
-
 ### Close
 
 On `_session/archive` for a UUID, `RunACP` closes that session: `tmux kill-session -t hermod-<uuid>` (Claude gets
@@ -242,7 +235,7 @@ Naming the binary needs none of them, and a session typed by hand
 (`hermod attach prod-box -- claude --resume <uuid>`) is the same session Air would open.
 
 The cost is that the stand-in cannot take Hermod's flags, since all its arguments are Claude's. Its sandbox comes
-from the environment, and so would any other option it needs (see [Open Questions](#open-questions)).
+from the environment, and so would any other option it comes to need.
 
 ### `claude` owns Claude's contract
 Argv classification and rewriting, environment selection and the stream-json replay rules all follow Claude's CLI
@@ -316,6 +309,17 @@ is named `hermod-<sandbox>-<slug>` instead (the alias reduced to the letters, di
 opening one checks its remote endpoint before resuming. Mirrors made under the old names are no longer found; the
 first run lists them and leaves terminating them to the user.
 
+### The project mirror never picks a winner
+The developer has to see what the sandbox changed in the project's files, and to bring local changes to the
+sandbox. Both need a mirror that carries edits each way and discards neither side's: the project mirror is
+`two-way-safe`. The sandbox's edits arrive in the local working tree, where the editor and `git diff` show them,
+and local edits reach the sandbox. A file changed on both sides is left as it is on each and reported by Mutagen
+as a conflict until the developer settles it.
+
+- **Alternative — local wins (`two-way-resolved`), as in the prototype:** rejected. A local edit silently
+  overwrites the agent's, so what the sandbox changed can no longer be seen.
+- **Alternative — one-way:** rejected. One side's changes never reach the other.
+
 ### Concurrent sandboxes are allowed; conflicts are the developer's
 One project can be attached to several sandboxes at once: each has its own mirror, tmux sessions and hook ports.
 The local directory then relays between them, so one agent's edits reach the other sandboxes too. Hermod allows
@@ -379,8 +383,8 @@ option stays; the hook forward uses it.
 
 Each step is usable on its own.
 
-1. `hermod attach` with `HERMOD_SANDBOX`, `HERMOD_SANDBOX_CMD`, `--no-sync`, `--sync-mode` and mirror names that
-   carry the sandbox; the notification back-channel removed.
+1. `hermod attach` with `HERMOD_SANDBOX`, `HERMOD_SANDBOX_CMD` and mirror names that carry the sandbox; the
+   notification back-channel removed.
 2. `claude.Classify`, `pathmap` and utility calls; the stand-in link.
 3. Terminal sessions: the session directory, tmux per UUID, the hook proxy.
 4. Chat sessions: the FIFO and log runtime and the stream pump, start and `--resume` only; `hermod air configure`,
@@ -395,7 +399,4 @@ Each step is usable on its own.
   configured path under its own name, as the SDK does, is assumed.
 - **`HERMOD_SANDBOX` in terminal mode.** It has to be in Air's own environment (e.g. `~/.config/environment.d/`).
   Whether Air's terminal-mode setting can carry environment of its own is not known.
-- **Options for the stand-in.** `--no-sync` and `--sync-mode` could reach it only as environment variables. Whether
-  any are needed, and their names, is not settled.
-- The questions in [`docs/air-integration.md`](../../../docs/air-integration.md#open-questions) still stand, except
-  "Seeing done", which `hermod air acp` answers.
+- The questions in [`docs/air-integration.md`](../../../docs/air-integration.md#open-questions) still stand.
