@@ -262,18 +262,8 @@ LOCAL (all of Hermod)                                    SANDBOX (nothing of Her
  mutagen: project mirrors ⇄, transcript mirrors ◄         mirrored roots, worktrees inside or beside them
 ```
 
-An entry point that Air (or any SDK host) can use as `CLAUDE_CODE_EXECUTABLE`, and that a terminal host can use as
-its `claude`, takes the agent's own arguments verbatim and reads sandbox and project from configuration.
-
-Where it lands in Hermod's packages:
-
-- **`mirror`** — already opens, resumes and pauses a mirror; gains sharing across sessions and one-way transcript
-  mirrors.
-- **`sandbox`** — the tmux session becomes per agent session rather than per directory, and `Channel` gains TCP
-  reverse forwards for hooks beside its unix sockets.
-- **`notify`** — already serves HTTP on a channel locally; the hook proxy is a second handler of that shape.
-- **`shell`** — the stand-in passes stdio through, which `Command` cannot express today.
-- **Path mapping** is new: one local ↔ sandbox mapping applied to arguments, hook bodies and the stream.
+The command line, the packages this lands in and the flows between them are in the
+[`add-air-bridge` design](../openspec/changes/add-air-bridge/design.md).
 
 ### Nothing of Hermod's runs on the sandbox
 
