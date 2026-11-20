@@ -25,7 +25,7 @@ Hermod's stdio, and expects Claude's own CLI contract on it.
   environment.
 - Everything Claude-specific behind one interface, unit-testable offline, so a second agent is a second
   implementation.
-- One project attached to several remotes at once, and several sessions sharing one project's files.
+- One project attached to several remotes at once, and several sessions in one project sharing its relays.
 
 **Non-Goals:**
 - Rewriting MCP configuration. Claude's `--mcp-config` arguments are carried like any other argument; a server
@@ -37,6 +37,10 @@ Hermod's stdio, and expects Claude's own CLI contract on it.
 - Resolving sync conflicts between remotes; see
   [Concurrent remotes](#concurrent-remotes-are-allowed-conflicts-are-the-developers).
 - A local record of sessions (state files or a database). Nothing in this design needs one.
+- A command that sets up a workspace ahead of its first session, or prints a workspace's state. A workspace's
+  state is readable ([Workspace](#workspace)); this change adds no command for it.
+- Keeping two sessions in one directory from editing the same files. That is the worker's to arrange
+  ([File isolation](#file-isolation-is-the-workers)).
 - Agents other than Claude Code. The command line names the agent (`hermod air acp claude`) and the code reaches
   it through an interface, but only `claude` is implemented.
 
@@ -60,8 +64,8 @@ resolved value and never looks at the environment again.
 
 ### `hermod attach`
 
-Runs a [session](#session): a workspace for the directory, a worker running `COMMAND` on the remote, and the
-caller attached to both. It replaces the bare `hermod <sandbox>` form.
+Runs a [session](#session): the workspace the directory belongs to, a worker in it running `COMMAND` on the
+remote, and the caller attached to both. It replaces the bare `hermod <sandbox>` form.
 
 - `-s` names the worker, `-C` gives the directory, `-n` prints the plan and changes nothing.
 - `-R PORT:ADDRESS` adds a Net relay of the user's own: calls to `PORT` on the remote reach `ADDRESS` locally,
@@ -80,6 +84,8 @@ runs the normal command line.
   a per-session log (`~/.cache/hermod/air/<uuid>.log`, mode `0600`).
 - `make install` creates the link, and where is the installer's choice: outside `PATH`, beside a local `claude`,
   or on `PATH` as the machine's only `claude`. Hermod itself never writes it.
+- Hermod finds the link as the `claude` on the user's login-shell `PATH` when that is a link to `hermod`, else at
+  `make install`'s default place.
 
 ### `hermod air configure claude [REMOTE]`
 
@@ -93,7 +99,6 @@ Registers a remote with Air by merging one entry into `~/.jetbrains/acp.json`, k
       "args": ["air", "acp", "claude"],
       "env": {
         "HERMOD_REMOTE": "prod-box",
-        "CLAUDE_CODE_EXECUTABLE": "/home/<you>/.local/share/hermod/bin/claude",
         "CLAUDE_CONFIG_DIR": "/home/<you>/.local/share/hermod/air/prod-box/claude"
       }
     }
@@ -101,8 +106,8 @@ Registers a remote with Air by merging one entry into `~/.jetbrains/acp.json`, k
 }
 ```
 
-- The stand-in is the `claude` on `configure`'s `PATH` when that is a link to `hermod`, else the link at
-  `make install`'s default place. `configure` fails when it finds neither.
+- The entry holds no path: `air acp` finds the adapter and the stand-in when it runs. `configure` fails when
+  [the stand-in's link](#the-stand-in-hermod-named-claude) is not found, since no chat could start.
 - The remote goes into `env`, not `args`: the per-chat stand-ins inherit the entry's environment but never see
   `air acp`'s arguments, and both must resolve the same remote.
 - `--name` sets the entry's name, `Claude (<remote>)` by default. Configuring the same name again replaces the
@@ -120,9 +125,10 @@ environment needs.
 
 What the entry runs. It starts the ACP adapter and relays ACP messages both ways verbatim. Air does not load the
 user's shell, so `air acp` starts the adapter through the user's login shell, as commands on the remote are
-started: `claude-agent-acp`, and through it `node`, are found on the `PATH` the user's own terminal has, and no
-path is written into the entry. The adapter passes that environment on to every `claude` it spawns, which is how each chat's
-stand-in gets `HERMOD_REMOTE`.
+started: `claude-agent-acp`, and through it `node`, are found on the `PATH` the user's own terminal has. It gives
+the adapter `CLAUDE_CODE_EXECUTABLE`, set to [the stand-in's link](#the-stand-in-hermod-named-claude), so every
+`claude` the adapter spawns is Hermod. The adapter passes its environment on to each of them, which is how each
+chat's stand-in gets `HERMOD_REMOTE`.
 
 It acts on one message: `_session/archive` ("mark done") [closes](#close) that chat's worker. The adapter is the
 only process that sees it (see [Session lifecycle](../../../docs/air-integration.md#session-lifecycle)).
@@ -136,28 +142,29 @@ in it.
 ```
 LOCAL workstation                                                 REMOTE workstation
 
-  client ──► session ─┬─ workspace ─┬─ FS relay   project dir   ⇄  project dir
-(you, Air's terminal, │             ├─ FS relay   transcripts   ⇄  transcripts
- the ACP adapter)     │             ├─ IO relay   stdio         ⇄  a process's stdio
-                      │             └─ Net relay  local address ◄  a remote port
-                      │
-                      └─ worker ────────────────────────────────── a process ── agent
+  client ──► session ──► workspace ─┬─ FS relay   project dir   ⇄  project dir
+(you, Air's terminal,               ├─ FS relay   transcripts   ⇄  transcripts
+ the ACP adapter)                   ├─ Net relay  local address ◄  a remote port
+                                    │
+                                    ├─ worker ─── IO relay ─────⇄  a process
+                                    └─ worker ─── IO relay ─────⇄  a process
 ```
 
 Hermod keeps state for none of these; each is read from its source when asked.
 
 | Entity      | The one fact it owns | Identified by | Lives until |
 |-------------|----------------------|---------------|-------------|
-| Workstation | A machine commands run on: the local one, or the remote. Hermod creates neither, so it is not modelled: it is a `shell.Shell`, the stateless low-level API that runs one `shell.Command` | its host | — |
-| Relay       | One channel between the two workstations, and whether it is connected | its kind and its two ends | no lease holds it and the remote no longer uses it |
-| Workspace   | A group of relays, connected and released together | the relays it groups | its relays are gone |
+| Workstation | A machine commands run on: the local one, or the remote. Hermod interacts with stations via `shell.Shell` that runs `shell.Command` | its host | — |
+| Session     | One Hermod process on the local workstation, attached to one workspace and one of its workers. It is stored nowhere | the process | the process ends; the worker keeps running and its relays are disconnected |
+| Workspace   | The relays and the workers of one project on one remote | the two ends of its project FS relay | it has no worker and no session |
+| Relay       | One channel between the two workstations, and whether it is connected | its kind and its two ends | no lease holds it and its workspace has no worker |
 | Worker      | One persistent process on the remote | a key: the agent's session ID, or a name | the remote process is gone |
 | Agent       | The agent program running in a worker, and that program's contract | the agent's own session ID | the client ends the conversation, or the program exits |
-| Session     | One Hermod process on the local workstation with one running worker and one attached workspace. It brings the two together and is stored nowhere | the process | the process ends; the worker keeps running and its relays hold what it produces |
 
-A workspace and a worker are independent. A workspace needs no worker: it neither starts a process nor knows that
-one runs. A worker needs no workspace to keep running. An agent is one kind of worker's process; whatever a
-detached worker changes or writes, an agent or not, reaches the local workstation at the next attach.
+A workspace holds any number of workers, none included: it exists from its first session and is gone with its last
+worker, and nothing sets one up beforehand. A worker belongs to one workspace and keeps running with no session
+attached. An agent is one kind of worker's process; whatever a detached worker changes or writes, an agent or not,
+reaches the local workstation at the next attach.
 
 ### Relay
 
@@ -175,35 +182,52 @@ detached worker changes or writes, an agent or not, reaches the local workstatio
 
 - A relay is **leased** ([Leases are file locks](#leases-are-file-locks)): each session that connects it holds a
   lease, and it stays Connected while any lease is held.
-- One rule decides what becomes of a relay when its last lease is released: it is Disconnected while the remote
-  still uses it, and Absent otherwise. An FS relay is flushed before it becomes Absent.
-- Whether the remote still uses a relay is not the relay's knowledge, nor the workspace's: whoever releases it
-  says so. When that cannot be determined, the relay is left Disconnected, which never removes something in use.
+- One rule decides what becomes of a relay when its last lease is released: it is Disconnected while its
+  workspace has a live worker, and Absent otherwise. An FS relay is flushed before it becomes Absent. When the
+  workers cannot be read, the relay is left Disconnected, which never removes something in use.
+- An IO relay's remote end is one worker, so it exists exactly as long as that worker.
 - A Net relay has no Disconnected state in this change. Nothing listens on the remote port once the client is
   gone, so it goes from Connected to Absent and a call made meanwhile fails at once.
 - Reading a relay's state can fail. That is a failure value, not a fourth state.
 
 ### Workspace
 
-A workspace is a group of relays and nothing more. It connects and releases its relays together and reports their
-states as one. It carries nothing itself: a project's files are on both workstations because an FS relay joins the
-two directories, not because a workspace exists.
+A workspace is the relays and the workers of one project on one remote. It adds relays and workers, connects and
+releases its relays together, applies the release rule from its own worker list, and reports the state of
+everything in it. It carries nothing itself: a project's files are on both workstations because an FS relay joins
+the two directories, not because a workspace exists.
 
 | State    | Meaning |
 |----------|---------|
-| Absent   | None of its relays exist. |
-| Detached | No session holds it: its relays are Disconnected, and what the remote does meanwhile is held. |
-| Attached | A session holds it: its relays are Connected. |
+| Absent   | It has no relay and no worker. |
+| Detached | No session holds it: its workers run on, its relays are Disconnected, and what the remote does meanwhile is held. |
+| Attached | A session holds it: the relays that session leases are Connected. |
 
-- A session says which relays its workspace groups: an FS relay for the directory it runs in, the IO relay to
-  the process it runs, and what the agent or the user declares (transcripts, hooks, `-R`).
-- A workspace can lease a relay from another instead of making its own. An FS relay whose two ends already exist
-  is leased, whoever made it; so is one whose local end contains the directory asked for. A relay that is leased
-  elsewhere stays Connected when this workspace detaches.
+A workspace's state is those of its members, read in two calls: its relays from Mutagen and its workers from tmux,
+both by the workspace's name ([Names and tags](#one-identity-names-and-tags)).
+
+**Which workspace a directory belongs to** is decided once, when a session starts:
+
+1. the workspace whose project FS relay covers the directory;
+2. else, for a linked git worktree, the workspace that covers its main working tree, where the worktree gets an FS
+   relay of its own;
+3. else a new workspace, whose project FS relay joins the directory to the corresponding remote path. A root that
+   holds existing roots gets one too, with a warning: the inner workspaces stay, so their files are carried twice.
+
+**Relays enter a workspace** in four ways, and a relay is its two ends, so the same two ends are never joined
+twice: a session or a worker that needs a relay already there leases it.
+
+| Relay | Added for | Shared by the workspace's sessions |
+|-------|-----------|------------------------------------|
+| FS, the project | the workspace itself | yes |
+| FS, another directory | a session whose directory lies outside the project relay, or an agent that declares one (its transcripts) | yes, by every session that needs the same two ends |
+| Net | an agent that declares one (its hooks), or the user's `-R` | no: its local end is a listener inside one session's process |
+| IO | each worker | no: one per worker |
+
 - An FS relay is configured with its two ends, a (local root, remote root) pair. The pairs of a workspace's FS
   relays, longest prefix first, are the **path map** its IO and Net relays apply to what they carry.
-- A directory under no existing relay gets a new FS relay at the corresponding remote path, a root that holds
-  existing roots included, with a warning: the inner relays stay, so their files are carried twice.
+- A relay belongs to the workspace that made it. A workspace that needs two ends another one already joined leases
+  that relay instead of making a second.
 
 ### Worker
 
@@ -213,7 +237,7 @@ two directories, not because a workspace exists.
 | Running | The process is alive. |
 | Exited  | The process failed; its pane is kept to show the error and exit status. |
 
-A worker is the tmux session `hermod-<key>` on the remote, tagged with its project directory and its origin
+A worker is the tmux session `hermod-<key>` on the remote, tagged with its workspace and its origin
 ([Names and tags](#one-identity-names-and-tags)). Start takes Absent to Running; a clean exit or a close leads to
 Absent; a failed exit leads to Exited; removing an Exited worker leads to Absent. tmux is the only source.
 
@@ -253,7 +277,8 @@ The agent is handed the path map and never learns where the other workstation is
 
 Every session, whoever starts it, runs these steps. The rows of the table after them are the only differences.
 
-1. **Set up the workspace.** Lease the FS relay that covers the directory, or make one, and connect it, flushed. The path map is now fixed for the run.
+1. **Set up the workspace.** Find [the workspace the directory belongs to](#workspace), or make it. Lease the FS
+   relay that covers the directory and connect it, flushed. The path map is now fixed for the run.
 2. **Read the states.** One call on the remote reads the worker's state and, for an agent, whether its
    conversation runs.
 3. **Decide.**
@@ -270,15 +295,13 @@ Every session, whoever starts it, runs these steps. The rows of the table after 
    requires,
    so its transcripts are on the remote before it reads them. Then create the worker's directory
    `~/.hermod/s/<key>/` (mode `0700`) with what the agent's answer listed, written over ssh stdin, and start the
-   worker in the project's remote directory.
+   worker in the workspace, in the directory's remote path.
 5. **Attach the workspace.** The workspace adds the session's remaining relays, the IO relay to the worker among
    them, and connects them on one ssh connection that refuses a shared master. The client is now connected to the
    worker.
 6. **Detach the workspace.** Stdin EOF, SIGTERM or a dropped connection releases the session's leases and nothing
-   else; the worker keeps running. Each relay follows [the release rule](#relay), and `control` supplies what the
-   rule asks from the worker list: an IO or Net relay is still used while its worker lives, an FS relay while any
-   worker's directory lies under its remote end. Hermod exits inside
-   the SDK's 2 s + 5 s window, so it is never left orphaned.
+   else; the worker keeps running, and the workspace applies [the release rule](#relay) to each relay released.
+   Hermod exits inside the SDK's 2 s + 5 s window, so it is never left orphaned.
 
 | Started as | Command | Agent | IO form | Net relays |
 |------------|---------|-------|---------|------------|
@@ -302,9 +325,9 @@ remote's login and settings.
 ### Close
 
 On `_session/archive` for a conversation, `air acp` closes its worker (the agent gets SIGHUP and saves its
-transcript), which ends the conversation's agent. It then releases the relays that worker used by the release
-rule, holding a lease while it decides so it cannot race an attached stand-in. The worker's directory
-stays, for a later resume.
+transcript), which ends the conversation's agent. Its workspace then applies the release rule to its relays,
+holding a lease while it decides so it cannot race an attached stand-in: with another worker left they stay, and
+with none they go. The worker's directory stays, for a later resume.
 
 A `_session/unarchive` closes nothing: the resume that follows finds a Stopped agent in step 3. It only keeps a
 close still to come from ending the resumed conversation: a queued close of that conversation is dropped, and one
@@ -334,7 +357,7 @@ the files themselves. The first three are mapped by the one path map the fourth 
 
 ## Packages
 
-Dependencies point one way: `cli → control → {workspace, worker, claude, acp, air, git} → relay →
+Dependencies point one way: `cli → control → {workspace, claude, acp, air, git} → {relay, worker} →
 {shell, pathmap, env, secret}`. No package imports a sibling. `control` declares the agent interface and `claude`
 implements it.
 
@@ -342,8 +365,8 @@ implements it.
 |-------------|------|
 | `cli`       | The process's interface: commands, flags, the name of every variable Hermod reads, stdio, and the stand-in entry chosen by the program name. It builds one request per command and calls one use case. |
 | `control`   | The use cases: session, one-shot call, close, ACP relay, registration. Each takes its own request. The decision table lives here, and the agent interface. |
-| `workspace` | A group of relays: finding or making each, their names and label, the leases, the release rule, the group's state, and the path map read from its FS relays. It knows nothing of workers. |
-| `worker`    | The tmux session on the remote: its state, tags, directory, start and close, its stdio as an IO relay can reach it, and the list of workers. It knows nothing of workspaces. |
+| `workspace` | One project's relays and workers on one remote: which workspace a directory belongs to, finding or making each relay, the names and labels, the leases, the release rule, the state of the whole, and the path map read from its FS relays. |
+| `worker`    | The tmux session on the remote: its state, tags, directory, start and close, its stdio as an IO relay can reach it, and the list of workers under a tag. Mechanism only: it knows nothing of workspaces or relays. |
 | `relay`     | The three relay kinds behind one state set. Mechanism only: it connects, disconnects and removes what it is told to. |
 | `claude`    | Claude's contract as the agent interface: its arguments, read with the flag library; its running state; its launch; its settings as typed documents; its stream. Pure functions; files are read by the caller. |
 | `acp`       | The ACP wire format as typed messages, and a relay between two streams that shows each message to an observer. |
@@ -352,7 +375,7 @@ implements it.
 | `env`       | Variables as key and value pairs. The one place that splits and joins `KEY=VALUE`; it prints keys only. |
 | `secret`    | A token as an opaque type that prints as a mask. |
 | `shell`     | `Command` and `Shell`: local, ssh, login shell, tmux. One command type, built once and passed down. |
-| `git`       | The developer's identity. |
+| `git`       | The developer's identity, and a linked worktree's main working tree. |
 
 Scripts that run on the remote are files embedded in the package that owns them. Each takes its inputs as
 arguments and environment; nothing is substituted into a script's text, so a value can never become shell syntax,
@@ -409,18 +432,41 @@ into a local transcript reaches the remote.
 The cost is that every conversation of the project in that local Claude config directory reaches the remote,
 those started locally included.
 
+### A workspace holds its workers
+Whether a relay may be removed depends on whether a process on the remote still needs it, so the two have to be
+read together. With the worker inside the workspace, the workspace answers that from its own members, and
+everything belonging to a project on a remote is found under one name.
+
+- **Alternative — workspace and worker as independent entities, joined by the session:** rejected. The release
+  rule then needs a third party to tell the workspace whether the remote still uses a relay, and the only link
+  between a relay and a worker is a directory, which a transcript relay does not share with any worker.
+
+A workspace still starts no process and reads no agent: `worker` is the mechanism, `control` decides when one
+starts, and the workspace only counts them.
+
+### File isolation is the worker's
+Several sessions in one project share the project's FS relay, so two agents in one directory edit the same files.
+Keeping them apart is the worker's choice, and both ways need nothing new from Hermod:
+
+- **Inside the project relay:** an agent that works in a subdirectory of its own (Claude's `--worktree`) is
+  carried by the relay already there.
+- **A relay of its own:** a session started in a directory outside the project relay, such as a worktree beside
+  the project, gets an FS relay for it in the same workspace.
+
 ### One identity: names and tags
 Everything a session uses is findable from its key or from the `hermod` prefix, with the tool that owns it.
 
 | Thing | Name | Tags | Read with |
 |---|---|---|---|
-| Worker (remote) | tmux session `hermod-<key>`; a plain `attach` keeps its name | options `@hermod-dir`, `@hermod-origin` | `tmux ls -F '#{session_name} #{@hermod-dir} #{@hermod-origin}'` |
+| Workspace | the name of its project FS relay | — | the two rows below |
+| Worker (remote) | tmux session `hermod-<key>`; a plain `attach` keeps its name | options `@hermod-workspace`, `@hermod-origin` | `tmux ls -F '#{session_name} #{@hermod-workspace} #{@hermod-origin}'` |
 | Worker's directory (remote) | `~/.hermod/s/<key>/` | — | — |
-| FS relay (local) | `hermod-<remote>-<slug>-<local>`: `<slug>` from its remote end, `<local>` a hash of its local end | label `hermod-remote=<remote>` | `mutagen sync list --label-selector hermod-remote=<remote>` |
+| FS relay (local) | `hermod-<remote>-<slug>-<local>`: `<slug>` from its remote end, `<local>` a hash of its local end | labels `hermod-remote=<remote>`, `hermod-workspace=<workspace>` | `mutagen sync list --label-selector hermod-workspace=<workspace>` |
 | Log (local) | `~/.cache/hermod/air/<uuid>.log` | — | — |
 
-- **`@hermod-dir`** is the directory the worker runs in. Whether the remote still uses an FS relay is read from
-  it, so no file on the remote has to record it.
+- **`@hermod-workspace`** is the workspace the worker belongs to. Whether a workspace's relays are still needed
+  is read from it, so no file on either workstation has to record it. `hermod-remote` lists every workspace on a
+  remote.
 - **Origin** is the machine the session was started from: its hostname, or `HERMOD_ORIGIN` when set, reduced to
   letters, digits, dots and dashes. An empty `HERMOD_ORIGIN` leaves the tag out, for a shared remote where the
   machine's name should not show.
@@ -519,6 +565,11 @@ The `add-notify-backchannel` and `add-remote-agent` changes are withdrawn with i
   resume, losing only a turn in flight.
 - **A held hook call does not outlast Claude's hook timeout**, and how long Claude waits for a tool or MCP call is
   not known. → Measure before building the Net relay's Disconnected state.
+- **A relay leased from another workspace follows that workspace's workers**, not the borrower's, so it could go
+  Absent under a detached borrower. → No case in this change borrows across workspaces: an agent's transcript
+  relay has ends of its own per project directory. Guard it when a case appears.
+- **A linked worktree's pointer files hold paths.** → They resolve on both workstations only as
+  [relative paths](../../../docs/air-integration.md#mirrors-cover-roots-worktrees-resolve-by-path).
 - **A Detached workspace shows nothing locally** until the next attach. → Accepted: a client that wants the
   files attaches.
 - **A transcript written on both sides at once is a conflict** that stops that file from travelling. "Mark done"
@@ -542,8 +593,10 @@ The `add-notify-backchannel` and `add-remote-agent` changes are withdrawn with i
 Each step is usable on its own and builds only on the ones before it.
 
 1. `env`, the single `shell.Command`, and `pathmap`.
-2. The FS relay and `workspace`: names that carry the remote, labels, leases and the release rule.
-3. `worker`, the terminal IO relay and the session flow for a command with no agent: `hermod attach` with
+2. The FS relay and `workspace` with no workers yet: which workspace a directory belongs to, names that carry the
+   remote, labels and leases.
+3. `worker` inside the workspace, the release rule, the terminal IO relay and the session flow for a command with
+   no agent: `hermod attach` with
    `HERMOD_REMOTE` and `HERMOD_REMOTE_CMD`; the notification back-channel removed.
 4. The agent interface and `claude`: arguments, running state, launch; one-shot calls; terminal sessions; the
    transcript relay; the stand-in link in `make install`.
@@ -557,6 +610,9 @@ Each step is usable on its own and builds only on the ones before it.
   configured path under its own name, as the SDK does, is assumed.
 - **`HERMOD_REMOTE` in terminal mode.** It has to be in Air's own environment (e.g. `~/.config/environment.d/`).
   Whether Air's terminal-mode setting can carry environment of its own is not known.
+- **Should `hermod air acp` attach the workspace with no worker?** It runs for the whole IDE run, so it could keep
+  transcripts arriving while no chat is open, and later hold one hooks relay for all of a workspace's chats.
+  Whether Air starts it in the project's directory is not known.
 - **Subscription use.** Air ships the adapter with `--hide-claude-auth`; whether running it without that flag is
   within Anthropic's terms has to be settled before a release.
 - The questions in [`docs/air-integration.md`](../../../docs/air-integration.md#open-questions) still stand.
