@@ -134,8 +134,8 @@ and passes every other one on with its paths mapped.
 
 ## Entities
 
-Hermod is built from six entities: workstation, session, workspace, relay, worker and agent. What each one owns,
-its states and the package that declares it are in [ARCHITECTURE](../../../docs/ARCHITECTURE.md#entities). This section gives the rules
+Hermod is built from six components: workstation, session, workspace, relay, worker and agent. What each one owns,
+its states and the package that declares it are in [ARCHITECTURE](../../../docs/ARCHITECTURE.md#components). This section gives the rules
 they follow.
 
 - A workspace holds any number of workers, none included. It exists from its first session and is gone with its

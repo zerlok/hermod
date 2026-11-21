@@ -1,6 +1,6 @@
 # Hermod — Architecture
 
-This document describes **what Hermod is built from**: its entities and their states, the packages, the types and
+This document describes **what Hermod is built from**: its components and their states, the packages, the types and
 interfaces each package declares, and which package calls which in every flow.
 
 Hermod is small on purpose. It composes Mutagen, ssh and tmux, and for JetBrains Air the ACP adapter, into one
@@ -42,83 +42,77 @@ flowchart LR
     session <-->|stdio| io
 ```
 
-## Entities
+## Components
 
-Every entity owns one thing, and one package represents the entity. No other package restates what it owns or
-decides by it.
-
-| Entity                      | What it owns                                                                     | Identified by                                                             | Lives until                                            |
-|-----------------------------|----------------------------------------------------------------------------------|---------------------------------------------------------------------------|--------------------------------------------------------|
-| [Workstation](#workstation) | A machine commands run on: the local one, or the remote                          | its host                                                                  | —                                                      |
-| [Session](#session)         | One attachment of a local Hermod process to one workspace and one of its workers | the process and the workspace                                             | the process releases it, or ends                       |
-| [Workspace](#workspace)     | The relays and the workers of one project on one remote                          | the remote and the project's root directory                               | — (it is Empty when it has no relay and no worker)     |
-| [Relay](#relay)             | One channel between the two workstations, and whether it is connected            | its kind and its two ends                                                 | its last lease is released                             |
-| [Worker](#worker)           | One persistent process on the remote                                             | a key: the agent's session ID, a name, or `acp` for a workspace's adapter | the remote process is gone                             |
-| [Agent](#agent)             | One conversation of the agent program, and that program's contract               | the agent's own session ID                                                | the client ends the conversation, or the program exits |
-
-### Workstation
-
-A workstation is a machine with a shell: the **local** one, where the client and Hermod run, and the **remote**,
-where the work runs. Hermod reaches workstations by running commands there using `shell`.
-
-| Workstation | What is there                                                                                                     |
-|-------------|-------------------------------------------------------------------------------------------------------------------|
-| Local       | the client, the Hermod process, the Mutagen daemon, the lock files, the listener of every Net relay               |
-| Remote      | the project's directories, the tmux server and its workers, the agent program and its adapter, each worker's logs |
-
-Hermod runs no process of its own on the remote: everything there is tmux, the agent program or a
-[script](#remote-scripts) a worker was started with.
+The components of the model, from the one that drives a command down to what everything runs on. Each section
+describes its component in its own terms and in terms of the components below it, never of those above. Every
+component has a limited responsibility, and one package represents it.
 
 ### Session
 
-A session is one attachment: a local Hermod process, holding the relays of one workspace Connected and one of its
-workers attached to the client. It is a running function of the `session` package, and nothing records it.
+A session is one attachment of a client: a local Hermod process that holds the relays of one workspace Connected
+and joins the client to one of that workspace's workers. It is a running function of the `session` package.
+Nothing records it, and it has no states: while it exists it is attached.
 
-- A session takes a **connect lease** on every relay it uses ([Leases](#leases)).
-- A session ends when its process releases it (the client leaves, the worker exits, a chat's last tab is closed)
-  or when the process dies. Either way its leases end with it.
-- A session that ends changes no worker's state: the worker runs on.
-- `hermod attach` and the stand-in hold one session. `hermod air acp` holds one for every workspace that has a
-  chat open, and keeps in memory which chat belongs to which.
-
-A session has no states of its own: while it exists it is attached.
+- **It decides.** A session reads the worker's state and, when the worker runs an agent, the agent's, and chooses
+  what to do from the pair: start, resume, join, or refuse.
+- **It uses an agent as values.** It asks the agent what a conversation needs, hands the answer to the workspace
+  as an ordinary worker to start, and runs the agent's state query through `shell` on the remote. Nothing below a
+  session knows what a conversation is.
+- **It leases what it uses.** A session takes a connect lease on every relay it uses, through the workspace, and
+  those leases end with it.
+- **Leaving ends only the session.** A session ends when its client leaves (a closed terminal, a closed chat tab,
+  a lost connection), when the worker exits, or when the process dies. The worker runs on, and an agent it runs
+  stays Running.
+- **One per workspace in use.** `hermod attach` and the stand-in hold one session. `hermod air acp` holds one for
+  every workspace that has a chat open, and keeps in memory which chat belongs to which.
 
 ### Workspace
 
 A workspace is the relays and the workers of one project on one remote. Its identity is the remote and the
 project's root directory, so it is neither created nor removed: a project that Hermod has never touched, or has
-finished with, has an Empty workspace. The `workspace` package represents it, and is the only package that pairs
-relays with workers.
+finished with, has an Empty workspace. The `workspace` package represents it, and is the only package that puts
+relays and workers together.
 
-| State    | Meaning                                                                               |
-|----------|---------------------------------------------------------------------------------------|
-| Empty    | No relay and no worker. Before the first session, and after the last worker is gone.  |
-| Detached | No session holds it: its workers run on, and the relays they lease are Disconnected.  |
-| Attached | At least one session holds it: the relays that session leases are Connected.          |
+- **One name.** It names its relays and tags its workers after itself, so everything of one project on one remote
+  is found again by that name.
+- **Relays are connected and released together.** Connecting takes a connect lease on each relay for the caller,
+  and releasing gives them up.
+- **A worker keeps its relays.** The workspace makes each of its workers the keeper of the relays that worker
+  depends on: the IO relay to its stdio, and the workspace's FS relays. They stay while the worker does.
+- **The path map.** The two ends of its FS relays, longest root first, are the map between local and remote
+  paths.
 
-A workspace's state is computed from its members every time and never kept. Which root a directory belongs to,
-and how relays enter a workspace, are in the [design](../openspec/changes/add-air-bridge/design.md#workspace).
+| State    | Meaning                                                                                  |
+|----------|------------------------------------------------------------------------------------------|
+| Empty    | No relay and no worker.                                                                  |
+| Detached | It has a worker, and no relay of its has a connect lease: they are Disconnected.         |
+| Attached | A connect lease is held on its relays: they are Connected.                               |
+
+A workspace's state is computed from its relays and workers every time and never kept. Which root a directory
+belongs to, and how relays enter a workspace, are in the
+[design](../openspec/changes/add-air-bridge/design.md#workspace).
 
 ```mermaid
 stateDiagram-v2
     [*] --> Empty
-    Empty --> Attached: first session
-    Attached --> Detached: last session ends, a worker runs on
-    Detached --> Attached: a session attaches
-    Attached --> Empty: last session ends, no worker
-    Detached --> Empty: last worker is closed
+    Empty --> Attached: its relays are connected for the first time
+    Attached --> Detached: last connect lease ends, a worker remains
+    Detached --> Attached: its relays are connected
+    Attached --> Empty: last connect lease ends, no worker
+    Detached --> Empty: last worker is gone
 ```
 
 ### Relay
 
-A relay is one channel between the two workstations. The `relay` package represents it: three kinds behind one
-set of states.
+A relay is one channel between the two workstations, identified by its kind and its two ends. The `relay`
+package represents it, with its leases: three kinds behind one set of states.
 
-| Kind | Carries                                                                  | Mechanism                                              | What Disconnected buffers, and where                               |
-|------|--------------------------------------------------------------------------|--------------------------------------------------------|--------------------------------------------------------------------|
-| FS   | files between two directories                                            | a Mutagen session                                      | file changes, on each side's disk                                  |
-| IO   | one worker's stdin, stdout and stderr                                    | tmux for a terminal; a FIFO and logs for a line stream | output and the agent's questions: in tmux's screen, or in the logs |
-| Net  | calls from a remote port to a local address, optionally through a filter | `ssh -R` to a local listener                           | nothing: a Net relay goes from Connected to Absent                 |
+| Kind | Carries                                                                  | Mechanism                                                        | What Disconnected buffers, and where            |
+|------|--------------------------------------------------------------------------|------------------------------------------------------------------|-------------------------------------------------|
+| FS   | files between two directories                                            | a Mutagen session                                                | file changes, on each side's disk               |
+| IO   | the stdin, stdout and stderr of one process on the remote                | copies between local streams and a remote stdio it is handed     | what the process writes, at the remote stdio    |
+| Net  | calls from a remote port to a local address, optionally through a filter | `ssh -R` to a local listener                                     | nothing: a Net relay goes from Connected to Absent |
 
 Each relay has one of the following states, and its leases decide which:
 
@@ -140,36 +134,33 @@ stateDiagram-v2
 
 #### Leases
 
-A lease is a claim on a relay that ends with the process that makes it. A relay and its leases do not know who
-that is: the entity that takes a lease says so in its own section.
+A lease is a claim on a relay. A relay counts its leases and knows nothing else about who holds them or why.
 
-| Lease   | Claims that the relay        | Is                                                                                         | Ends when                                                    |
-|---------|------------------------------|--------------------------------------------------------------------------------------------|--------------------------------------------------------------|
-| Connect | delivers                     | a shared lock on the relay's lock file, `$XDG_RUNTIME_DIR/hermod/lease/<relay>`, held by a local process | the process unlocks it, or dies and the kernel unlocks it |
-| Keep    | exists, and buffers          | the workspace tag on a tmux session on the remote, which claims that workspace's FS relays and the session's own IO relay | the tmux session is gone |
+| Lease   | Claims that the relay | Is                                                                                                       | Ends when                                                 |
+|---------|-----------------------|----------------------------------------------------------------------------------------------------------|-----------------------------------------------------------|
+| Connect | delivers              | a shared lock on the relay's lock file, `$XDG_RUNTIME_DIR/hermod/lease/<relay>`, held by a local process | the process unlocks it, or dies and the kernel unlocks it |
+| Keep    | exists, and buffers   | a **keeper**: a value the relay is given that answers one question, whether it still stands              | the keeper answers no                                     |
 
 - **No lease is left behind.** Neither kind is a record someone must remember to delete: a killed process holds
-  no lock, and a tmux session that is gone carries no tag.
-- **`workspace` is the only package that sees a lease.** It takes and releases the locks and counts the tags.
-  `relay` connects, disconnects and removes what it is told to.
+  no lock, and a keeper is asked each time.
 - **The last one out settles.** A process that releases a connect lease tries to lock the file exclusively,
-  without waiting. If it gets the lock, no other connect lease is left: it counts the keep leases, then
-  disconnects the relay or removes it. Closing a tmux session settles its relays the same way.
-- **Unknown means keep.** When the keep leases cannot be counted (the remote does not answer), the relay is left
-  Disconnected, which never removes something in use.
-- **A keep lease can end with nobody there.** The relay then stays Disconnected until the workspace's next
-  session settles it.
+  without waiting. If it gets the lock, no other connect lease is left: the relay asks its keepers, then
+  disconnects or removes itself.
+- **Unknown means keep.** When a keeper cannot answer, the relay is left Disconnected, which never removes
+  something in use.
+- **A keep lease can end with nobody there.** The relay then stays Disconnected until it is next connected or
+  released, which settles it.
 - **A Net relay takes connect leases only.** Its local end is a listener inside the process that connected it,
   so nothing could buffer for it and it has no Disconnected state.
 
-A lock was chosen over a local daemon that owns the relays because `hermod attach` has no process that outlives
-it to be one.
+A lock was chosen over a local daemon that owns the relays because not every Hermod command has a process that
+outlives it to be one.
 
 ### Worker
 
-A worker is one process on the remote that outlives its clients: a tmux session running a plain command, one
-agent, or an adapter that runs an agent per chat. The `worker` package represents it and knows nothing about what
-the process is.
+A worker is one process on the remote that outlives whoever started it: a tmux session running a command. It is
+identified by a key its caller chooses, and carries the tags its caller gives it. The `worker` package represents
+it and knows nothing about what the process is or who it is for.
 
 | State   | Meaning                                                                 |
 |---------|-------------------------------------------------------------------------|
@@ -186,33 +177,56 @@ stateDiagram-v2
     Exited --> Absent: remove
 ```
 
-While its tmux session exists, Running or Exited, a worker is a **keep lease** on its IO relay and on its
-workspace's FS relays ([Leases](#leases)).
+A worker offers its process's stdio in one of two forms, fixed when it starts. Each buffers what the process
+writes while nobody reads:
+
+| Form        | How the stdio is reached                                          | Buffered in        |
+|-------------|-------------------------------------------------------------------|--------------------|
+| Terminal    | joining the tmux session on a tty                                 | tmux's screen      |
+| Line stream | writing lines to a FIFO and reading the process's appended logs   | the logs           |
 
 ### Agent
 
 An agent is two things under one name: one conversation of an agent program, and the contract that program
-offers Hermod. The `agent` package declares the contract and `claude` implements it for Claude Code.
+offers. A conversation is identified by the program's own session ID. The `agent` package declares the contract
+and `claude` implements it for Claude Code.
 
-| State   | Meaning                                                                                                                             |
-|---------|-------------------------------------------------------------------------------------------------------------------------------------|
-| Running | The agent program lists the conversation as running: it works on the last message or waits for the next one.                        |
-| Stopped | The conversation was ended: the client asked the agent to end it, or the program exited. Its transcript stays and can be resumed.   |
+| State   | Meaning                                                                                                                  |
+|---------|--------------------------------------------------------------------------------------------------------------------------|
+| Running | The agent program lists the conversation as running: it works on the last message or waits for the next one.             |
+| Stopped | The conversation was ended: it was asked to end, or the program exited. Its transcript stays and can be resumed.         |
 
 ```mermaid
 stateDiagram-v2
     [*] --> Stopped
     Stopped --> Running: the agent program starts or resumes the conversation
-    Running --> Stopped: the client ends it, or the program exits
+    Running --> Stopped: it is asked to end, or the program exits
 ```
 
-Leaving is not ending. A client that detaches (a closed terminal, a closed chat tab, a lost connection) leaves
-the agent Running, and what the agent asks meanwhile waits in its IO relay.
+A conversation's state does not depend on whether anyone reads its output. A Running conversation with no reader
+stays Running and waits.
 
-An agent performs nothing. It answers `session` with values: the command a worker needs, the files and relays
-that command requires, and the command that asks the agent program for a conversation's state. `session` hands
-the first to `workspace` as an ordinary worker to start and runs the last through `shell` on the remote, so
-neither `workspace` nor `worker` has an operation that names a conversation.
+The contract is values only, and an agent performs nothing. Asked about a conversation, it answers with:
+
+- the command that runs the conversation, with its paths mapped to the remote;
+- what that command requires: the files it must find, the variables it must be given, the directories that must
+  be the same on both workstations, and the port its hooks call back on;
+- the command that asks the agent program for the conversation's state, and how to read the answer.
+
+An agent is handed a path map and never learns where the other workstation is or how it is reached.
+
+### Workstation
+
+A workstation is a machine with a shell: the **local** one, where the client and Hermod run, and the **remote**,
+where the work runs. Hermod reaches workstations by running commands there using `shell`.
+
+| Workstation | What is there                                                                                         |
+|-------------|-------------------------------------------------------------------------------------------------------|
+| Local       | the client, the Hermod process, the Mutagen daemon, the lock files, the listener of every Net relay   |
+| Remote      | the project's directories, the tmux server, the agent program and its adapter, each process's logs    |
+
+Hermod runs no process of its own on the remote: everything there is tmux, the agent program or a
+[script](#remote-scripts) a process was started with.
 
 ## Storage
 
@@ -224,8 +238,8 @@ is nothing to drift.
 | Which FS relays exist, their ends and whether they sync | Mutagen                                                                       | `mutagen sync list`, by label                        | **Relay**, asked by **Workspace**                                |
 | Which workers exist, their state and workspace          | tmux on the remote                                                            | `tmux ls`, by tag                                    | **Worker**, asked by **Workspace**                               |
 | Whether a conversation runs                             | the agent program                                                             | `claude agents --json`                               | **Session**, with the command and the reading **Agent** declares |
-| A relay's connect leases                                | the kernel, as locks on the relay's lock file on the local workstation        | trying to take the lock exclusively, without waiting | **Workspace**                                                    |
-| A relay's keep leases                                   | tmux on the remote, as workspace tags                                         | `tmux ls`, by tag                                    | **Worker**, asked by **Workspace**                               |
+| A relay's connect leases                                | the kernel, as locks on the relay's lock file on the local workstation        | trying to take the lock exclusively, without waiting | **Relay**                                                        |
+| A relay's keep leases                                   | wherever its keepers read: for a worker, tmux on the remote                   | asking each keeper                                   | **Relay**, answered by **Worker** through **Workspace**          |
 | What a Disconnected IO relay buffers                    | tmux's screen, or the logs in the worker's directory on the remote            | joining the tmux session, or reading the logs        | **Relay**                                                        |
 
 Two of these stores are files Hermod writes itself:
@@ -241,8 +255,8 @@ Two of these stores are files Hermod writes itself:
 |-------------|------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------|
 | `cli`       | the process's interface | The only package that reads the arguments, the environment and the process's streams, and the one place every variable Hermod reads is named. Builds everything a command needs from outside the core and hands it in: the agent implementation, the shells, the developer's git facts, the ACP connection. Decides nothing from a state. | the commands |
 | `session`   | [Session](#session) | The only package that decides from states: what to do for a pair of agent and worker states, and where a chat's message goes. Reaches relays and workers only through `workspace`, and an agent only through `agent.Agent`. Declares the messages it routes and the channel they arrive on, and never the wire format. Keeps nothing past the process. | `Attach`, `Chat`, `ExitStatus`, `Message`, `Channel` |
-| `workspace` | [Workspace](#workspace), [Leases](#leases)           | The only package that pairs relays with workers, names and tags them, and takes a lock. Its state is computed on every call.                                                                                     | `Workspace`, `State`, `Members`                                              |
-| `relay`     | [Relay](#relay)                                      | Mechanism only: holds no lease and decides nothing. FS runs the `mutagen` command; Net runs `ssh -R` and a listener in this process; IO copies between a worker's stdio and the client's streams.                 | `Relay`, `State`, `FS`, `IO`, `Net`, `Ends`, `Filter`                        |
+| `workspace` | [Workspace](#workspace) | The only package that imports both `relay` and `worker`, and the one that names and tags them. Its state is computed on every call. | `Workspace`, `State`, `Members` |
+| `relay`     | [Relay](#relay), [Leases](#leases) | The only package that takes a lock. Knows a keeper only as an interface. FS runs the `mutagen` command; Net runs `ssh -R` and a listener in this process; IO copies between local streams and a remote stdio it is handed. | `Relay`, `State`, `FS`, `IO`, `Net`, `Ends`, `Filter`, `Lease`, `Keeper` |
 | `worker`    | [Worker](#worker)                                    | Mechanism only: builds tmux commands and runs them through a `shell` on the remote. Does not know what its process is. Holds the [scripts](#remote-scripts) a worker starts with.                                 | `Worker`, `State`, `Spec`, `Form`, `Stdio`, `List`                           |
 | `agent`     | [Agent](#agent), the contract                        | An interface and values. No behaviour, and no dependency but the shared packages.                                                                                                                                | `Agent`, `State`, `Call`, `Probe`, `Needs`                                   |
 | `claude`    | [Agent](#agent), for Claude Code                     | Pure functions: runs no command and reads no file. The only package that knows Claude Code's arguments, files and adapter.                                                                                       | `Agent` (implements `agent.Agent`)                                           |
@@ -256,6 +270,11 @@ Two of these stores are files Hermod writes itself:
 
 ### Package dependencies
 
+Diagram below shows direct package imports. An **Adapter** imports the **Core** and the **Core** imports no **Adapter**; inside the **Core**, a
+package imports only its own layer or a lower one.  The **domain** layer holds the key components. The **application**
+layer drives them for one command, and the **foundation** layer is what they are built on.
+
+
 ```mermaid
 flowchart TD
     subgraph adapters["Adapters"]
@@ -264,18 +283,18 @@ flowchart TD
         acp
     end
     subgraph core["Core"]
-        subgraph high["High-level API"]
+        subgraph app["Application"]
             session
             air
             claude
         end
-        subgraph mid["Mid-level API"]
+        subgraph domain["Domain"]
             workspace
             worker
             relay
             agent
         end
-        subgraph low["Low-level API"]
+        subgraph foundation["Foundation"]
             shell
             env
             secret
@@ -308,15 +327,6 @@ flowchart TD
     shell --> env
     env --> secret
 ```
-
-Every arrow is a direct import. An adapter imports the core and the core imports no adapter; inside the core, a
-package imports only its own level or a lower one.
-
-- `git` and `acp` are adapters because each speaks to something outside Hermod's model: the `git` command, and a
-  wire protocol. `cli` runs `git` and passes the developer's identity and a worktree's main working tree into
-  the core as values. `acp` implements the channel that `session` declares.
-- `air` and `claude` are in the core because `session` decides by what they declare: Air's own message names, and
-  the agent's contract.
 
 ### Remote scripts
 
