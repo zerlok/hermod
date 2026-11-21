@@ -253,15 +253,15 @@ Two of these stores are files Hermod writes itself:
 
 | Package     | Represents                                           | Constraints                                                                                                                                                                                                      | Declares                                                                     |
 |-------------|------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------|
-| `cli`       | the process's interface | The only package that reads the arguments, the environment and the process's streams, and the one place every variable Hermod reads is named. Builds everything a command needs from outside the core and hands it in: the agent implementation, the shells, the developer's git facts, the ACP connection. Decides nothing from a state. | the commands |
-| `session`   | [Session](#session) | The only package that decides from states: what to do for a pair of agent and worker states, and where a chat's message goes. Reaches relays and workers only through `workspace`, and an agent only through `agent.Agent`. Declares the messages it routes and the channel they arrive on, and never the wire format. Keeps nothing past the process. | `Attach`, `Chat`, `ExitStatus`, `Message`, `Channel` |
+| `cli`       | the process's interface | The only package that reads the arguments, the environment and the process's streams, and the one place every variable Hermod reads is named. Builds everything a command needs from the other adapters and hands it into the core: the agent implementation, the shells, the developer's git facts, the ACP connection and Air's own messages. Decides nothing from a state. | the commands |
+| `session`   | [Session](#session) | The only package that decides from states: what to do for a pair of agent and worker states, and where a chat's message goes. Reaches relays and workers only through `workspace`, and an agent only through `agent.Agent`. Declares the messages it routes by what they mean to it (open, close, end or reopen a chat, or pass through) and the channel they arrive on, and never a wire format or a client's own method names. Keeps nothing past the process. | `Attach`, `Chat`, `ExitStatus`, `Message`, `Kind`, `Channel` |
 | `workspace` | [Workspace](#workspace) | The only package that imports both `relay` and `worker`, and the one that names and tags them. Its state is computed on every call. | `Workspace`, `State`, `Members` |
 | `relay`     | [Relay](#relay), [Leases](#leases) | The only package that takes a lock. Knows a keeper only as an interface. FS runs the `mutagen` command; Net runs `ssh -R` and a listener in this process; IO copies between local streams and a remote stdio it is handed. | `Relay`, `State`, `FS`, `IO`, `Net`, `Ends`, `Filter`, `Lease`, `Keeper` |
 | `worker`    | [Worker](#worker)                                    | Mechanism only: builds tmux commands and runs them through a `shell` on the remote. Does not know what its process is. Holds the [scripts](#remote-scripts) a worker starts with.                                 | `Worker`, `State`, `Spec`, `Form`, `Stdio`, `List`                           |
 | `agent`     | [Agent](#agent), the contract                        | An interface and values. No behaviour, and no dependency but the shared packages.                                                                                                                                | `Agent`, `State`, `Call`, `Probe`, `Needs`                                   |
-| `claude`    | [Agent](#agent), for Claude Code                     | Pure functions: runs no command and reads no file. The only package that knows Claude Code's arguments, files and adapter.                                                                                       | `Agent` (implements `agent.Agent`)                                           |
-| `acp`       | the ACP wire format | Reads and writes one message per line, and turns each into the `session.Message` it is routed by. Routes nothing itself. | `Conn` (implements `session.Channel`) |
-| `air`       | JetBrains Air's own facts                            | The only package that knows the `acp.json` document, the stand-in link and the names of Air's own ACP messages. Writing `acp.json` keeps every entry and key it does not own.                                     | `Configure`, `Config`, `Entry`, `Archive`, `Unarchive`                       |
+| `claude`    | [Agent](#agent), for Claude Code | Pure functions: runs no command and reads no file. The only package that knows Claude Code's arguments, files and ACP adapter program. | `Agent` (implements `agent.Agent`) |
+| `acp`       | the ACP wire format | Reads and writes one message per line, and turns each into the `session.Message` it is routed by: the standard methods by itself, a client's own methods by the table it is given. Routes nothing itself. | `Conn` (implements `session.Channel`) |
+| `air`       | JetBrains Air's own facts | The only package that knows the `acp.json` document, the stand-in link and Air's own ACP messages. Says what each of those messages means as a `session.Kind`. Writing `acp.json` keeps every entry and key it does not own. | `Configure`, `Config`, `Entry`, `Methods` |
 | `git`       | the developer's git facts | Read-only `git` commands on the local workstation. Called by `cli`, which passes the results on as values. | `Identity`, `Read`, `MainWorktree` |
 | `shell`     | [Workstation](#workstation)                          | The only package that starts a process. Each wrapper rewrites the command and hands it inward, and dry-run is chosen once at the innermost one.                                                                  | `Shell`, `Command`, `Result`; `Local`, `DryRun`, `SSH`, `LoginShell`, `Tmux` |
 | `pathmap`   | the map between local and remote paths               | Pure. Applies to a string or a JSON value, longest root first.                                                                                                                                                   | `Map`, `Place`                                                               |
@@ -281,12 +281,12 @@ flowchart TD
         cli
         git
         acp
+        air
+        claude
     end
     subgraph core["Core"]
         subgraph app["Application"]
             session
-            air
-            claude
         end
         subgraph domain["Domain"]
             workspace
@@ -310,11 +310,14 @@ flowchart TD
     git --> shell
     acp --> session
     acp --> pathmap
+    air --> session
     session --> workspace
     session --> agent
-    session --> air
     session --> shell
     claude --> agent
+    claude --> pathmap
+    claude --> env
+    claude --> secret
     workspace --> relay
     workspace --> worker
     workspace --> pathmap
