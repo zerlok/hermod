@@ -142,7 +142,9 @@ you ──────────────► hermod attach [SANDBOX] -- COM
 
 ### Packages
 
-Dependencies point one way: `cli → control → {claude, hook, air, sandbox, mirror, git} → {pathmap, shell}`.
+Dependencies point one way: `cli → control → {claude, hook, air, sandbox, mirror, git} → {pathmap, secret, shell}`,
+with one edge between siblings, `sandbox → claude`: a session is keyed by `claude.SessionID`, and the probe reads
+Claude's list of running sessions and Claude's transcript path, all Claude's contract, which only `claude` holds.
 
 | Package   | Status    | Owns |
 |-----------|-----------|------|
@@ -151,9 +153,10 @@ Dependencies point one way: `cli → control → {claude, hook, air, sandbox, mi
 | `claude`  | new       | Claude's CLI contract as pure functions: classify an argv, extract the session UUID, rewrite an argv and a settings file for the sandbox, select the environment to carry, and the stream-json rules used on reattach. Files are read by the caller. |
 | `pathmap` | new, leaf | (local root, sandbox root) pairs, longest prefix wins, applied to a string, a JSON value or a stream-json line. Knows nothing about Claude. |
 | `hook`    | new       | The local hook proxy: an HTTP handler on a loopback listener that checks the session's token, rewrites bodies through `pathmap`, and forwards to Air's current hook URL with Air's current token. |
-| `air`     | new       | Air's files: merge an entry into `acp.json`, create the stand-in link. |
+| `air`     | new       | Air's files: merge an entry into `acp.json`, create the stand-in link; and Air's mark-done message, read from the ACP stream. |
 | `sandbox` | changed   | Agent sessions keyed by UUID beside today's sessions keyed by name: probe, start (terminal or chat runtime), attach, close. Owns the session directory on the sandbox and every shell line run there, and the TCP reverse forward for hooks. |
 | `mirror`  | changed   | Names that carry the sandbox, one-way transcript mirrors, labels, and a shared lease per mirror. |
+| `secret`  | new, leaf | Credentials as opaque types: a hook token and the environment carried to the sandbox. Every printed form is a mask; `Reveal` is the one way to the value. |
 | `shell`   | changed   | `Command` gains explicit stdio (`Stdin`, `Stdout`, `Stderr`), so a caller can pump a stream through a transform instead of inheriting the terminal; `NewSSH` gains an option to refuse a shared master connection. |
 | `notify`  | removed   | See [The notification back-channel is removed](#the-notification-back-channel-is-removed). |
 
@@ -170,24 +173,28 @@ Dependencies point one way: `cli → control → {claude, hook, air, sandbox, mi
 | anything else with `--session-id` or `--resume <uuid>`                            | terminal session |
 | anything else                                                                     | not an agent session: today's attach, in a tmux session named after the directory |
 
-A command that is not `claude` is the last row.
+A command that is not `claude` is the last row. A session is keyed by the UUID Claude stores it under:
+`--session-id`, else the `--resume <uuid>`. With `--fork-session` Claude stores the resumed conversation under a new
+UUID, so only `--session-id` keys it, and a fork without one has no session.
 
 ### Utility call
 
 Hermod runs `ssh <sandbox> claude ARGS…` with the caller's stdio and exits with its code. No mirror, no tmux, no
-hooks. This covers the adapter's `claude auth status` and Air's `-p` settings read, which then report the
-sandbox's login and settings.
+hooks. The call runs in the project's sandbox directory when that exists, else in the sandbox user's home. This
+covers the adapter's `claude auth status` and Air's `-p` settings read, which then report the sandbox's login and
+settings, the project's own included once the project is mirrored.
 
 ### Agent session
 
 1. **Map paths.** List Hermod's mirrors for this sandbox from Mutagen. The session's directory either lies inside
-   one mirror's local root or becomes a new root at the corresponding sandbox path. The resulting `pathmap` is
-   fixed for the run.
-2. **Open mirrors.** Take a shared lease on the project mirror and on the transcript mirror for this directory,
-   open each (create or resume), flush the project mirror. The transcript mirror brings
-   `~/.claude/projects/<dir>/` on the sandbox to the same place under the local Claude config directory
-   (`CLAUDE_CONFIG_DIR`, `~/.claude` by default). Every setup command runs with stdin from `/dev/null`; Hermod's
-   stdin is left for Claude.
+   one mirror's local root or becomes a new root at the corresponding sandbox path. A new root that holds mirrored
+   roots is made all the same, with a warning: their mirrors keep running, so their files are synced twice. The
+   resulting `pathmap` is fixed for the run.
+2. **Open mirrors.** Take a shared lease on the project mirror, open it (create or resume) and flush it. Once
+   step 3 has reported the sandbox's Claude config directory, take a lease on the transcript mirror for this
+   directory and open it: it brings `<config dir>/projects/<dir>/` on the sandbox (`CLAUDE_CONFIG_DIR`, `~/.claude`
+   by default) to the same place under the local Claude config directory (`CLAUDE_CONFIG_DIR`, `~/.claude` by
+   default). Every setup command runs with stdin from `/dev/null`; Hermod's stdin is left for Claude.
 3. **Ask Claude about the session.** One ssh call runs `claude agents --json` on the sandbox, which lists every
    running session with its `sessionId`, `pid`, `cwd`, `name` and `status`, and checks for the tmux session and the
    transcript:
@@ -199,17 +206,23 @@ sandbox's login and settings.
    | no  | —   | yes | **closed** → start with `--resume`, copying the transcript up first if it exists only locally |
    | no  | —   | no  | **new** → start, or fail if the caller asked to `--resume` |
 
-   A tmux session left without its Claude is removed before a start.
+   A tmux session left without its Claude is removed before a start. A new fork (`--resume <x> --fork-session
+   --session-id <uuid>`) resumes another session than its key, so the probe also looks for `<x>`'s transcript, and
+   one that exists only locally is copied up before the start.
 4. **Start.** Create `~/.hermod/s/<uuid>/` (mode `0700`) if it is missing, with a free sandbox port in `hookport`
    and a new per-session `token`. Write `env` (the selected `CLAUDE_*`/`ANTHROPIC_*` variables and the git
-   identity) and `settings.json` (the caller's hook settings, with the URL set to `localhost:<hookport>` and the
-   session token in place of Air's) into it over ssh stdin. Start tmux session `hermod-<uuid>`, tagged as in
-   [Names and tags](#one-identity-names-and-tags), running `. ./env && exec claude <rewritten args>`. In a chat session Claude's stdin is `in.fifo`, held open by the tmux
+   identity), `settings.json` (the caller's hook settings, with the URL set to `localhost:<hookport>` and the
+   session token in place of Air's) and `mcp.json` (every `--mcp-config` value, inline or a local file, merged
+   without the servers that run local programs) into it over ssh stdin. Start tmux session `hermod-<uuid>`, tagged as in
+   [Names and tags](#one-identity-names-and-tags), in the project's directory, running `. ~/.hermod/s/<uuid>/env && exec claude <rewritten args>`. In a chat session Claude's stdin is `in.fifo`, held open by the tmux
    session, and its stdout is appended to `out.log`.
 5. **Attach.** If the caller's settings carry Air's hooks, start the hook proxy on `127.0.0.1:0` aimed at Air's
    current URL and token. Open one ssh connection, refusing a shared master, with
    `-R <hookport>:127.0.0.1:<proxy port>`:
-   - **terminal session:** `tmux new-session -A -s hermod-<uuid>` on a tty;
+   - **terminal session:** `tmux attach-session -t hermod-<uuid>` on a tty. It joins only a session that exists,
+     never creating one, which would be a shell under the session's name. Claude runs with tmux's
+     `remain-on-exit failed`, so a Claude that fails leaves its pane, error and exit status for the attach to show;
+     a session gone by the attach (Claude exited at once) fails the run;
    - **chat session:** a shell line that tails `out.log` to stdout and copies stdin into `in.fifo` one complete
      line at a time. Hermod passes both directions through `pathmap`, line by line, unbuffered. When the session
      was already running, Hermod answers the SDK's `initialize` from the first response in the log, re-delivers
@@ -217,14 +230,20 @@ sandbox's login and settings.
 6. **Detach.** Stdin EOF, SIGTERM or a dropped connection ends the attach and nothing else; the tmux session
    keeps running. Hermod exits inside the SDK's 2 s + 5 s window, so it is never left orphaned.
 7. **Settle.** Release the leases. The last holder of a mirror settles it by today's rule, with liveness read as
-   "any `hermod-*` tmux session tagged with a directory under this root".
+   "any tmux session tagged with a directory under this root", an agent session's or a plain attach's.
 
 ### Close
 
 On `_session/archive` for a UUID, `RunACP` closes that session: `tmux kill-session -t hermod-<uuid>` (Claude gets
 SIGHUP and saves its transcript); the session directory stays, for `--resume`. It then settles the session's
 mirrors as step 7 does, holding a lease while it decides so it cannot race an attached stand-in. A
-`_session/unarchive` needs nothing: the `session/resume` that follows finds a closed session in step 3.
+`_session/unarchive` closes nothing: the `session/resume` that follows finds a closed session in step 3. It only
+keeps a close still to come from ending the resumed session: a queued close of that chat is dropped, and one under
+way skips the hang-up, settling the mirrors as a detach does.
+
+A session whose tmux session is already gone (its Claude exited) has nothing to close, and its mirrors are not
+settled: the directory that names them is known only from the tmux session's tag. They stay as the last detach
+left them, paused at worst, until the next attach under their root opens them; nothing is lost.
 
 ## Decisions
 
@@ -248,10 +267,13 @@ SDK version is one package and its table-driven tests. `pathmap` is separate bec
 ### Claude says what state a session is in
 Whether a session runs is Claude's to say, not something to infer from the files and tmux sessions Hermod left
 behind. `claude agents --json` on the sandbox is the authority; the session directory holds only what the running
-process needs (`hookport`, `token`, `env`, `settings.json`, `in.fifo`, `out.log`) and decides nothing. This also
-catches a session started on the sandbox outside Hermod, which a tmux check alone would resume as a second copy.
+process needs (`hookport`, `token`, `env`, `settings.json`, `mcp.json`, `in.fifo`, `out.log`), and the `pid` a close
+waits on, and decides nothing. This also catches a session started on the sandbox outside Hermod, which a tmux
+check alone would resume as a second copy.
 
-A command that is not an agent session has no Claude to ask and keeps today's check, `tmux has-session`.
+A command that is not an agent session has no Claude to ask. It places its directory and settles its mirror as an
+agent session does (steps 1 and 7), so a plain attach and an agent session under one root keep each other's mirror
+alive.
 
 ### One identity: names and tags
 Everything a session owns is findable from its UUID or from the `hermod` prefix, with the tool that owns it, and
@@ -264,7 +286,7 @@ by hand from one that Hermod runs for an Air chat on a particular laptop.
 | Claude process (sandbox) | untouched | environment `HERMOD_SESSION`, `HERMOD_MODE`, `HERMOD_ORIGIN` | `/proc/<pid>/environ`, with the `pid` from `claude agents --json` |
 | Session directory (sandbox) | `~/.hermod/s/<uuid>/` | — | — |
 | Project mirror (local) | `hermod-<sandbox>-<slug>` | labels `hermod-kind=project`, `hermod-sandbox=<sandbox>` | `mutagen sync list --label-selector hermod-sandbox=<sandbox>` |
-| Transcript mirror (local) | `hermod-<sandbox>-<slug>-transcripts` | labels `hermod-kind=transcripts`, `hermod-sandbox=<sandbox>` | same |
+| Transcript mirror (local) | `hermod-<sandbox>-<slug>-transcripts-<local>`, `<local>` a hash of its local end | labels `hermod-kind=transcripts`, `hermod-sandbox=<sandbox>` | same |
 | Log (local) | `~/.cache/hermod/air/<uuid>.log` | — | — |
 
 - **Mode** says who drives the session: `air-acp` (an Air chat, through the adapter), `air-terminal` (Air's terminal
@@ -276,7 +298,9 @@ by hand from one that Hermod runs for an Air chat on a particular laptop.
   Hermod passes no `--name` and adds no prefix or suffix. A Claude that Hermod runs is recognized by its
   environment, not by its name; one without `HERMOD_SESSION` was started on the sandbox itself.
 - Mirrors belong to a root, not to one session, so they carry the sandbox and the kind but no session ID. They
-  live on the local machine, so they need no origin.
+  live on the local machine, so they need no origin. A transcript mirror also carries its local end: one sandbox
+  directory's transcripts go to `~/.claude` for a terminal or a hand-run session and to an entry's
+  `CLAUDE_CONFIG_DIR` for its chats, each by a mirror of its own.
 - `@hermod-dir` is what the settle rule reads, so no file on the sandbox has to record it.
 
 ### The sandbox never holds Air's secrets
@@ -345,7 +369,7 @@ releases a crashed process's locks, so a killed stand-in never leaves a mirror l
 does not fit what this design makes of Hermod:
 
 - **It wants Hermod on the sandbox.** Its sender is `hermod notify` run there, which is what the
-  [remote-agent](../add-remote-agent/proposal.md) proposal exists to install. Nothing of Hermod's runs on the
+  `add-remote-agent` proposal exists to install. Nothing of Hermod's runs on the
   sandbox now.
 - **It is one socket per sandbox user**, owned by the most recent attach. With several sessions attached at once,
   all but one lose it.
@@ -355,8 +379,7 @@ does not fit what this design makes of Hermod:
 What is lost is the desktop toast for a session attached from a plain terminal. If that is wanted again, the hook
 forward is the transport to build it on: Claude's own `Stop` and `Notification` hooks, received locally.
 
-The [`add-notify-backchannel`](../add-notify-backchannel/proposal.md) and
-[`add-remote-agent`](../add-remote-agent/proposal.md) changes are withdrawn with it. `shell`'s reverse-forward
+The `add-notify-backchannel` and `add-remote-agent` changes are withdrawn with it. `shell`'s reverse-forward
 option stays; the hook forward uses it.
 
 ## Risks / Trade-offs
@@ -367,10 +390,8 @@ option stays; the hook forward uses it.
 - **The adapter is assumed to list sessions from `CLAUDE_CONFIG_DIR`**, as Claude Code does. → Verify with
   `air-probe` and two entries. If it does not, every agent lists every chat, and a chat reopened through the wrong
   agent forks.
-- **`claude agents --json` is assumed to list a headless chat session** as it lists interactive ones, and to exist
-  in the sandbox's Claude version. → Verify on the sandbox with a chat session running. If it does not list them,
-  chat sessions fall back to `tmux has-session`.
-- **The ACP session ID is assumed to be Claude's session UUID.** → Verify in `acp-tap` logs before building close.
+- **The ACP session ID is assumed to be Claude's session UUID**, which close takes it for. → Verify in `acp-tap`
+  logs. If it is not, "mark done" closes nothing.
 - **"Mark done" writes into a transcript the one-way mirror owns**, which may stall that mirror. → Test with
   `air-probe`; if it stalls, close resets the file.
 - **A sandbox port picked free can be taken before `ssh -R` binds it.** → That attach runs without hooks, logged;
