@@ -134,27 +134,9 @@ and passes every other one on with its paths mapped.
 
 ## Entities
 
-```
-LOCAL workstation                                                 REMOTE workstation
-
-  client ──► session ──► workspace ─┬─ FS relay   project dir   ⇄  project dir
-(you, Air's terminal,               ├─ FS relay   transcripts   ⇄  transcripts
- Air's chat UI)                     ├─ Net relay  local address ◄  a remote port
-                                    │
-                                    ├─ worker ─── IO relay ─────⇄  a process
-                                    └─ worker ─── IO relay ─────⇄  a process
-```
-
-Hermod keeps state for none of these; each is read from its source when asked.
-
-| Entity      | The one fact it owns | Identified by | Lives until |
-|-------------|----------------------|---------------|-------------|
-| Workstation | A machine commands run on: the local one, or the remote. Hermod interacts with stations via `shell.Shell` that runs `shell.Command` | its host | — |
-| Session     | One attachment of a local Hermod process to one workspace and one of its workers. It is stored nowhere | the process and the workspace | the process ends or releases it; the worker keeps running and its relays are disconnected |
-| Workspace   | The relays and the workers of one project on one remote | the two ends of its project FS relay | it has no worker and no session |
-| Relay       | One channel between the two workstations, and whether it is connected | its kind and its two ends | no lease holds it and its workspace has no worker |
-| Worker      | One persistent process on the remote | a key: the agent's session ID, a name, or `acp` for a workspace's adapter | the remote process is gone |
-| Agent       | One conversation of the agent program, and that program's contract | the agent's own session ID | the client ends the conversation, or the program exits |
+Hermod is built from six entities: workstation, session, workspace, relay, worker and agent. What each one owns,
+its states and the package that declares it are in [ARCHITECTURE](../../../docs/ARCHITECTURE.md#entities). This section gives the rules
+they follow.
 
 - A workspace holds any number of workers, none included. It exists from its first session and is gone with its
   last worker, and nothing sets one up beforehand.
@@ -166,17 +148,7 @@ Hermod keeps state for none of these; each is read from its source when asked.
 
 ### Relay
 
-| State        | Meaning |
-|--------------|---------|
-| Absent       | Does not exist. |
-| Disconnected | Exists and accepts traffic at the remote end, but delivers nothing. What arrives is held. |
-| Connected    | Delivers in both directions. Entering this state first drains what was held. |
-
-| Kind | Carries | Mechanism (implementation) | What Disconnected holds, and where |
-|------|---------|----------------------------|------------------------------------|
-| FS   | files between two directories | a Mutagen session | file changes, on each side's disk |
-| IO   | the worker's stdin, stdout and stderr | tmux for a terminal; a FIFO and logs for a line stream | output and the agent's questions: in tmux's screen, or in the logs |
-| Net  | calls from a remote port to a local address, optionally through a filter | `ssh -R` to a local listener | nothing: see below |
+States and kinds: [ARCHITECTURE](../../../docs/ARCHITECTURE.md#relay).
 
 - A relay is **leased** ([Leases are file locks](#leases-are-file-locks)): each session that connects it holds a
   lease, and it stays Connected while any lease is held.
@@ -196,11 +168,7 @@ releases its relays together, applies the release rule from its own worker list,
 everything in it. It carries nothing itself: a project's files are on both workstations because an FS relay joins
 the two directories, not because a workspace exists.
 
-| State    | Meaning |
-|----------|---------|
-| Absent   | It has no relay and no worker. |
-| Detached | No session holds it: its workers run on, its relays are Disconnected, and what the remote does meanwhile is held. |
-| Attached | A session holds it: the relays that session leases are Connected. |
+States: [ARCHITECTURE](../../../docs/ARCHITECTURE.md#workspace).
 
 A workspace's state is those of its members, read in two calls: its relays from Mutagen and its workers from tmux,
 both by the workspace's name ([Names and tags](#one-identity-names-and-tags)).
@@ -230,15 +198,10 @@ twice: a session or a worker that needs a relay already there leases it.
 
 ### Worker
 
-| State   | Meaning |
-|---------|---------|
-| Absent  | No tmux session under the key. |
-| Running | The process is alive. |
-| Exited  | The process failed; its pane is kept to show the error and exit status. |
+States: [ARCHITECTURE](../../../docs/ARCHITECTURE.md#worker).
 
 A worker is a tmux session on the remote, tagged with its workspace and its origin
-([Names and tags](#one-identity-names-and-tags)). Start takes Absent to Running; a clean exit or a close leads to
-Absent; a failed exit leads to Exited; removing an Exited worker leads to Absent. tmux is the only source.
+([Names and tags](#one-identity-names-and-tags)). tmux is the only source of its state.
 
 The worker provides the remote end of its IO relay in one of two forms, fixed when it starts:
 
@@ -248,10 +211,7 @@ The worker provides the remote end of its IO relay in one of two forms, fixed wh
 
 ### Agent
 
-| State   | Meaning |
-|---------|---------|
-| Running | The agent program lists the conversation as running. |
-| Stopped | It does not. |
+States: [ARCHITECTURE](../../../docs/ARCHITECTURE.md#agent).
 
 The agent program is the only source: for Claude, `claude agents --json`. A detach changes nothing here: an agent
 whose client has gone is Running, and what it waits for is held in a relay. Whether a stopped conversation can be
@@ -261,17 +221,9 @@ there is nothing to resume.
 Hermod reads an agent's state only for a worker that runs one agent. A chat's agent runs inside the adapter, which
 starts, resumes and ends it; Hermod decides nothing about it.
 
-`control` reaches an agent through one interface and never names Claude:
-
-| Control asks | The agent answers |
-|--------------|-------------------|
-| What do these arguments ask for? | The conversation's key; or that this is a one-shot call with no conversation. |
-| Is this conversation running? | The command that asks the agent program, and how to read its output into a state. |
-| What does a worker for it need? | The command to run with paths mapped, the files it must find, the local variables it must be given, and the relays it requires. |
-| What does its ACP adapter need? | The adapter's command, the local variables it must be given, and the relays it requires. |
-| How do its hook settings reach a relay? | The settings document with its hooks aimed at a remote port and carrying the worker's token. |
-
-The agent is handed the path map and never learns where the other workstation is or how it is reached.
+`control` reaches an agent through one interface, [`agent.Agent`](../../../docs/ARCHITECTURE.md#agentagent--an-agent-programs-contract),
+and never names Claude. The agent is handed the path map and never learns where the other workstation is or how
+it is reached.
 
 ## Flows
 
@@ -399,51 +351,6 @@ LOCAL                                                              REMOTE
 Paths cross between the workstations in four places: a worker's arguments, ACP messages, hook bodies and the files
 themselves. The first three are mapped by the one path map the fourth defines.
 
-## Packages
-
-```mermaid
-flowchart TD
-    cli --> control
-    control --> workspace
-    control --> claude
-    control --> acp
-    control --> air
-    control --> git
-    workspace --> relay
-    workspace --> worker
-    workspace --> pathmap
-    claude --> pathmap
-    claude --> env
-    claude --> secret
-    relay --> shell
-    worker --> shell
-    worker --> env
-    git --> shell
-```
-
-Dependencies point one way, and no package imports another on its own row of the diagram. `control` also uses
-`pathmap`, `env` and `secret` directly. It declares the agent interface, and `claude` implements it.
-
-| Package     | Owns |
-|-------------|------|
-| `cli`       | The process's interface: commands, flags, the name of every variable Hermod reads, stdio, and the stand-in entry chosen by the program name. It builds one request per command and calls one use case. |
-| `control`   | The use cases: session, one-shot call, chat, close, registration. Each takes its own request. The decision table lives here, and the agent interface. |
-| `workspace` | One project's relays and workers on one remote: which workspace a directory belongs to, finding or making each relay, the names and labels, the leases, the release rule, the state of the whole, and the path map read from its FS relays. |
-| `worker`    | The tmux session on the remote: its state, tags, directory, start and close, its stdio as an IO relay can reach it, and the list of workers under a tag. Mechanism only: it knows nothing of workspaces or relays. |
-| `relay`     | The three relay kinds behind one state set. Mechanism only: it connects, disconnects and removes what it is told to. |
-| `claude`    | Claude's contract as the agent interface: its arguments, read with the flag library; its running state; its launch and its adapter's; its settings as typed documents. Pure functions; files are read by the caller. |
-| `acp`       | The ACP wire format as typed messages: reading and writing them, and the fields `control` routes by. |
-| `air`       | Air's own facts: the `acp.json` document as typed structures, and the names of the archive messages. |
-| `pathmap`   | The map itself, and where a local directory lies on the remote. Applied to a string or a JSON value. |
-| `env`       | Variables as key and value pairs. The one place that splits and joins `KEY=VALUE`; it prints keys only. |
-| `secret`    | A token as an opaque type that prints as a mask. |
-| `shell`     | `Command` and `Shell`: local, ssh, login shell, tmux. One command type, built once and passed down. |
-| `git`       | The developer's identity, and a linked worktree's main working tree. |
-
-Scripts that run on the remote are files embedded in the package that owns them. Each takes its inputs as
-arguments and environment; nothing is substituted into a script's text, so a value can never become shell syntax,
-and `shell` does not have to express redirections or loops.
-
 ## Decisions
 
 ### The adapter runs on the remote, one per workspace
@@ -503,7 +410,7 @@ from the environment, and so would any other option it comes to need.
 
 ### An agent declares, the entities act
 Claude's arguments, settings and state follow Claude's CLI and change together when it changes. `claude` answers
-`control`'s questions with values (a command, files, relay requirements, a rewritten settings document) and
+the [agent interface]({A}#agentagent--an-agent-programs-contract)'s questions with values (a command, files, relay requirements, a rewritten settings document) and
 performs nothing itself, so it needs no shell, no remote and no relay to be tested, and a new Claude version is
 one package and its table-driven tests.
 

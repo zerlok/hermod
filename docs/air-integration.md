@@ -365,7 +365,7 @@ Each local Hermod holds a shared lease on every mirror its session uses. When it
 mirror by today's rule: pause while any session under that root is alive (or its liveness is unknown) on the
 sandbox, flush and close when none is. A detached session keeps working with its mirrors paused; its edits arrive on
 the next attach. This applies to project and transcript mirrors alike. How the leases and the liveness check work is
-in [`ARCHITECTURE.md`](ARCHITECTURE.md#leases-the-last-one-out-settles).
+in the [design](../openspec/changes/add-air-bridge/design.md#leases-are-file-locks).
 
 ### File, transcript and hook channels are not synchronized
 
