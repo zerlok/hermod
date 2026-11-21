@@ -36,3 +36,7 @@ func isShellSafe(r rune) bool {
 		return strings.ContainsRune("_-./:=@,", r)
 	}
 }
+
+// Quote is s as one word of a POSIX shell line, for a caller that writes a
+// line itself, such as a file the sandbox's shell sources.
+func Quote(s string) string { return quote(s) }
