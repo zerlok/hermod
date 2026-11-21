@@ -1,14 +1,15 @@
 # JetBrains Air — remote agent integration
 
 This document records how [JetBrains Air](https://www.jetbrains.com/air/) runs Claude Code, what a bridge
-must do to run that agent on a Hermod sandbox while Air stays local, which of those requirements a working
-prototype has already proven, and the architecture chosen for bringing the bridge into Hermod. It is the input for
-an OpenSpec change that does so.
+must do to run that agent on a Hermod sandbox while Air stays local, and the decisions Hermod's bridge is built on.
+The bridge itself — its command line, packages and flows — is the
+[`add-air-bridge` design](../openspec/changes/add-air-bridge/design.md); how to set it up is in the
+[README](../README.md#jetbrains-air).
 
-The prototype is [`air-remote-claude`](../air-remote-claude), a bash script standing in for the `claude`
-executable. It talks to the sandbox with plain `ssh` and `mutagen`, without Hermod, so every mechanism below can be
-read in one file. The [session lifecycle](#session-lifecycle) was recorded with [`air-probe`](../air-probe): a
-stand-in `claude` that answers without a model, and a tap on the ACP stream between Air and the adapter.
+Each mechanism below marked proven was first shown to work by a bash script standing in for `claude`, before the
+bridge was built into Hermod. The [session lifecycle](#session-lifecycle) was recorded with
+[`air-probe`](../air-probe): a stand-in `claude` that answers without a model, and a tap on the ACP stream between
+Air and the adapter. What is still unverified is listed under [Open questions](#open-questions).
 
 Versions observed: GoLand 2026.3 with the Air plugin, `@agentclientprotocol/claude-agent-acp` 0.101.0,
 `@anthropic-ai/claude-agent-sdk` 0.3.318, Claude Code 2.1.318 on the sandbox.
@@ -140,13 +141,12 @@ Terminal mode's lifecycle is not observed yet.
 
 ## What the bridge must do
 
-Each requirement states the mechanism and its status in the prototype.
+Each requirement states the mechanism and its status.
 
 ### 1. Rewrite the arguments — proven
 
-- `--settings <file>`: the file exists only locally, so its contents must reach the sandbox. The prototype passes
-  them inline (`--settings` accepts JSON); Hermod writes them to a file in the session's directory, keeping them
-  off the command line.
+- `--settings <file>`: the file exists only locally, so its contents must reach the sandbox. `--settings` accepts
+  inline JSON, but Hermod writes them to a file in the session's directory, keeping them off the command line.
 - Local paths in any argument (`--add-dir`, project paths) are rewritten to their sandbox form.
 - `--session-id` / `--resume` pass through unchanged; the UUID is the key for transcripts and session naming.
 
@@ -171,8 +171,8 @@ reports sandbox paths (`cwd`, `transcript_path`, `tool_input.file_path`, …), w
 so the proxy rewrites every JSON string sandbox → local on requests and local → sandbox on responses. Observed
 latency through the tunnel is 2–100 ms, well inside the 1 s timeouts.
 
-The prototype leaves the settings untouched — the sandbox keeps Air's port number and token, and the proxy passes
-the `Authorization` header through. Hermod gives each session a port and a token of its own; see
+Proven with the sandbox keeping Air's port number and token and the proxy passing the `Authorization` header
+through. Hermod gives each session a port and a token of its own instead; see
 [Hooks: a sandbox port per session](#hooks-a-sandbox-port-per-session). `ControlPath=none` is required on that
 `ssh`; a shared master connection silently drops the new `-R` forwards.
 
@@ -184,8 +184,8 @@ stdout line sandbox → local and each stdin line local → sandbox, unbuffered,
 ### 6. Mirror the project — proven
 
 A two-way Mutagen session between the local project and the sandbox directory. Edits made on the sandbox reach the
-editor through the mirror; Air's change tracking comes from the hook/stream events, not from the files. The
-prototype lets local win conflicts (`two-way-resolved`), which silently discards the sandbox's side. Hermod's mirror
+editor through the mirror; Air's change tracking comes from the hook/stream events, not from the files. It was
+proven with local winning conflicts (`two-way-resolved`), which silently discards the sandbox's side. Hermod's mirror
 is `two-way-safe`, so the sandbox's changes stay visible and neither side's are lost; see
 [the design](../openspec/changes/add-air-bridge/design.md#the-project-mirror-never-picks-a-winner).
 
@@ -227,19 +227,23 @@ it. Whether Air writes files there for the agent is not yet known; if it does, t
 - **Hook port.** Every session of an IDE run uses the same port, but a sandbox port can be bound by only one
   `ssh -R`. A second concurrent session silently loses its hooks. See
   [Hooks: a sandbox port per session](#hooks-a-sandbox-port-per-session).
-- **Mirror.** Several sessions can share one Mutagen mirror; pause/teardown must wait for the last of them. See
-  [Mirrors cover roots](#mirrors-cover-roots-worktrees-resolve-by-path) and
+- **Mirror.** Several sessions share one Mutagen mirror, and pause/teardown waits for the last of them, through a
+  lease per mirror. See [Mirrors cover roots](#mirrors-cover-roots-worktrees-resolve-by-path) and
   [Mirrors pause when nobody is attached](#mirrors-pause-when-nobody-is-attached).
 - **Naming.** Session identity is Air's UUID, not the directory slug.
 
 ### 12. Durability — decided
 
-The prototype runs the agent directly over `ssh`; a dropped connection ends the session. See
+An agent run directly over `ssh` ends with a dropped connection. See
 [A session is a tmux session](#a-session-is-a-tmux-session-and-only-the-user-ends-it).
 
 ---
 
 ## Feature status
+
+Observed with the bash stand-in that first proved the mechanisms above; Hermod's bridge has not yet been run
+against Air as a whole. Where the stand-in fell short, the numbered need under *Depends on* says how the bridge
+answers it.
 
 | Air feature                                  | Terminal mode | Chat mode | Depends on |
 |----------------------------------------------|:-------------:|:---------:|------------|
@@ -258,7 +262,7 @@ The prototype runs the agent directly over `ssh`; a dropped connection ends the 
 ## Design decisions
 
 **Air is a terminal.** It attaches to and detaches from an agent session that lives on the sandbox, the way
-`hermod <sandbox>` attaches to tmux today, while the IDE still shows the session's file changes locally and receives
+`hermod attach` attaches to tmux today, while the IDE still shows the session's file changes locally and receives
 every event it needs. Everything that rewrites, proxies or decides runs in the local Hermod; the sandbox runs Claude
 in tmux on mirrored files.
 
@@ -280,40 +284,51 @@ The sandbox needs `sshd`, `tmux`, `claude`, a POSIX shell with coreutils (`mkfif
 sends short shell commands over `ssh` on each run, as it already does for tmux, and installs nothing. A sandbox-side
 helper — a per-session process holding the agent's stdio, or a resident daemon — was rejected: either one needs a
 Hermod binary matching the sandbox's platform, an upgrade path while sessions run, and turns Hermod into server
-software instead of the connection to one. The Air bridge therefore does not depend on
-[remote-agent](../openspec/changes/add-remote-agent/proposal.md).
+software instead of the connection to one. The Air bridge therefore does not depend on the withdrawn
+`add-remote-agent` change.
 
 ### A session is a tmux session, and only the user ends it
 
 Each Air session runs in a tmux session named `hermod-<uuid>`, so it survives the connection in both modes:
 
-- **Terminal mode** is today's attach: `ssh -t <sandbox> tmux new-session -A -s hermod-<uuid> -- claude …`.
+- **Terminal mode** runs Claude's own UI in that tmux session, started detached and joined with
+  `ssh -t <sandbox> tmux attach-session -t hermod-<uuid>`.
 - **Chat mode** cannot pass its stream through tmux — a pty alters the bytes and an attach replays a screen, not
   the output — so tmux only keeps the process alive. Claude reads stdin from a FIFO the tmux session holds open (so
   it never sees EOF) and appends stdout to a log, both in `~/.hermod/s/<uuid>/` (mode `0700`). Attaching tails the
   log and forwards stdin into the FIFO one complete line at a time (`read -r`), so a connection dropped mid-line
-  never hands Claude partial JSON. User messages echoed back by `--replay-user-messages` acknowledge input; prompts
-  not yet echoed are resent on reattach.
+  never hands Claude partial JSON. User messages echoed back by `--replay-user-messages` acknowledge input, which a
+  [live reattach](#reattach-to-a-running-chat-session-restarts-it) would use to resend prompts not yet echoed.
+
+  Observed with Claude Code 2.1.325, one machine standing in for the sandbox (tmux and Claude, no ssh): a Claude
+  started this way keeps running with nobody attached; `claude agents --json` lists it as it lists a terminal
+  session (`"kind": "interactive"`, `"status": "idle"`), so the probe needs no fallback to `tmux has-session` for
+  chat sessions; an `initialize` written through the attach is answered in the log; a detach on stdin EOF leaves it
+  running and listed; and `tmux kill-session` ends it within a second, leaving the session directory.
 
 A session is **running** (with zero or more attached clients) or **closed** (Claude stopped, transcript kept,
 resumable). A local process ending — a closed tab, a quit IDE, a dropped connection — is always a detach: the
 session keeps running, and may be driven meanwhile through Claude's Remote Control. Air's `session/close` is such a
 detach, sent on every tab close and IDE quit. Closing happens only by the user's decision, which Air expresses as
 "mark done" (`_session/archive`, undone by opening the chat again); see [Session lifecycle](#session-lifecycle).
-That message reaches only the adapter, so in chat mode Hermod wraps the adapter and closes the session when it
-passes.
+That message reaches only the adapter, so in chat mode Hermod wraps the adapter (`hermod air acp claude`) and
+closes the session when it passes: the tmux session goes, the session directory stays for `--resume`, and the
+session's mirrors are settled as on a detach. In terminal mode no adapter runs, so nothing marks a session done; it
+runs until it is closed on the sandbox (`tmux kill-session -t hermod-<uuid>`).
 
 Deleting a session is out of scope for now, and Air offers no delete. When added, it stops Claude and the session's
 tmux session, stops the mirror if no other session uses it, and removes the session's files from the sandbox.
 
-### Reattach attaches to the live session
+### Reattach to a running chat session restarts it
 
-When Air reopens a session that is still running, the bridge attaches to the running Claude instead of
-starting another: Air loads history from the transcript, the bridge answers the new SDK's `initialize` locally from
-the first response in the log, re-delivers control requests still waiting for an answer (permission prompts
-raised while detached), and streams the log from its end. Only when the session is closed does the bridge start
-`claude --resume <uuid>` in a new tmux session. Whether a session is running is Claude's to say, not something
-read from the tmux session alone.
+The aim is for a reopened chat whose Claude still runs to attach to that Claude instead of starting another: Air
+loads history from the transcript, the bridge answers the new SDK's `initialize` locally from the first response in
+the log, re-delivers control requests still waiting for an answer (permission prompts raised while detached), and
+streams the log from its end. Whether the SDK accepts that is unproven, so it is not built. What Hermod does instead
+is close the running session and start `claude --resume <uuid>` in a new tmux session, which costs at most the
+turn in flight. A closed session is resumed the same way. Whether a session is running is Claude's to say, not
+something read from the tmux session alone. A terminal session needs none of this: its attach joins the running
+tmux session.
 
 ### Hooks: a sandbox port per session
 
@@ -349,7 +364,8 @@ a remote session.
 Each local Hermod holds a shared lease on every mirror its session uses. When it exits, the last holder settles the
 mirror by today's rule: pause while any session under that root is alive (or its liveness is unknown) on the
 sandbox, flush and close when none is. A detached session keeps working with its mirrors paused; its edits arrive on
-the next attach. This applies to project and transcript mirrors alike.
+the next attach. This applies to project and transcript mirrors alike. How the leases and the liveness check work is
+in [`ARCHITECTURE.md`](ARCHITECTURE.md#leases-the-last-one-out-settles).
 
 ### File, transcript and hook channels are not synchronized
 
@@ -359,13 +375,19 @@ bridge does not order them.
 
 ### Open questions
 
+- **The ACP session ID.** Closing a chat marked done takes the `sessionId` of `_session/archive` for Claude's
+  session UUID. The adapter is believed to use Claude's UUID as the ACP session ID; not yet confirmed in `acp-tap`
+  logs. If it does not, "mark done" closes nothing and the session runs until closed on the sandbox.
 - **Archive marker and the transcript mirror.** "Mark done" writes to the local copy of a transcript that the
   one-way mirror owns. A locally changed file is likely a conflict that stops later sandbox writes from reaching it;
-  not yet tested.
+  not yet tested. If it does, the close is to reset that file.
+- **Sessions listed per sandbox.** Each sandbox's agent sets its own `CLAUDE_CONFIG_DIR`, assuming the adapter lists
+  sessions from there as Claude Code does; not yet tested with two entries.
 - **Terminal mode.** Not observed yet: switching the agent to terminal mode in Air's agent settings still opened
   the chat UI.
 - **Attaching to a live chat-mode process.** Whether Air accepts the locally answered `initialize`, the re-delivered
-  pending requests, and history from the transcript joined to the live log.
+  pending requests, and history from the transcript joined to the live log. Until it is shown to, a reopened chat
+  restarts with `--resume` (see [above](#reattach-to-a-running-chat-session-restarts-it)).
 - **Remote Control in chat mode.** Whether a Claude started headless by the SDK can be driven through Remote Control
   while detached.
 - **Worktree layout.** Where Air creates worktrees — inside the project root or beside it — which decides how many
@@ -381,5 +403,6 @@ bridge does not order them.
   states that third-party products may not offer claude.ai login without approval. Running the adapter without the
   flag uses a Claude subscription outside what Air ships; anyone adopting this should check Anthropic's terms.
 - **Secrets in transit.** Air's hook settings carry a Bearer token, and its MCP config an IDE token. Both are
-  per-IDE-run and local-only by design; the bridge must not log them in clear or send them to the sandbox. (The
-  prototype sends both, and its log, mode `0600`, still records argv and so the MCP token.)
+  per-IDE-run and local-only by design; the bridge must not log them in clear or send them to the sandbox. Hermod
+  gives the sandbox a hook token of the session's own and leaves out the MCP servers that run local programs, so
+  neither token reaches it.
