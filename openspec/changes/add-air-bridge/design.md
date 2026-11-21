@@ -546,10 +546,8 @@ root pair. Hermod labels its relays and reads the roots from `mutagen sync list`
 could drift. Paths stay in the ends because a label value cannot hold one.
 
 ### Leases are file locks
-Each session that connects a relay through its workspace holds a shared `flock` on
-`$XDG_RUNTIME_DIR/hermod/lease/<relay>`. On release it tries a non-blocking exclusive lock; the process that gets
-it held the last lease and applies the release rule. The kernel releases a crashed process's locks, so a killed
-Hermod never leaves a relay leased. The lease is `workspace`'s own detail and no other package sees it.
+A lease is a lock the kernel holds for a live process, so a killed Hermod never leaves a relay leased. The
+mechanism is in [ARCHITECTURE](../../../docs/ARCHITECTURE.md#leases).
 
 - **Alternative — a local daemon owning relays:** rejected. `hermod air acp` lives as long as the IDE run and
   could host one, but terminal mode and `attach` have no such process.
