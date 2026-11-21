@@ -26,5 +26,7 @@ func (l loginShell) Run(ctx context.Context, cmd Command) (Result, error) {
 	// The literal "sh" is $0; the joined command is $1. exec avoids a lingering
 	// wrapper process.
 	argv := []string{"sh", "-c", `exec "$SHELL" -lc "$1"`, "sh", join(cmd.Argv)}
-	return l.inner.Run(ctx, Command{Argv: argv, Dir: cmd.Dir, Env: cmd.Env, Capture: cmd.Capture})
+	wrapped := cmd
+	wrapped.Argv = argv
+	return l.inner.Run(ctx, wrapped)
 }

@@ -3,6 +3,8 @@ package control
 import (
 	"reflect"
 	"testing"
+
+	"github.com/zerlok/hermod/internal/sandbox"
 )
 
 func TestRemoteDir(t *testing.T) {
@@ -85,6 +87,55 @@ func TestWithSession(t *testing.T) {
 			tc.apply(&o)
 			if o.Session != tc.want {
 				t.Errorf("Session = %q, want %q", o.Session, tc.want)
+			}
+		})
+	}
+}
+
+// TestWithCommand asserts each command form lands as its own sandbox.Command,
+// that an empty one is the default shell, and that the last option applied wins.
+func TestWithCommand(t *testing.T) {
+	cases := []struct {
+		name string
+		opts []Option
+		want sandbox.Command
+	}{
+		{"no option runs the default shell", nil, sandbox.Command{}},
+		{"argv", []Option{WithCommand([]string{"htop", "-d", "5"})}, sandbox.Exec([]string{"htop", "-d", "5"})},
+		{"empty argv runs the default shell", []Option{WithCommand(nil)}, sandbox.Command{}},
+		{"command line", []Option{WithCommandLine("htop -d 5")}, sandbox.ShellLine("htop -d 5")},
+		{"empty line runs the default shell", []Option{WithCommandLine("")}, sandbox.Command{}},
+		{"later argv replaces a line", []Option{WithCommandLine("htop"), WithCommand([]string{"top"})}, sandbox.Exec([]string{"top"})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var o Options
+			for _, opt := range tc.opts {
+				opt(&o)
+			}
+			if !reflect.DeepEqual(o.Command, tc.want) {
+				t.Errorf("Command = %+v, want %+v", o.Command, tc.want)
+			}
+		})
+	}
+}
+
+func TestWithOrigin(t *testing.T) {
+	cases := []struct {
+		name   string
+		origin string
+		want   string
+	}{
+		{"hostname kept", "laptop-1.local", "laptop-1.local"},
+		{"empty names none", "", ""},
+		{"other characters become dashes", "my laptop_2", "my-laptop-2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var o Options
+			WithOrigin(tc.origin)(&o)
+			if o.Origin != tc.want {
+				t.Errorf("Origin = %q, want %q", o.Origin, tc.want)
 			}
 		})
 	}

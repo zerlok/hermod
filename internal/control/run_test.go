@@ -57,7 +57,7 @@ func TestTeardownByLiveness(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := &fakeMirror{flushErr: tc.flushErr}
-			err := teardown(context.Background(), m, fakeSandbox{alive: tc.alive, liveErr: tc.liveErr}, log.New(io.Discard, "", 0))
+			err := teardown(context.Background(), "hermod-prod-dev-api", m, fakeSandbox{alive: tc.alive, liveErr: tc.liveErr}, log.New(io.Discard, "", 0))
 			if err != nil {
 				t.Fatalf("teardown() error: %v", err)
 			}
