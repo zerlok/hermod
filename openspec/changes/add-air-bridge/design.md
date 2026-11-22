@@ -410,7 +410,7 @@ from the environment, and so would any other option it comes to need.
 
 ### An agent declares, the entities act
 Claude's arguments, settings and state follow Claude's CLI and change together when it changes. `claude` answers
-the [agent interface]({A}#agentagent--an-agent-programs-contract)'s questions with values (a command, files, relay requirements, a rewritten settings document) and
+the [agent interface](../../../docs/ARCHITECTURE.md#agentagent--an-agent-programs-contract)'s questions with values (a command, files, relay requirements, a rewritten settings document) and
 performs nothing itself, so it needs no shell, no remote and no relay to be tested, and a new Claude version is
 one package and its table-driven tests.
 

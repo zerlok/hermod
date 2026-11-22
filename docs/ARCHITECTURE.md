@@ -254,16 +254,16 @@ Two of these stores are files Hermod writes itself:
 | Package     | Represents                                           | Constraints                                                                                                                                                                                                      | Declares                                                                     |
 |-------------|------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------|
 | `cli`       | the process's interface | The only package that reads the arguments, the environment and the process's streams, and the one place every variable Hermod reads is named. Builds everything a command needs from the other adapters and hands it into the core: the agent implementation, the shells, the developer's git facts, the ACP connection and Air's own messages. Decides nothing from a state. | the commands |
-| `session`   | [Session](#session) | The only package that decides from states: what to do for a pair of agent and worker states, and where a chat's message goes. Reaches relays and workers only through `workspace`, and an agent only through `agent.Agent`. Declares the messages it routes by what they mean to it (open, close, end or reopen a chat, or pass through) and the channel they arrive on, and never a wire format or a client's own method names. Keeps nothing past the process. | `Attach`, `Chat`, `ExitStatus`, `Message`, `Kind`, `Channel` |
+| `session`   | [Session](#session) | The only package that decides from states: what to do for a pair of agent and worker states, and where a chat's message goes. Reaches relays and workers only through `workspace`, and an agent only through `agent.Agent`. Declares the messages it routes by what they mean to it (open, close, end or reopen a chat, or pass through) and the channel they arrive on, and never a wire format or a client's own method names. Keeps nothing past the process. | `Attach`, `Chat`, `ExitStatus`, `Channel`, `Message`, `Kind` |
 | `workspace` | [Workspace](#workspace) | The only package that imports both `relay` and `worker`, and the one that names and tags them. Its state is computed on every call. | `Workspace`, `State`, `Members` |
-| `relay`     | [Relay](#relay), [Leases](#leases) | The only package that takes a lock. Knows a keeper only as an interface. FS runs the `mutagen` command; Net runs `ssh -R` and a listener in this process; IO copies between local streams and a remote stdio it is handed. | `Relay`, `State`, `FS`, `IO`, `Net`, `Ends`, `Filter`, `Lease`, `Keeper` |
+| `relay`     | [Relay](#relay), [Leases](#leases) | The only package that takes a lock. Knows a keeper only as an interface. FS runs the `mutagen` command; Net runs `ssh -R` and a listener in this process; IO copies between local streams and a remote stdio it is handed. | `Relay`, `State`, `Lease`, `Keeper`, `Filter`, `Ends`; a constructor for each kind |
 | `worker`    | [Worker](#worker)                                    | Mechanism only: builds tmux commands and runs them through a `shell` on the remote. Does not know what its process is. Holds the [scripts](#remote-scripts) a worker starts with.                                 | `Worker`, `State`, `Spec`, `Form`, `Stdio`, `List`                           |
 | `agent`     | [Agent](#agent), the contract                        | An interface and values. No behaviour, and no dependency but the shared packages.                                                                                                                                | `Agent`, `State`, `Call`, `Probe`, `Needs`                                   |
 | `claude`    | [Agent](#agent), for Claude Code | Pure functions: runs no command and reads no file. The only package that knows Claude Code's arguments, files and ACP adapter program. | `Agent` (implements `agent.Agent`) |
 | `acp`       | the ACP wire format | Reads and writes one message per line, and turns each into the `session.Message` it is routed by: the standard methods by itself, a client's own methods by the table it is given. Routes nothing itself. | `Conn` (implements `session.Channel`) |
 | `air`       | JetBrains Air's own facts | The only package that knows the `acp.json` document, the stand-in link and Air's own ACP messages. Says what each of those messages means as a `session.Kind`. Writing `acp.json` keeps every entry and key it does not own. | `Configure`, `Config`, `Entry`, `Methods` |
 | `git`       | the developer's git facts | Read-only `git` commands on the local workstation. Called by `cli`, which passes the results on as values. | `Identity`, `Read`, `MainWorktree` |
-| `shell`     | [Workstation](#workstation)                          | The only package that starts a process. Each wrapper rewrites the command and hands it inward, and dry-run is chosen once at the innermost one.                                                                  | `Shell`, `Command`, `Result`; `Local`, `DryRun`, `SSH`, `LoginShell`, `Tmux` |
+| `shell`     | [Workstation](#workstation)                          | The only package that starts a process. Each wrapper rewrites the command and hands it inward, and dry-run is chosen once at the innermost one.                                                                  | `Executor`, `Command`, `Execution`; a constructor for each implementation |
 | `pathmap`   | the map between local and remote paths               | Pure. Applies to a string or a JSON value, longest root first.                                                                                                                                                   | `Map`, `Place`                                                               |
 | `env`       | variables as pairs                                   | The one place that splits and joins `KEY=VALUE`.                                                                                                                                                                 | `Vars`                                                                       |
 | `secret`    | a value that must not be printed                     | A token prints as a mask everywhere but where it is delivered.                                                                                                                                                   | `Token`                                                                      |
@@ -341,8 +341,24 @@ repository as on the remote.
 
 ## Interfaces
 
-An interface is declared where it has more than one implementation or where a package must not know who implements
-it. Everything else is a concrete type, tested through a fake `Shell`.
+A package gets an interface for one of three reasons, and only for them. Everything else is a concrete type,
+tested through a fake `shell.Executor`.
+
+- **Kinds:** one component has several implementations behind one set of operations.
+- **Inversion:** the core needs something an adapter provides, and the core imports no adapter. The core
+  declares the interface and the adapter implements it.
+- **Looking up:** a component needs an answer from above it, and may not know who answers. It declares the
+  question as an interface and is handed the answer.
+
+| Interface         | Declared in | Implemented by                           | Reason     | Handed in by |
+|-------------------|-------------|------------------------------------------|------------|--------------|
+| `shell.Executor`  | foundation  | `shell`: local, dry-run, ssh, login, tmux | kinds      | `cli`        |
+| `relay.Relay`     | domain      | `relay`: fs, io, net                      | kinds      | —            |
+| `relay.Keeper`    | domain      | `workspace`, one per worker               | looking up | `workspace`  |
+| `relay.Filter`    | domain      | `session`, from what an agent declares    | looking up | `session`    |
+| `agent.Agent`     | domain      | `claude`                                  | inversion  | `cli`        |
+| `session.Channel` | application | `acp`                                     | inversion  | `cli`        |
+| `session.Message` | application | `acp`                                     | inversion  | —            |
 
 ```mermaid
 classDiagram
@@ -363,34 +379,64 @@ classDiagram
         class Relay {
             <<interface>>
             +State() State
-            +Connect()
-            +Disconnect()
-            +Remove()
+            +Connect() Lease
         }
-        class fsRelay
-        class ioRelay
-        class netRelay
+        class Lease {
+            +Release()
+        }
+        class Keeper {
+            <<interface>>
+            +Stands() bool
+        }
+        class Filter {
+            <<interface>>
+            +Pass(call) call
+        }
+        class fsRelay["fs"]
+        class ioRelay["io"]
+        class netRelay["net"]
     }
-    class Filter {
-        <<interface>>
-        +Pass(call) call
+    namespace workspace {
+        class workerKeeper["keeper"]
     }
-    
     namespace agent {
         class Agent {
             <<interface>>
             +Parse(args) Call
-            +Probe(key) Probe
-            +Worker(Call, Map) Needs
+            +Run(Call, Map) Needs
             +Adapter() Needs
-            +HookSettings(document, port, Token) document
+            +Probe(id) Probe
+            +Hooks(document, port, Token) document
         }
     }
-    
     namespace claude {
         class claudeAgent["Agent"]
     }
-    
+    namespace session {
+        class Channel {
+            <<interface>>
+            +Read() Message
+            +Write(Message)
+        }
+        class Message {
+            <<interface>>
+            +Kind() Kind
+            +ID() id
+            +Chat() id
+            +Dir() path
+            +WithID(id) Message
+            +Mapped(Map) Message
+            +Answer() Message
+        }
+        class hookFilter["filter"]
+    }
+    namespace acp {
+        class Conn
+        class acpMessage["message"]
+    }
+
+    Executor ..> Command
+    Executor ..> Execution
     Executor <|.. local
     Executor <|.. dryRun
     Executor <|.. ssh
@@ -399,74 +445,101 @@ classDiagram
     Relay <|.. fsRelay
     Relay <|.. ioRelay
     Relay <|.. netRelay
+    Relay ..> Lease
+    Relay --> Keeper
     netRelay --> Filter
+    Keeper <|.. workerKeeper
+    Filter <|.. hookFilter
     Agent <|.. claudeAgent
+    Channel <|.. Conn
+    Message <|.. acpMessage
+    Channel ..> Message
 ```
 
-### `shell.Shell` — a workstation
+### `shell.Executor` — a workstation
 
-One method: run one `Command` and return its `Result`. A `Command` is built once and carries the argv, the
-directory, the variables, the streams and how to stop it.
+One method: execute one `Command` and return its `Execution`. A `Command` is built once and carries the
+arguments, the directory, the variables and the streams. An `Execution` gives the running command's streams and
+its result.
 
-| Implementation | What it is                                                             |
-|----------------|------------------------------------------------------------------------|
-| `Local`        | Runs the command on this machine.                                      |
-| `DryRun`       | Prints the command as a line that can be pasted, and runs nothing.     |
-| `SSH`          | Wraps an inner `Shell`: the command runs on a host.                    |
-| `LoginShell`   | Wraps an inner `Shell`: the command runs under the user's login shell. |
-| `Tmux`         | Wraps an inner `Shell`: the command runs in a tmux session.            |
+| Implementation | What it is                                                                |
+|----------------|---------------------------------------------------------------------------|
+| local          | Runs the command on this machine.                                         |
+| dry-run        | Prints the command as a line that can be pasted, and runs nothing.        |
+| ssh            | Wraps an inner `Executor`: the command runs on a host.                    |
+| login          | Wraps an inner `Executor`: the command runs under the user's login shell. |
+| tmux           | Wraps an inner `Executor`: the command runs in a tmux session.            |
 
 The first two say **how** a command runs and the other three **where**. A caller nests the ones it needs, and the
-choice between `Local` and `DryRun` is made once, at the bottom, so no code above it knows about dry-run. Reads
-that shape the plan (states, git identity) always use `Local`.
+choice between local and dry-run is made once, at the innermost one, so nothing above it knows about dry-run.
+Commands that only read a state always run on a local one.
 
 ### `relay.Relay` — one channel
 
-| Method       | What it does                                                                            |
-|--------------|-----------------------------------------------------------------------------------------|
-| `State`      | Reads the relay's state from its mechanism. A read that fails is an error, not a state. |
-| `Connect`    | Makes the relay if Absent, and takes it to Connected.                                   |
-| `Disconnect` | Takes it to Disconnected.                                                               |
-| `Remove`     | Takes it to Absent.                                                                     |
+| Method    | What it does                                                                                                  |
+|-----------|---------------------------------------------------------------------------------------------------------------|
+| `State`   | Reads the relay's state from its mechanism. A read that fails is an error, not a state.                       |
+| `Connect` | Takes a connect lease, makes the relay if it is Absent, and takes it to Connected. Returns the `Lease`.       |
 
-| Implementation | Constructed from                                        | Adds                                                                    |
-|----------------|---------------------------------------------------------|-------------------------------------------------------------------------|
-| `FS`           | `Ends` (a local root and a remote root), a name, labels | `Flush`; `ListFS`, which reads the relays under a label with their ends |
-| `IO`           | a `worker.Stdio` value and the client's streams         | `Serve`, which copies between them until the client leaves              |
-| `Net`          | a remote port, a local address, an optional `Filter`    | —                                                                       |
+`Lease.Release` gives the lease up and, when it was the last one, settles the relay: Disconnected if a keeper
+still stands, Absent otherwise. There is no operation to disconnect or remove a relay directly.
 
-`relay` connects, disconnects and removes what it is told to. It holds no lease and decides nothing.
+| Implementation | Constructed from                                                  | Adds                                                              |
+|----------------|-------------------------------------------------------------------|-------------------------------------------------------------------|
+| fs             | `Ends` (a local root and a remote root), a name, labels, keepers  | `Flush`; `List`, which reads the relays under a label, with ends  |
+| io             | a remote stdio (a command that reaches it), local streams, keepers | `Serve`, which copies between the two until the local side leaves |
+| net            | a remote port, a local address, an optional `Filter`              | —                                                                 |
+
+### `relay.Keeper` — whether a keep lease still stands
+
+One method, `Stands`, answered with yes, no, or an error when it cannot be told. A relay is constructed with its
+keepers and asks them when it settles; they are not stored, so each process hands them in again. `workspace`
+implements it once: a keeper that reads one worker's state.
 
 ### `relay.Filter` — what a Net relay lets through
 
-One method: given a call that arrived on the remote port, return the call to make locally, or refuse it. `relay`
-declares it and knows no implementation. `control` builds the one for an agent's hooks from what the agent
-declared; a user's `-R` relay has none.
+One method: given a call that arrived on the remote port, return the call to make locally, or refuse it.
+`session` implements it for an agent's hooks, from the token and the address the agent declared. A user's own
+Net relay has none.
 
 ### `agent.Agent` — an agent program's contract
 
-`control` reaches an agent only through this interface, and `cli` chooses the implementation from the command
-line. Every method is a question answered with a value; an agent performs nothing.
+Every method is a question answered with a value; an agent performs nothing.
 
-| Method         | Control asks                            | The agent answers with                                                                                                                          |
-|----------------|-----------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
-| `Parse`        | What do these arguments ask for?        | a `Call`: a conversation and its key, or a one-shot call                                                                                        |
-| `Probe`        | Is this conversation running?           | a `Probe`: the command that asks the agent program, and how to read its output into a `State`                                                   |
-| `Worker`       | What does a worker for this call need?  | a `Needs`: the command with paths mapped, the files it must find, the names of the local variables it must be given, and the relays it requires |
-| `Adapter`      | What does its ACP adapter need?         | a `Needs` of the same shape                                                                                                                     |
-| `HookSettings` | How do its hook settings reach a relay? | the settings document with its hooks aimed at a remote port and carrying the worker's token                                                     |
+| Method    | The question                                 | The answer                                                                                                                                             |
+|-----------|----------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `Parse`   | What do these arguments ask for?             | a `Call`: a conversation and its ID, or a one-shot call                                                                                                |
+| `Run`     | What does running this call need?            | a `Needs`: the command with paths mapped, the files it must find, the names of the variables it must be given, the directories and the port it requires |
+| `Adapter` | What does the program's ACP adapter need?    | a `Needs` of the same shape                                                                                                                            |
+| `Probe`   | Is this conversation running?                | a `Probe`: the command that asks the agent program, and how to read its output into a `State`                                                          |
+| `Hooks`   | How do the program's hooks call back?        | the settings document with its hooks aimed at a port and carrying a token                                                                              |
 
-An agent is handed a `pathmap.Map` and never learns where the other workstation is or how it is reached.
+### `session.Channel` and `session.Message` — a chat client's connection
+
+`session` routes a chat's messages without knowing how they are written. A `Channel` reads and writes whole
+messages, and a `Message` says what `session` needs to route it.
+
+| Method    | What it gives                                                                                   |
+|-----------|-------------------------------------------------------------------------------------------------|
+| `Kind`    | What the message means to a session: open, close, end or reopen a chat, start the connection, or pass through |
+| `ID`      | The request this message is, or answers                                                         |
+| `Chat`    | The chat it belongs to, if any                                                                  |
+| `Dir`     | The directory it names, if any                                                                  |
+| `WithID`  | The same message under another request ID                                                       |
+| `Mapped`  | The same message with its paths taken through a path map                                        |
+| `Answer`  | The empty answer to this request, for a message `session` answers itself                        |
+
+`acp.Conn` implements `Channel` over a pair of streams, one message per line. It maps the standard ACP methods
+to a `Kind` itself and a client's own methods by the table it is given, which `air` provides for Air.
 
 ### Concrete types
 
-| Type                  | Operations                                                                                                                                                 | Notes                                                                                                                                     |
-|-----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
-| `workspace.Workspace` | `For` (the workspace a directory belongs to, made if there is none), `State`, `PathMap`, `AddFS`, `AddNet`, `Worker`, `Start`, `Attach`, `Detach`, `Close` | The only type that pairs relays with workers. `Detach` and `Close` apply the release rule. Leases are its own detail.                     |
-| `worker.Worker`       | `State`, `Start`, `Close`, `Remove`, `Stdio`; `List` by tag                                                                                                | `Spec` says what to start: key, directory, command, files, variables, tags and the IO `Form` (terminal or line stream).                   |
-| `acp.Conn`            | `Read`, `Write`                                                                                                                                            | One message per line. A `Message` gives its method, its ID, the chat it belongs to and the directory it names, and takes a `pathmap.Map`. |
-| `air.Config`          | `Load`, `Merge`, `Save`                                                                                                                                    | Merging keeps every entry and key it does not own.                                                                                        |
-| `pathmap.Map`         | `ToRemote`, `ToLocal`                                                                                                                                      | Built from the ends of a workspace's FS relays, longest prefix first.                                                                     |
+| Type                  | Operations                                                                                           | Notes                                                                                                                         |
+|-----------------------|------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
+| `workspace.Workspace` | `Open` (the workspace of a remote and a directory), `State`, `PathMap`, `AddFS`, `AddNet`, `Start`, `Attach`, `Detach`, `Close` | `Attach` connects its relays and serves one worker's stdio; `Detach` releases the leases; `Close` ends one worker.            |
+| `worker.Worker`       | `State`, `Start`, `Close`, `Remove`, `Stdio`; `List` by tag                                          | `Spec` says what to start: key, directory, command, files, variables, tags and the stdio `Form` (terminal or line stream).    |
+| `air.Config`          | `Load`, `Merge`, `Save`                                                                              | Merging keeps every entry and key it does not own.                                                                            |
+| `pathmap.Map`         | `ToRemote`, `ToLocal`                                                                                | Built from pairs of a local and a remote root, longest root first.                                                            |
 
 ## Flows
 
