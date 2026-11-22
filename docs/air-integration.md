@@ -108,7 +108,12 @@ Air also runs the configured `claude` itself, outside any session, to read Claud
 
 ## Session lifecycle
 
-Observed in chat mode. Air runs one adapter per IDE run for all chats; the adapter runs one `claude` per chat.
+Observed in chat mode. Each running IDE starts one adapter of its own, in a directory of the IDE's cache, for all
+chats of all its open projects; the adapter runs one `claude` per chat. A chat names its project directory in
+`session/new`; every later message carries only the session ID. Air numbers its requests from 1 on that connection,
+in one sequence across projects. The adapter numbers its own requests (`session/request_permission`) from 0, in one
+sequence across its chats, and Air answers under the same ID. Two adapters therefore send the same IDs; the count
+past the first request, and two adapters side by side, were seen with a test client in place of Air.
 
 | Air action         | ACP request, Air → adapter                                     | The chat's `claude` gets       |
 |--------------------|----------------------------------------------------------------|--------------------------------|
@@ -133,7 +138,7 @@ Observed in chat mode. Air runs one adapter per IDE run for all chats; the adapt
 - **The IDE can vanish without a shutdown.** An adapter's ACP stream once stopped between two `session/list` polls
   with no EOF, signal or exit, and the next IDE run had a new process. What a running chat sees then was not
   observed.
-- Air polls `session/list` every 60 s for each open project directory.
+- Air polls `session/list` every 60 s for each open project directory, all on the IDE's one connection.
 
 Terminal mode's lifecycle is not observed yet.
 
