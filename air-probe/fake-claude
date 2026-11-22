@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """fake-claude: a stand-in `claude` that records how JetBrains Air (directly, in
 terminal mode, or through the ACP adapter, in chat mode) starts and ends it.
-No model runs: every prompt gets a canned reply.
+No model runs: every prompt gets a canned reply. In chat mode a prompt containing
+"ask" first requests permission for a Bash call, so the adapter sends Air a
+session/request_permission; the reply then names Air's answer.
 
 Each invocation writes one JSON-lines log, $AIR_PROBE_DIR/<time>-<pid>-claude.log
 (default ~/.cache/air-probe), with: argv, selected env, cwd, process ids, tty
@@ -188,22 +190,61 @@ def state(s):
          "session_id": SESSION, "uuid": str(uuid.uuid4())})
 
 
+pending = {}  # request ID of a permission request -> its tool use, until the answer comes
+
+
+def prompt_text(msg):
+    content = msg.get("message", {}).get("content")
+    if isinstance(content, str):
+        return content
+    return " ".join(b.get("text", "") for b in content or [] if isinstance(b, dict))
+
+
+def assistant(content, stop_reason):
+    out({"type": "assistant", "session_id": SESSION, "parent_tool_use_id": None, "uuid": str(uuid.uuid4()),
+         "message": {"id": "msg_probe", "type": "message", "role": "assistant", "model": "fake-probe",
+                     "content": content, "stop_reason": stop_reason,
+                     "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
+
+
 def turn(msg):
     out({"type": "system", "subtype": "init", "session_id": SESSION, "cwd": os.getcwd(), "tools": [],
          "mcp_servers": [], "model": "fake-probe", "permissionMode": "default", "slash_commands": [],
          "apiKeySource": "none", "output_style": "default", "claude_code_version": "2.1.318",
          "uuid": str(uuid.uuid4())})
     state("running")
-    text = msg.get("message", {}).get("content")
     if replay:
         out(dict(msg, session_id=SESSION, uuid=msg.get("uuid") or str(uuid.uuid4())))
-    transcript("user", text)
-    reply = "probe: got it"
+    transcript("user", msg.get("message", {}).get("content"))
+    if "ask" in prompt_text(msg).lower():
+        ask()
+    else:
+        end_turn("probe: got it")
+
+
+def ask():
+    """Requests permission for a tool call; the turn ends in answered()."""
+    tool_use = {"type": "tool_use", "id": "toolu_probe" + uuid.uuid4().hex[:16], "name": "Bash",
+                "input": {"command": "true", "description": "probe: nothing runs"}}
+    assistant([tool_use], "tool_use")
+    request_id = uuid.uuid4().hex[:12]
+    pending[request_id] = tool_use
+    out({"type": "control_request", "request_id": request_id,
+         "request": {"subtype": "can_use_tool", "tool_name": tool_use["name"], "input": tool_use["input"],
+                     "tool_use_id": tool_use["id"]}})
+
+
+def answered(tool_use, response):
+    behavior = (response.get("response") or {}).get("behavior") or response.get("subtype")
+    out({"type": "user", "session_id": SESSION, "parent_tool_use_id": None, "uuid": str(uuid.uuid4()),
+         "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_use["id"],
+                                                  "content": "probe: nothing ran", "is_error": behavior != "allow"}]}})
+    end_turn("probe: permission %s" % behavior)
+
+
+def end_turn(reply):
     transcript("assistant", reply)
-    out({"type": "assistant", "session_id": SESSION, "parent_tool_use_id": None, "uuid": str(uuid.uuid4()),
-         "message": {"id": "msg_probe", "type": "message", "role": "assistant", "model": "fake-probe",
-                     "content": [{"type": "text", "text": reply}], "stop_reason": "end_turn",
-                     "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
+    assistant([{"type": "text", "text": reply}], "end_turn")
     out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "duration_api_ms": 0,
          "num_turns": 1, "result": reply, "session_id": SESSION, "total_cost_usd": 0,
          "usage": {"input_tokens": 0, "output_tokens": 0}, "modelUsage": {}, "permission_denials": [],
@@ -225,6 +266,11 @@ for line in sys.stdin:
         resp = initialize_response() if sub == "initialize" else {}
         out({"type": "control_response",
              "response": {"subtype": "success", "request_id": msg.get("request_id"), "response": resp}})
+    elif kind == "control_response":
+        response = msg.get("response", {})
+        tool_use = pending.pop(response.get("request_id"), None)
+        if tool_use:
+            answered(tool_use, response)
     elif kind == "user":
         turn(msg)
 log("stdin_eof")

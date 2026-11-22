@@ -1,6 +1,7 @@
 # air-probe — record how Air starts and ends sessions, with no agent
 
-Two recorders, Python 3 stdlib only. Nothing calls a model: every prompt gets "probe: got it".
+Two recorders, Python 3 stdlib only. Nothing calls a model: every prompt gets "probe: got it", and in chat mode a
+prompt containing "ask" first requests permission for a Bash call that never runs.
 
 - `fake-claude` stands in for `claude`. It logs argv, env, process ids, tty state, every stdin line, stdin EOF,
   every signal, and its exit. In chat mode it speaks enough stream-json for the ACP adapter; in terminal mode it
@@ -52,6 +53,7 @@ Run each in a fresh chat, note the wall-clock time, then read the logs.
 | 7  | Two chats open at once, close one               | chat  |
 | 8  | Press stop right after sending (the fake answers instantly, so this mostly shows the cancel message) | chat |
 | 9  | Leave the IDE idle a while: does Air start a headless `-p` call on its own? | — |
+| 10 | Send "ask" in two chats: the adapter sends `session/request_permission`; answer each dialog | chat |
 
 Quick read:
 
