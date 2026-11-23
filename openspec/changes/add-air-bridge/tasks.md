@@ -34,8 +34,8 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 ## 4. Domain: `agent`
 
-- [ ] 4.1 Create `internal/agent` with the `Agent` interface (`Parse`, `Run`, `Adapter`, `Probe`, `Connect`, `List`, `Locate`, `Hooks`) and its values `Call`, `Needs`, `Probe`, `Handshake`, `Listing`, `Lookup`, `Conversation` and `State` (Running, Stopped) ([`agent.Agent`](../../../docs/ARCHITECTURE.md#agentagent--an-agent-programs-contract), [Agent](../../../docs/ARCHITECTURE.md#agent)): an interface and values only, depending on `pathmap`, `env` and `secret`
-- [ ] 4.2 Tests: a `Probe` reads an answer into a `State`, a `Listing` into `Conversation`s, a `Lookup` into one `Conversation` or none, and a `Needs` lists exactly what it was built with
+- [x] 4.1 Create `internal/agent` with the `Agent` interface (`Parse`, `Run`, `Adapter`, `Probe`, `Connect`, `List`, `Locate`, `Hooks`) and its values `Call`, `Needs`, `Probe`, `Handshake`, `Listing`, `Lookup`, `Conversation` and `State` (Running, Stopped) ([`agent.Agent`](../../../docs/ARCHITECTURE.md#agentagent--an-agent-programs-contract), [Agent](../../../docs/ARCHITECTURE.md#agent)): an interface and values only, depending on `pathmap`, `env` and `secret`
+- [x] 4.2 Tests: a `Probe` reads an answer into a `State`, a `Listing` into `Conversation`s, a `Lookup` into one `Conversation` or none, and a `Needs` lists exactly what it was built with
 
 ## 5. Domain: `workspace`
 
