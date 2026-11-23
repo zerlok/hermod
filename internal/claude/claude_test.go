@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/zerlok/hermod/internal/agent"
 )
 
 const (
@@ -12,73 +14,83 @@ const (
 	fork  = "5d6e1e2a-3b4c-4c8e-9d6f-0b7e5f3c2a41"
 )
 
-func TestClassify(t *testing.T) {
+// form is what a parsed call asks for, as a test names it.
+type form int
+
+const (
+	command form = iota
+	oneShot
+	conversation
+)
+
+func formOf(c agent.Call) form {
+	if _, ok := c.ID(); ok {
+		return conversation
+	}
+	if c.OneShot() {
+		return oneShot
+	}
+	return command
+}
+
+func TestParse(t *testing.T) {
 	cases := []struct {
-		name        string
-		argv        string // split on spaces; "" is an empty argv
-		wantKind    Kind
-		wantSession SessionID // "" when the kind has none
+		name   string
+		argv   string // split on spaces; "" is an empty argv
+		want   form
+		wantID string // "" when the call is no conversation
 	}{
-		// Utility calls.
-		{"subcommand", "claude auth status", UtilityCall, ""},
-		{"mcp subcommand", "claude mcp list", UtilityCall, ""},
-		{"subcommand with a session flag", "claude agents --json --session-id " + uuid, UtilityCall, ""},
-		{"version", "claude --version", UtilityCall, ""},
-		{"short version", "claude -v", UtilityCall, ""},
-		{"help", "claude --help", UtilityCall, ""},
-		{"help with a session", "claude --session-id " + uuid + " -h", UtilityCall, ""},
-		{"settings read", "claude -p --input-format stream-json --output-format stream-json --verbose", UtilityCall, ""},
-		{"print long form", "claude --print hello", UtilityCall, ""},
-		{"print with a resume picker", "claude -p --resume", UtilityCall, ""},
-		{"by path", "/usr/local/bin/claude --version", UtilityCall, ""},
+		{"subcommand", "claude auth status", oneShot, ""},
+		{"mcp subcommand", "claude mcp list", oneShot, ""},
+		{"subcommand with a session flag", "claude agents --json --session-id " + uuid, oneShot, ""},
+		{"version", "claude --version", oneShot, ""},
+		{"short version", "claude -v", oneShot, ""},
+		{"help", "claude --help", oneShot, ""},
+		{"help with a session", "claude --session-id " + uuid + " -h", oneShot, ""},
+		{"settings read", "claude -p --input-format stream-json --output-format stream-json --verbose", oneShot, ""},
+		{"print long form", "claude --print hello", oneShot, ""},
+		{"print with a resume picker", "claude -p --resume", oneShot, ""},
+		{"print fork with no new session", "claude -p --resume " + uuid + " --fork-session", oneShot, ""},
+		{"by path", "/usr/local/bin/claude --version", oneShot, ""},
 
-		// Chat sessions.
-		{"SDK session", "claude --output-format stream-json --input-format stream-json --session-id=" + uuid, ChatSession, uuid},
-		{"SDK resume", "claude --input-format=stream-json --resume=" + uuid, ChatSession, uuid},
-		{"SDK resume separate value", "claude --input-format stream-json --resume " + uuid + " --verbose", ChatSession, uuid},
-		{"print with a stream-json session", "claude -p --input-format stream-json --session-id " + uuid, ChatSession, uuid},
-		{"SDK fork keyed by its new session", "claude --input-format stream-json --resume " + uuid + " --fork-session --session-id " + fork, ChatSession, fork},
+		{"stream-json session", "claude --output-format stream-json --input-format stream-json --session-id=" + uuid, conversation, uuid},
+		{"stream-json resume", "claude --input-format=stream-json --resume=" + uuid, conversation, uuid},
+		{"print with a session", "claude -p --input-format stream-json --session-id " + uuid, conversation, uuid},
+		{"terminal resume", "claude --resume " + uuid + " --settings /tmp/s.json", conversation, uuid},
+		{"terminal new", "claude --session-id " + uuid + " --settings /tmp/s.json", conversation, uuid},
+		{"short resume", "claude -r " + uuid, conversation, uuid},
+		{"upper-case UUID", "claude --session-id " + upper, conversation, upper},
+		{"fork keyed by its new session", "claude --resume " + uuid + " --fork-session --session-id " + fork, conversation, fork},
+		{"fork with the new session first", "claude --session-id=" + fork + " --fork-session --resume=" + uuid, conversation, fork},
 
-		// Terminal sessions.
-		{"terminal resume", "claude --resume " + uuid + " --settings /tmp/s.json", TerminalSession, uuid},
-		{"terminal new", "claude --session-id " + uuid + " --settings /tmp/s.json", TerminalSession, uuid},
-		{"short resume", "claude -r " + uuid, TerminalSession, uuid},
-		{"text input format", "claude --input-format text --session-id " + uuid, TerminalSession, uuid},
-		{"upper-case UUID", "claude --session-id " + upper, TerminalSession, upper},
-		{"print with a terminal session", "claude -p --session-id " + uuid, TerminalSession, uuid},
-		{"fork keyed by its new session", "claude --resume " + uuid + " --fork-session --session-id " + fork, TerminalSession, fork},
-		{"fork with the new session first", "claude --session-id=" + fork + " --fork-session --resume=" + uuid, TerminalSession, fork},
-
-		// Not agent sessions.
-		{"plain claude", "claude --model opus", NotAgentSession, ""},
-		{"bare claude", "claude", NotAgentSession, ""},
-		{"resume picker", "claude --resume", NotAgentSession, ""},
-		{"resume search term", "claude --resume fix-login", NotAgentSession, ""},
-		{"continue", "claude -c", NotAgentSession, ""},
-		{"fork with no new session", "claude --resume " + uuid + " --fork-session", NotAgentSession, ""},
-		{"print fork with no new session", "claude -p --resume " + uuid + " --fork-session", UtilityCall, ""},
-		{"malformed session id", "claude --session-id not-a-uuid", NotAgentSession, ""},
-		{"session id missing value", "claude --session-id", NotAgentSession, ""},
-		{"subcommand word later is a prompt", "claude --model opus auth", NotAgentSession, ""},
-		{"flags after -- are prompt text", "claude -- --version --session-id " + uuid, NotAgentSession, ""},
-		{"session id consumes its value", "claude --session-id --version", NotAgentSession, ""},
-		{"not claude", "htop -d 5", NotAgentSession, ""},
-		{"claude-like name", "claude-code --version", NotAgentSession, ""},
-		{"empty argv", "", NotAgentSession, ""},
+		{"plain claude", "claude --model opus", command, ""},
+		{"bare claude", "claude", command, ""},
+		{"resume picker", "claude --resume", command, ""},
+		{"resume search term", "claude --resume fix-login", command, ""},
+		{"continue", "claude -c", command, ""},
+		{"fork with no new session", "claude --resume " + uuid + " --fork-session", command, ""},
+		{"malformed session id", "claude --session-id not-a-uuid", command, ""},
+		{"session id missing value", "claude --session-id", command, ""},
+		{"path traversal as an ID", "claude --session-id ../../../../../../../../../etc/passw", command, ""},
+		{"subcommand word later is a prompt", "claude --model opus auth", command, ""},
+		{"flags after -- are prompt text", "claude -- --version --session-id " + uuid, command, ""},
+		{"session id consumes its value", "claude --session-id --version", command, ""},
+		{"not claude", "htop -d 5", command, ""},
+		{"claude-like name", "claude-code --version", command, ""},
+		{"empty argv", "", command, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			argv := strings.Fields(tc.argv)
-			call := Classify(argv)
-			if call.Kind() != tc.wantKind {
-				t.Errorf("Kind() = %v, want %v", call.Kind(), tc.wantKind)
+			call := Agent{}.Parse(argv)
+			if got := formOf(call); got != tc.want {
+				t.Errorf("form = %v, want %v", got, tc.want)
 			}
-			id, ok := call.Session()
-			if id != tc.wantSession || ok != (tc.wantSession != "") {
-				t.Errorf("Session() = %q, %v, want %q", id, ok, tc.wantSession)
+			if id, ok := call.ID(); id != tc.wantID || ok != (tc.wantID != "") {
+				t.Errorf("ID() = %q, %v, want %q", id, ok, tc.wantID)
 			}
-			if !reflect.DeepEqual(call.Argv(), argvOrNil(argv)) {
-				t.Errorf("Argv() = %q, want %q", call.Argv(), argv)
+			if got := call.Args(); !reflect.DeepEqual(got, argvOrNil(argv)) {
+				t.Errorf("Args() = %q, want %q", got, argv)
 			}
 		})
 	}
@@ -91,72 +103,57 @@ func argvOrNil(argv []string) []string {
 	return argv
 }
 
-// TestCallIsImmutable asserts that neither the caller's argv nor a returned argv
-// reaches into the Call.
-func TestCallIsImmutable(t *testing.T) {
+var agentsArgv = []string{"claude", "agents", "--json"}
+
+func TestProbe(t *testing.T) {
 	cases := []struct {
-		name string
-		argv []string
-		edit string
+		name        string
+		id          string
+		out         string
+		wantCommand []string
+		want        agent.State
+		wantErr     bool
 	}{
-		{"utility call", []string{"claude", "auth", "status"}, "rm"},
-		{"terminal session", []string{"claude", "--resume", uuid}, "--evil"},
+		{"listed", uuid, `[{"pid":1,"cwd":"/x","kind":"interactive","sessionId":"` + uuid + `","status":"busy"}]`, agentsArgv, agent.Running, false},
+		{"asked in upper case", upper, `[{"sessionId":"` + uuid + `"}]`, agentsArgv, agent.Running, false},
+		{"another conversation", uuid, `[{"sessionId":"` + fork + `"}]`, agentsArgv, agent.Stopped, false},
+		{"none running", uuid, `[]`, agentsArgv, agent.Stopped, false},
+		{"not JSON", uuid, `error: unknown command`, agentsArgv, agent.Stopped, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			in := append([]string(nil), tc.argv...)
-			call := Classify(in)
-			in[1] = tc.edit
-			call.Argv()[1] = tc.edit
-			if !reflect.DeepEqual(call.Argv(), tc.argv) {
-				t.Errorf("Argv() = %q, want %q", call.Argv(), tc.argv)
+			probe := Agent{}.Probe(tc.id)
+			if got := probe.Command(); !reflect.DeepEqual(got, tc.wantCommand) {
+				t.Errorf("Command() = %q, want %q", got, tc.wantCommand)
+			}
+			got, err := probe.Read([]byte(tc.out))
+			if got != tc.want || (err != nil) != tc.wantErr {
+				t.Errorf("Read() = %v, %v, want %v, error %v", got, err, tc.want, tc.wantErr)
 			}
 		})
 	}
 }
 
-func TestParseSessionID(t *testing.T) {
+func TestConnect(t *testing.T) {
 	cases := []struct {
-		name   string
-		in     string
-		want   SessionID
-		wantOK bool
+		name    string
+		version int
+		object  string
+		want    bool
 	}{
-		{"canonical lower case", uuid, uuid, true},
-		{"canonical upper case", upper, upper, true},
-		{"empty", "", "", false},
-		{"too short", uuid[:35], "", false},
-		{"too long", uuid + "0", "", false},
-		{"no dashes", strings.ReplaceAll(uuid, "-", "") + "0000", "", false},
-		{"dash misplaced", "0b7e5f3-c2a41-4c8e-9d6f-1e2a3b4c5d6e", "", false},
-		{"non-hex digit", "0b7e5f3c-2a41-4c8e-9d6f-1e2a3b4c5d6g", "", false},
-		{"path traversal", "../../../../../../../../../etc/passw", "", false},
+		{"claude-agent-acp's answer", acpVersion, acpCapabilities, true},
+		{"the same, spaced and ordered otherwise", 1, `{"sessionCapabilities":{"resume":{},"list":{},"fork":{},"close":{}},"mcpCapabilities":{"sse":true,"http":true},"promptCapabilities":{"embeddedContext":true,"image":true},"loadSession":true}`, true},
+		{"another version", 2, acpCapabilities, false},
+		{"no session loading", 1, `{"loadSession":false}`, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			id, ok := ParseSessionID(tc.in)
-			if id != tc.want || ok != tc.wantOK {
-				t.Errorf("ParseSessionID(%q) = %q, %v, want %q, %v", tc.in, id, ok, tc.want, tc.wantOK)
+			other, err := agent.NewHandshake(tc.version, []byte(tc.object))
+			if err != nil {
+				t.Fatalf("NewHandshake() error: %v", err)
 			}
-		})
-	}
-}
-
-func TestKindString(t *testing.T) {
-	cases := []struct {
-		kind Kind
-		want string
-	}{
-		{NotAgentSession, "not an agent session"},
-		{UtilityCall, "utility call"},
-		{ChatSession, "chat session"},
-		{TerminalSession, "terminal session"},
-		{Kind(99), "unknown kind"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.want, func(t *testing.T) {
-			if got := tc.kind.String(); got != tc.want {
-				t.Errorf("String() = %q, want %q", got, tc.want)
+			if got := (Agent{}).Connect().Equal(other); got != tc.want {
+				t.Errorf("Connect().Equal() = %v, want %v", got, tc.want)
 			}
 		})
 	}

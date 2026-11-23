@@ -1,107 +1,52 @@
-// Package claude is Claude Code's command-line contract as pure functions: which
-// kind of run an argv asks for and which session it names, how an argv, a
-// settings document and an environment are carried to the sandbox, and where
-// Claude keeps a session's transcript. It follows Claude's CLI and changes when
-// that does; it reads no files and runs nothing.
+// Package claude is Claude Code's contract as an agent.Agent: which call an
+// argv asks for, what running it or Claude's ACP adapter needs on the remote,
+// how to ask Claude which conversations exist and which run, and how its hook
+// settings are aimed at a worker's port. It follows Claude's command line and
+// files and changes when they do; it runs no command, and reads a local file
+// only through the reader it is handed.
 package claude
 
 import (
+	"encoding/json"
+	"fmt"
 	"path"
 	"strings"
+
+	"github.com/zerlok/hermod/internal/agent"
 )
 
-// Kind is what a command asks Hermod to run.
-type Kind int
-
-const (
-	// NotAgentSession is any command that is not one of the kinds below,
-	// including a command that is not claude. It runs as a plain attach. It is
-	// the zero value, so an unclassified command is never taken for a session.
-	NotAgentSession Kind = iota
-	// UtilityCall is a short run with no session, such as `claude auth status`,
-	// `claude --version` or a `-p` settings read. It runs straight on the sandbox.
-	UtilityCall
-	// ChatSession is a session driven over stream-json on stdin and stdout, as
-	// the Agent SDK runs one.
-	ChatSession
-	// TerminalSession is an interactive session in a terminal.
-	TerminalSession
-)
-
-func (k Kind) String() string {
-	switch k {
-	case NotAgentSession:
-		return "not an agent session"
-	case UtilityCall:
-		return "utility call"
-	case ChatSession:
-		return "chat session"
-	case TerminalSession:
-		return "terminal session"
-	}
-	return "unknown kind"
+// Config is what Claude's contract needs to know of the workstations.
+type Config struct {
+	// Dir is the local directory a conversation run on a terminal works in,
+	// absolute: Claude names its transcripts' directory after it, and a
+	// relative path in the arguments is relative to it.
+	Dir string
+	// ConfigDir is Claude's local config directory, absolute.
+	ConfigDir string
+	// RemoteConfigDir is Claude's config directory on the remote, absolute:
+	// the one Claude there uses, `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` in the
+	// remote's environment. The transcripts' place and the asking for
+	// conversations both use it, so a conversation listed is one the relay
+	// keeps.
+	RemoteConfigDir string
+	// ReadFile reads a local file that `--settings` or `--mcp-config` names,
+	// whose contents the worker is given in place of the path.
+	ReadFile func(name string) ([]byte, error)
 }
 
-// SessionID is a Claude session's UUID, the key for its transcript and for
-// everything Hermod keeps for it. It is only ever built from a well-formed UUID,
-// so it is safe as a file name and a tmux session name.
-type SessionID string
-
-// ParseSessionID accepts a UUID in its canonical 8-4-4-4-12 hexadecimal form.
-func ParseSessionID(s string) (SessionID, bool) {
-	if len(s) != 36 {
-		return "", false
-	}
-	for i, r := range s {
-		switch i {
-		case 8, 13, 18, 23:
-			if r != '-' {
-				return "", false
-			}
-		default:
-			if !isHex(r) {
-				return "", false
-			}
-		}
-	}
-	return SessionID(s), true
+// Agent is Claude Code's contract.
+type Agent struct {
+	cfg Config
 }
 
-func (id SessionID) String() string { return string(id) }
+var _ agent.Agent = Agent{}
 
-// Call is a classified command. It is built only by Classify, so a session ID is
-// present exactly when the kind is a session.
-type Call struct {
-	kind    Kind
-	session SessionID
-	resumes bool      // the session is named by --resume: the caller expects it to exist
-	resumed SessionID // the session --resume names, the call's own or a fork's source
-	argv    []string
-}
+// New is Claude's contract for the workstations cfg describes.
+func New(cfg Config) Agent { return Agent{cfg: cfg} }
 
-// Kind is what the command asks for.
-func (c Call) Kind() Kind { return c.kind }
-
-// Session is the session a chat or terminal session is keyed by; ok is false for
-// every other kind.
-func (c Call) Session() (id SessionID, ok bool) { return c.session, c.session != "" }
-
-// Resumes reports whether the caller asked to resume the session the call is
-// keyed by, rather than to start one under its UUID. A fork resumes another
-// session and starts its own, so it does not count.
-func (c Call) Resumes() bool { return c.resumes }
-
-// Resumed is the session `--resume <uuid>` names: the call's own, or in a
-// fork, the session the new one starts from. ok is false without a UUID to
-// resume.
-func (c Call) Resumed() (id SessionID, ok bool) { return c.resumed, c.resumed != "" }
-
-// Argv is the command as given, program first.
-func (c Call) Argv() []string { return append([]string(nil), c.argv...) }
-
-// utilitySubcommands are Claude's subcommands. Each runs to completion without a
-// conversation, so none is a session whatever else its arguments say.
-var utilitySubcommands = map[string]bool{
+// oneShotSubcommands are Claude's subcommands. Each runs to completion without
+// a conversation, so none is a conversation whatever else its arguments say.
+var oneShotSubcommands = map[string]bool{
 	"agents": true, "attach": true, "auth": true, "auto-mode": true, "config": true,
 	"doctor": true, "gateway": true, "import": true, "install": true, "logs": true,
 	"mcp": true, "migrate-installer": true, "plugin": true, "plugins": true,
@@ -109,55 +54,50 @@ var utilitySubcommands = map[string]bool{
 	"kill": true, "ultrareview": true, "update": true, "upgrade": true,
 }
 
-// Classify reads a command's argv. A command is claude when its program's base
-// name is `claude`; any other command is not an agent session.
+// Parse reads a command's argv. A command is Claude's when its program's base
+// name is `claude`; any other command is not the agent's.
 //
-//   - A subcommand, `--version` or `--help`, or `-p` with no session is a utility
-//     call. Claude reads a subcommand only as its first argument, so a later word
-//     is a prompt or an option's value.
-//   - `--session-id <uuid>` or `--resume <uuid>` makes a session: a chat session
-//     with `--input-format stream-json`, a terminal session otherwise. With
-//     `--fork-session`, Claude writes the resumed conversation under a new UUID,
-//     so only `--session-id` names the session; a fork without one is keyed by
-//     no UUID known in advance.
-//   - Anything else, including `--resume` with no UUID (Claude's own picker), is
-//     not an agent session.
-func Classify(argv []string) Call {
-	call := Call{argv: append([]string(nil), argv...)}
+//   - A subcommand, `--version` or `--help`, or `-p` with no conversation is a
+//     one-shot call. Claude reads a subcommand only as its first argument, so a
+//     later word is a prompt or an option's value.
+//   - `--session-id <uuid>` or `--resume <uuid>` is a conversation, whatever
+//     its input format: one driven over stream-json is still one conversation.
+//     With `--fork-session`, Claude writes the resumed conversation under a new
+//     UUID, so only `--session-id` names it; a fork without one is keyed by no
+//     UUID known in advance.
+//   - Anything else, including `--resume` with no UUID (Claude's own picker),
+//     runs as given.
+func (Agent) Parse(argv []string) agent.Call {
 	if len(argv) == 0 || path.Base(argv[0]) != "claude" {
-		return call
+		return agent.NewCommand(argv)
 	}
 	a := scan(argv[1:])
-	session := a.key()
+	id := a.key()
 	switch {
-	case a.subcommand || a.info || (a.print && session == ""):
-		call.kind = UtilityCall
-	case session != "" && a.inputFormat == "stream-json":
-		call.kind, call.session = ChatSession, session
-	case session != "":
-		call.kind, call.session = TerminalSession, session
+	case a.subcommand || a.info || (a.print && id == ""):
+		return agent.NewOneShot(argv)
+	case id != "":
+		// The ID is a parsed UUID, never empty here, so the call is built.
+		call, _ := agent.NewConversation(id, argv)
+		return call
 	}
-	call.resumes = call.session != "" && a.sessionID == ""
-	if call.session != "" {
-		call.resumed = a.resume
-	}
-	return call
+	return agent.NewCommand(argv)
 }
 
-// args is what Classify needs from Claude's arguments.
+// args is what Parse needs from Claude's arguments.
 type args struct {
-	subcommand  bool
-	info        bool // --version or --help: Claude prints and exits
-	print       bool
-	sessionID   SessionID // from --session-id
-	resume      SessionID // from --resume <uuid>
-	fork        bool      // --fork-session: the resumed conversation gets a new UUID
-	inputFormat string
+	subcommand bool
+	info       bool // --version or --help: Claude prints and exits
+	print      bool
+	sessionID  string // from --session-id
+	resume     string // from --resume <uuid>
+	fork       bool   // --fork-session: the resumed conversation gets a new UUID
 }
 
-// key is the UUID the session Claude writes is stored under: --session-id when
-// given, else the resumed session's own, unless a fork gives it a new one.
-func (a args) key() SessionID {
+// key is the UUID the conversation Claude writes is stored under:
+// --session-id when given, else the resumed one's own, unless a fork gives it
+// a new one.
+func (a args) key() string {
 	switch {
 	case a.sessionID != "":
 		return a.sessionID
@@ -166,6 +106,58 @@ func (a args) key() SessionID {
 	default:
 		return a.resume
 	}
+}
+
+// scan reads Claude's arguments, stopping at `--`, after which every word is a
+// prompt. An option's value is read in both the `--opt value` and `--opt=value`
+// forms.
+func scan(words []string) args {
+	var a args
+	if len(words) > 0 {
+		a.subcommand = oneShotSubcommands[words[0]]
+	}
+	for i := 0; i < len(words); i++ {
+		name, value, inline := splitOption(words[i])
+		// next is the option's value: the inline one, else the next word.
+		next := func() string {
+			if inline {
+				return value
+			}
+			if i+1 < len(words) {
+				i++
+				return words[i]
+			}
+			return ""
+		}
+		switch name {
+		case "--":
+			return a
+		case "-v", "--version", "-h", "--help":
+			a.info = true
+		case "-p", "--print":
+			a.print = true
+		case "--session-id":
+			if v := next(); isSessionID(v) {
+				a.sessionID = v
+			}
+		case "--fork-session":
+			a.fork = true
+		case "-r", "--resume":
+			// --resume takes an optional value: a UUID resumes that
+			// conversation, and anything else is Claude's picker or a search
+			// term, which is left to Claude, so a following word that is no
+			// UUID stays unread.
+			if inline {
+				if isSessionID(value) {
+					a.resume = value
+				}
+			} else if i+1 < len(words) && isSessionID(words[i+1]) {
+				i++
+				a.resume = words[i]
+			}
+		}
+	}
+	return a
 }
 
 // splitOption reads a word as an option in the `--opt=value` form: a word that
@@ -179,61 +171,91 @@ func splitOption(word string) (name, value string, inline bool) {
 	return strings.Cut(word, "=")
 }
 
-// scan reads Claude's arguments, stopping at `--`, after which every word is a
-// prompt. An option's value is read in both the `--opt value` and `--opt=value`
-// forms.
-func scan(argv []string) args {
-	var a args
-	if len(argv) > 0 {
-		a.subcommand = utilitySubcommands[argv[0]]
+// isSessionID accepts a UUID in its canonical 8-4-4-4-12 hexadecimal form,
+// the only form Claude stores a conversation under. Only such an ID is safe as
+// a file name and a tmux session name.
+func isSessionID(s string) bool {
+	if len(s) != 36 {
+		return false
 	}
-	for i := 0; i < len(argv); i++ {
-		name, value, inline := splitOption(argv[i])
-		// next is the option's value: the inline one, else the next word.
-		next := func() string {
-			if inline {
-				return value
+	for i, r := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
 			}
-			if i+1 < len(argv) {
-				i++
-				return argv[i]
-			}
-			return ""
-		}
-		switch name {
-		case "--":
-			return a
-		case "-v", "--version", "-h", "--help":
-			a.info = true
-		case "-p", "--print":
-			a.print = true
-		case "--input-format":
-			a.inputFormat = next()
-		case "--session-id":
-			if id, ok := ParseSessionID(next()); ok {
-				a.sessionID = id
-			}
-		case "--fork-session":
-			a.fork = true
-		case "-r", "--resume":
-			// --resume takes an optional value: a UUID resumes that session, and
-			// anything else is Claude's picker or a search term, which is left to
-			// Claude, so a following word that is no UUID stays unread.
-			if inline {
-				if id, ok := ParseSessionID(value); ok {
-					a.resume = id
-				}
-			} else if i+1 < len(argv) {
-				if id, ok := ParseSessionID(argv[i+1]); ok {
-					a.resume = id
-					i++
-				}
+		default:
+			if !isHex(r) {
+				return false
 			}
 		}
 	}
-	return a
+	return true
 }
 
 func isHex(r rune) bool {
 	return (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+}
+
+// agentsCommand lists the conversations Claude runs, each with its directory.
+var agentsCommand = []string{"claude", "agents", "--json"}
+
+// Probe asks `claude agents --json`, which lists exactly the conversations
+// Claude runs.
+func (Agent) Probe(id string) agent.Probe {
+	return agent.NewProbe(id, agentsCommand, func(out []byte) (agent.State, error) {
+		running, err := readAgents(out)
+		if err != nil {
+			return agent.Stopped, err
+		}
+		if _, ok := running[strings.ToLower(id)]; ok {
+			return agent.Running, nil
+		}
+		return agent.Stopped, nil
+	})
+}
+
+// running is one entry of `claude agents --json`.
+type running struct {
+	SessionID string `json:"sessionId"`
+	Cwd       string `json:"cwd"`
+	Name      string `json:"name"`
+	StartedAt int64  `json:"startedAt"` // milliseconds since the epoch
+}
+
+// readAgents reads `claude agents --json` by lower-cased conversation ID:
+// Claude writes IDs in lower case, while a caller may give one in upper case.
+func readAgents(out []byte) (map[string]running, error) {
+	var list []running
+	if err := json.Unmarshal(out, &list); err != nil {
+		return nil, fmt.Errorf("claude agents --json: %w", err)
+	}
+	byID := make(map[string]running, len(list))
+	for _, r := range list {
+		byID[strings.ToLower(r.SessionID)] = r
+	}
+	return byID, nil
+}
+
+// acpVersion is the ACP protocol version claude-agent-acp speaks.
+const acpVersion = 1
+
+// acpCapabilities are the agent capabilities claude-agent-acp answers
+// `initialize` with: images and embedded context in prompts, MCP servers over
+// HTTP and SSE, and loading, listing, resuming, forking and closing sessions.
+const acpCapabilities = `{
+  "loadSession": true,
+  "promptCapabilities": {"image": true, "embeddedContext": true},
+  "mcpCapabilities": {"http": true, "sse": true},
+  "sessionCapabilities": {"close": {}, "fork": {}, "list": {}, "resume": {}}
+}`
+
+// Connect is claude-agent-acp's own answer to a connection start, so a client
+// is answered before any adapter runs.
+func (Agent) Connect() agent.Handshake {
+	h, err := agent.NewHandshake(acpVersion, []byte(acpCapabilities))
+	if err != nil {
+		panic(fmt.Sprintf("claude: the declared ACP capabilities are invalid: %v", err))
+	}
+	return h
 }
