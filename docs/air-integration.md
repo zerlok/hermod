@@ -7,9 +7,8 @@ The bridge itself — its command line, packages and flows — is the
 [README](../README.md#jetbrains-air).
 
 Each mechanism below marked proven was first shown to work by a bash script standing in for `claude`, before the
-bridge was built into Hermod. The [session lifecycle](#session-lifecycle) was recorded with
-[`air-probe`](../air-probe): a stand-in `claude` that answers without a model, and a tap on the ACP stream between
-Air and the adapter. What is still unverified is listed under [Open questions](#open-questions).
+bridge was built into Hermod. The [session lifecycle](#session-lifecycle) was recorded with a stand-in `claude`
+that answers without a model, and a tap on the ACP stream between Air and the adapter. What is still unverified is listed under [Open questions](#open-questions).
 
 Versions observed: GoLand 2026.3 with the Air plugin, `@agentclientprotocol/claude-agent-acp` 0.101.0,
 `@anthropic-ai/claude-agent-sdk` 0.3.318, Claude Code 2.1.318 on the sandbox.
@@ -380,14 +379,16 @@ bridge does not order them.
 
 ### Open questions
 
-- **The ACP session ID.** Closing a chat marked done takes the `sessionId` of `_session/archive` for Claude's
-  session UUID. The adapter is believed to use Claude's UUID as the ACP session ID; not yet confirmed in `acp-tap`
-  logs. If it does not, "mark done" closes nothing and the session runs until closed on the sandbox.
+- **The ACP session ID.** Finding a chat in the agent program takes the `sessionId` Air sends for Claude's
+  session UUID, and listing chats gives Air Claude's UUIDs as session IDs. The adapter is believed to use Claude's
+  UUID as the ACP session ID; not yet confirmed on the ACP stream. If it does not, `session/list` returns IDs that
+  Air cannot resume, and every chat that `air acp` does not hold, such as one reopened after a restart or marked
+  done after its project's last tab closed, gets an error.
 - **Archive marker and the transcript mirror.** "Mark done" writes to the local copy of a transcript that the
   one-way mirror owns. A locally changed file is likely a conflict that stops later sandbox writes from reaching it;
   not yet tested. If it does, the close is to reset that file.
-- **Sessions listed per sandbox.** Each sandbox's agent sets its own `CLAUDE_CONFIG_DIR`, assuming the adapter lists
-  sessions from there as Claude Code does; not yet tested with two entries.
+- **Sessions listed per sandbox.** Each sandbox's agent sets its own `CLAUDE_CONFIG_DIR`, assuming Claude Code lists
+  sessions from there; not yet tested with two entries.
 - **Terminal mode.** Not observed yet: switching the agent to terminal mode in Air's agent settings still opened
   the chat UI.
 - **Attaching to a live chat-mode process.** Whether Air accepts the locally answered `initialize`, the re-delivered

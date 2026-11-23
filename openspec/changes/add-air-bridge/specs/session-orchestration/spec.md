@@ -33,7 +33,7 @@ the requirement "Suspend or release keyed on the workspace's workers" specifies.
 When a process gives up its leases on a workspace's relays, Hermod SHALL read the workspace's workers on the remote
 and decide from them alone. While any worker of the workspace exists, or the workers cannot be read, every lease
 SHALL be suspended: a relay whose last lease is suspended stays and holds what arrives at either end, except a Net
-relay, which is removed ([Leases](../../../docs/ARCHITECTURE.md#leases)), and a file relay is paused as the
+relay, which is removed ([Leases](../../../../../docs/ARCHITECTURE.md#leases)), and a file relay is paused as the
 `file-sync` capability specifies. With no worker left, every lease SHALL be released: a relay whose last lease is
 released is removed, and a file relay is flushed first. A relay on which another process still holds a lease SHALL
 be left as it is. No other signal (exit codes, timers, the state of an agent's conversation, or

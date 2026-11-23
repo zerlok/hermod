@@ -17,9 +17,9 @@ hand.
 - `hermod air configure claude [REMOTE]` writes one `~/.jetbrains/acp.json` entry per remote, which runs
   `hermod air acp claude REMOTE`.
 - `hermod air acp` is Air's chat agent for one remote. Each project's chats run in one ACP adapter on the remote,
-  and `air acp` routes Air's one connection between them. A closed tab or a quit IDE leaves a chat running; "mark
-  done" ends it while another chat of its project is shown
-  ([Risks](design.md#risks--trade-offs)).
+  and `air acp` routes Air's one connection between them. It answers the connection start and the chat list
+  itself, from the agent, and finds a chat it does not hold in the agent program on the remote. A closed tab or a
+  quit IDE leaves a chat running; "mark done" ends it, and ending a project's last running chat ends its adapter.
 - Hermod is rebuilt around workspaces: the relays (files, stdio, calls) and the workers (tmux sessions) of one
   project on one remote. Sessions lease relays through file locks, and a workspace suspends them while a worker
   remains and releases them when none does. An agent's hooks reach Air through a relayed port with a token of the

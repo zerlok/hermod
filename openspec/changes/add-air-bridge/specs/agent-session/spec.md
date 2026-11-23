@@ -209,9 +209,10 @@ with a worker. Hermod SHALL then exit at once, so the program that started it ne
 ### Requirement: Each workspace's chats run in one adapter
 `hermod air acp` SHALL hold the client's one ACP connection for every chat of every project, and run each
 project's chats in one ACP adapter on the remote: a worker of the workspace the chat's directory belongs to, its
-stdio a line stream. A request that opens a chat (`session/new`, `session/load`, `session/resume`) SHALL be routed
-by the directory it names, attaching that workspace and starting its adapter when none runs; every later message
-of the chat SHALL be routed by the chat's session ID to the same adapter. Every message SHALL reach the adapter
+stdio a line stream. A request that opens a new chat (`session/new`) SHALL be routed by the directory it names,
+attaching that workspace and starting its adapter when none runs; every later message of the chat, and a request
+that opens it again (`session/load`, `session/resume`), SHALL be routed by the chat's session ID to the same
+adapter. Every message SHALL reach the adapter
 with its paths mapped to the remote, and the client with its paths mapped back. A line SHALL reach the adapter only
 whole. A second `hermod air acp` that opens a chat in a workspace whose adapter is already attached SHALL end
 with that error, and the first SHALL keep its adapter.
@@ -245,11 +246,15 @@ with that error, and the first SHALL keep its adapter.
 - **WHEN** a second IDE's `hermod air acp` opens a chat in a project whose adapter the first one is attached to
 - **THEN** the second `hermod air acp` exits with the error, and the first keeps its adapter
 
-### Requirement: What belongs to no workspace
-`hermod air acp` SHALL answer `initialize` and `session/list` through one more adapter of its own on the remote,
-which runs for as long as `hermod air acp` runs. It SHALL remove the `fs` and `terminal` client capabilities from
-`initialize`, so the agent reads, writes and runs everything on the remote, and SHALL send the same `initialize` to
-every workspace's adapter it starts.
+### Requirement: Hermod answers what names no chat
+`hermod air acp` SHALL answer `initialize` itself, from what the agent declares, and `session/list` from the agent
+program on the remote, with no adapter. It SHALL remove the `fs` and `terminal` client capabilities from
+`initialize`, so the agent reads, writes and runs everything on the remote, and SHALL send that `initialize` first
+to every adapter it starts. A `$/cancel_request` SHALL reach the adapter that holds the cancelled request.
+
+#### Scenario: Connection answered without an adapter
+- **WHEN** Air sends `initialize` and no chat is open
+- **THEN** Air receives the answer and no adapter is started
 
 #### Scenario: Client capabilities removed
 - **WHEN** Air's `initialize` declares the `fs` and `terminal` capabilities
@@ -257,11 +262,31 @@ every workspace's adapter it starts.
 
 #### Scenario: A new adapter is initialized
 - **WHEN** a chat opens in a project whose adapter is not running
-- **THEN** the adapter is started and receives Air's `initialize` before the request that opens the chat
+- **THEN** the adapter is started and receives Air's `initialize` before the request that opens the chat, and Air
+  does not receive the adapter's answer to it
 
 #### Scenario: Chats listed from the remote
 - **WHEN** Air sends `session/list` for a project directory
-- **THEN** the answer lists the chats whose transcripts are on the remote
+- **THEN** the answer lists the conversations the agent program on the remote has in that directory, with local
+  paths
+
+#### Scenario: Cancel reaches the request's adapter
+- **WHEN** Air sends `$/cancel_request` for a prompt it sent to a chat of a project
+- **THEN** the cancel reaches that project's adapter
+
+### Requirement: A chat Hermod does not hold is found in the agent program
+`hermod air acp` SHALL ask the agent program on the remote for the directory and state of a chat that no attached
+workspace holds when `session/close`, `_session/archive`, `session/load` or `session/resume` names it, attach the
+workspace of that directory, and handle the request as for a chat it holds. A chat the agent program does not have
+SHALL be answered to Air as an error, and `hermod air acp` SHALL go on serving every other chat.
+
+#### Scenario: Reopened after a restart
+- **WHEN** a new `hermod air acp` receives `session/resume` for a chat that runs on the remote
+- **THEN** the workspace of the chat's directory is attached and the request reaches its adapter
+
+#### Scenario: Unknown chat
+- **WHEN** Air names a chat that the agent program on the remote does not have
+- **THEN** Air receives an error for that request, and `hermod air acp` keeps running
 
 ### Requirement: A closed tab leaves its chat running
 `session/close`, which Air sends for every closed tab and for every open chat at an IDE quit, SHALL be answered by
@@ -285,16 +310,24 @@ SHALL detach the workspace, and its adapter keeps running.
 - **THEN** Air receives the answer to its `session/resume` first and the permission request after it
 
 ### Requirement: Mark done ends a chat
-`_session/archive`, which Air sends when a chat is marked done, SHALL reach the chat's adapter while another chat
-of its workspace is shown, and the adapter ends the chat's agent. Hermod SHALL then forget the chat, and pass to Air as it is whatever the adapter still sends of it.
+`_session/archive`, which Air sends when a chat is marked done, SHALL reach the chat's adapter, and the adapter ends
+the chat's agent. Hermod SHALL then forget the chat, and pass to Air as it is whatever the adapter still sends of
+it. When no chat of the workspace is shown any more, Hermod SHALL close the adapter once it has answered, if no
+conversation of the project's workspace, in its root or a directory under it, still runs, and the workspace's relays SHALL be released; otherwise it
+SHALL detach the workspace and the adapter keeps running.
 
 #### Scenario: Chat marked done
 - **WHEN** Air sends `_session/archive` for a chat of a project whose workspace has another chat open
 - **THEN** the archive reaches the adapter, and the chat's agent stops
 
 #### Scenario: Only shown chat marked done
-- **WHEN** Air marks done the only shown chat of a project
-- **THEN** `hermod air acp` ends with the error, and the chat is not marked done
+- **WHEN** Air marks done the only shown chat of a project, and no other conversation of the project runs
+- **THEN** the archive reaches the adapter, the chat's agent stops, the adapter is closed, and the workspace's
+  relays are released
+
+#### Scenario: Marked done while another conversation runs
+- **WHEN** Air marks done the only shown chat of a project whose other chat runs hidden
+- **THEN** the chat's agent stops, the workspace is detached, and the adapter keeps running
 
 ### Requirement: The adapters' requests are renumbered
 Every request an adapter sends SHALL reach the client under an ID unique on the client's connection, and the

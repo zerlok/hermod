@@ -25,8 +25,7 @@ chat UI speaks the Agent Client Protocol (ACP) to an agent it starts from `acp.j
   environment ([The command-line seam](../../../docs/ARCHITECTURE.md#the-command-line-seam)).
 - Everything Claude-specific behind one interface, unit-testable offline, so a second agent is a second
   implementation.
-- A chat outlives its tab and the IDE: only "mark done" ends it, while another chat of its project is shown
-  ([Risks](#risks--trade-offs)).
+- A chat outlives its tab and the IDE: only "mark done" ends it.
 - One project attached to several remotes at once, and several sessions in one project sharing its relays.
 
 **Non-Goals:**
@@ -147,12 +146,12 @@ change answers.
 | Terminal mode starts the configured executable with Claude's arguments and nothing in front ([Terminal mode](../../../docs/air-integration.md#terminal-mode)). | [The stand-in](#the-stand-in-hermod-named-claude) |
 | Terminal mode lists and resumes conversations from the local `~/.claude` ([Terminal mode](../../../docs/air-integration.md#terminal-mode)). | [A terminal session's transcripts travel both ways](#a-terminal-sessions-transcripts-travel-both-ways) |
 | Air reads extra agents from `~/.jetbrains/acp.json`, each a `command`, `args` and `env`, and does not load the user's shell ([Chat mode](../../../docs/air-integration.md#chat-mode-acp)). | [`hermod air configure`](#hermod-air-configure-claude-remote) |
-| Each running IDE starts one agent process for all chats of all its open projects. A chat names its directory when it is opened; every later message carries only its session ID ([Session lifecycle](../../../docs/air-integration.md#session-lifecycle)). | [`air acp` routes, the adapters translate](#air-acp-routes-the-adapters-translate) |
+| Each running IDE starts one agent process for all chats of all its open projects. A chat names its directory when it is opened; every later message carries only its session ID ([Session lifecycle](../../../docs/air-integration.md#session-lifecycle)). | [`air acp` routes, the adapters translate](#air-acp-routes-the-adapters-translate), [The agent program knows where a chat belongs](#the-agent-program-knows-where-a-chat-belongs) |
 | Air numbers its requests from 1 in one sequence across projects. An adapter numbers its own from 0 across its chats, and Air answers under the same ID ([Session lifecycle](../../../docs/air-integration.md#session-lifecycle)). | [Request IDs](../../../docs/ARCHITECTURE.md#request-ids) |
 | Air sends `session/close` for every closed tab and for every open chat at an IDE quit; ACP defines it as cancelling the session's work and freeing it ([Session lifecycle](../../../docs/air-integration.md#session-lifecycle)). | [`air acp` routes, the adapters translate](#air-acp-routes-the-adapters-translate) |
 | "Mark done" sends `session/close` if the chat is open, then `_session/archive`, which only the adapter acts on ([Session lifecycle](../../../docs/air-integration.md#session-lifecycle)). | [Air's messages](../../../docs/ARCHITECTURE.md#airs-messages) |
 | Air polls `session/list` every 60 s for each open project directory ([Session lifecycle](../../../docs/air-integration.md#session-lifecycle)). | [Each remote's chats are listed by its own agent](#each-remotes-chats-are-listed-by-its-own-agent) |
-| Air declares itself with `_meta.jetbrains.air` at `initialize`, which turns on the adapter's Air extensions ([Chat mode](../../../docs/air-integration.md#chat-mode-acp)). | [Outside any workspace](../../../docs/ARCHITECTURE.md#outside-any-workspace) |
+| Air declares itself with `_meta.jetbrains.air` at `initialize`, which turns on the adapter's Air extensions ([Chat mode](../../../docs/air-integration.md#chat-mode-acp)). | [Hermod answers what names no chat](#hermod-answers-what-names-no-chat) |
 | Air runs the configured `claude -p …` outside any chat to read Claude's settings ([Chat mode](../../../docs/air-integration.md#chat-mode-acp)). | [One-shot call](../../../docs/ARCHITECTURE.md#one-shot-call), which then reports the remote's settings |
 | Air's hook settings call `localhost:<port>` with a Bearer token, both new with every IDE run, and time out after 1 s ([Terminal mode](../../../docs/air-integration.md#terminal-mode)). | [The remote never holds Air's secrets](#the-remote-never-holds-airs-secrets) |
 | Air hands the agent an MCP server whose command is the local IDE binary ([MCP servers](../../../docs/air-integration.md#9-mcp-servers-that-run-local-programs--decided-not-bridged)). | Not bridged (Non-Goals) |
@@ -185,8 +184,7 @@ follows is in one section there:
 ACP has to be translated for Claude, and `claude-agent-acp` does that and carries Air's extensions. Where it runs
 decides what Hermod has to understand. On the remote, beside the Claude it starts, Hermod carries ACP: a public,
 typed protocol that already has what a returning client needs (a chat is opened again with a replay of its
-history). The adapter also reads the remote's own transcripts, so Air lists that remote's chats with no files
-copied.
+history). The adapter also resumes chats from the remote's own transcripts, so no files are copied for them.
 
 - **Alternative — the adapter local, starting Hermod as its `claude` for each chat:** rejected. Hermod would map
   paths in the SDK's stream, which is not a public protocol, and invent how a new client catches up on it; and
@@ -211,8 +209,9 @@ also have one more program, `claude-agent-acp`, which ships as a standalone exec
 ### `air acp` routes, the adapters translate
 Air holds all its chats on one ACP connection, and each project is a workspace with an adapter of its own. So
 `air acp` cannot be a pipe: it sends each message to its chat's workspace. It understands only what that takes
-(which directory a new chat names, which chat a message belongs to, and the lifecycle messages) and never the
-content of a conversation. Each message is given one of a few meanings (open, suspend or close a chat, a remote's
+(the connection start, the chat list, a cancel, which directory a new chat names, which chat a message belongs
+to, and the lifecycle messages) and never the content of a conversation. Each message is given one of a few
+meanings (start the connection, list the chats, cancel a request, open, suspend or close a chat, a remote's
 question, the client's answer, or pass through), so the routing knows neither ACP's wire format nor Air's own
 method names ([Air's messages](../../../docs/ARCHITECTURE.md#airs-messages)).
 
@@ -226,11 +225,43 @@ something only between two neighbours.
 - **Alternative — ACP's proxy chains:** not used. They are a draft that the client has to take part in, and Air
   is not known to.
 
+### Hermod answers what names no chat
+A client's connection start, its chat list and its cancels belong to no one chat, while every adapter serves one
+workspace. `air acp` answers the first two itself from what the agent declares, and sends a cancel to the
+workspace whose adapter holds the cancelled request
+([The client's connection](../../../docs/ARCHITECTURE.md#the-clients-connection)). A connection start is then
+answered before any workspace is attached, and the chat list comes from the agent program on the remote, which
+holds every conversation there.
+
+- **Alternative — one more adapter for what belongs to no workspace, run over ssh for as long as `air acp` runs:**
+  rejected. It is one more process on the remote for the IDE's whole run, and a cancel, which names no chat,
+  would reach it instead of the adapter that holds the request.
+
+### The agent program knows where a chat belongs
+Hermod keeps no record of chats. While a session holds a workspace, `air acp` knows its chats from their opening;
+a chat whose session has detached, or that `air acp` has not seen since a restart, reaches it by its ID alone. The
+agent program on the remote holds every conversation with its directory, so `air acp` asks it, attaches the
+workspace of that directory, and takes the chat in the state the program reports
+([Events](../../../docs/ARCHITECTURE.md#events)). "Mark done" after the project's last tab was closed, and a
+reopen after an IDE restart, then reach the right adapter. A chat the program does not have is an error for that
+request only.
+
+- **Alternative — keep the owner of a chat after its session detaches:** rejected. It is lost with the process,
+  so a restart would still need the agent program, and the map would be a second copy of what the program holds.
+
+### The last close ends the adapter
+An adapter left with no running conversation keeps its workspace Detached, and its relays Disconnected, until the
+remote ends it. So when a close leaves a workspace with no chat shown, `air acp` asks the agent program whether a
+conversation of the workspace, in its root or a directory under it, still runs, and with none it closes the
+adapter worker, which releases the relays
+([Session states](../../../docs/ARCHITECTURE.md#session-states)). One adapter runs every chat of its workspace,
+so it is ended only when none runs; a suspended chat's adapter runs on.
+
 ### An agent acts on the remote only
 ACP lets an agent ask its client to read or write a file and to run a terminal, when the client's `initialize`
 says it can. Those act on the client's machine, which here is the other workstation: a command would run locally
 while the agent works on the remote. `air acp` removes both capabilities from `initialize`
-([Outside any workspace](../../../docs/ARCHITECTURE.md#outside-any-workspace)), so the adapter does all of it on
+([The client's connection](../../../docs/ARCHITECTURE.md#the-clients-connection)), so the adapter does all of it on
 the remote, and the FS relay carries the result.
 
 The cost is that the agent reads a file as it is on disk, not as it stands unsaved in Air's editor.
@@ -335,7 +366,7 @@ Secrets reach the remote only inside the worker's directory or its own stdin
 
 ### Each remote's chats are listed by its own agent
 Air lists chats by asking the agent (`session/list`). Each entry `configure` writes is one remote's `air acp`, and
-the adapter it asks reads that remote's transcripts. "Claude (A)" then lists only A's chats and "Claude (B)" only
+it asks the agent program on that remote. "Claude (A)" then lists only A's chats and "Claude (B)" only
 B's, so a chat can only be reopened on the remote it lives on, and Hermod needs no record of which remote holds
 which chat. The user's local sessions stay out of both lists.
 
@@ -394,16 +425,18 @@ The `add-notify-backchannel` and `add-remote-agent` changes are withdrawn with i
 ## Risks / Trade-offs
 
 - **Returning to a running adapter is unproven.** That the adapter reuses a chat it still runs when the chat is
-  opened again was read in its source (0.109.0), not observed with Air. → Verify with `air-probe`.
+  opened again was read in its source (0.109.0), not observed with Air. → Verify with Air.
 - **A conversation that runs in a terminal worker and is opened as a chat is started a second time** by the
   adapter, which knows nothing of the first. → Unguarded in this change.
 - **The remote's adapter must suit the local Air.** Air pins the adapter version it ships; the remote has
-  whichever was installed there. → `air acp` logs both sides' versions from `initialize`; documentation says to
-  install the version Air uses.
+  whichever was installed there. Air no longer sees the adapter's answer to `initialize`: it sees the `Handshake`
+  the agent declares, which may promise a protocol version, capabilities or Air extensions the installed adapter
+  lacks. → `air acp` logs both sides' versions from `initialize` and where the adapter's dropped answer differs
+  from the declared `Handshake`; documentation says to install the version Air uses.
 - **Air's extension files may be expected locally.** The adapter writes plan files and reads the directories Air
-  adds (`air-views`), which exist only locally. → Verify with `air-probe`; if Air needs them, they are FS relays
+  adds (`air-views`), which exist only locally. → Verify with Air; if Air needs them, they are FS relays
   the agent declares.
-- **Where Air's hook settings travel in ACP has not been observed.** → Verify in `acp-tap` logs. If they are not
+- **Where Air's hook settings travel in ACP has not been observed.** → Verify on the ACP stream. If they are not
   in the messages `air acp` reads, chats run without Air's hooks.
 - **The adapter hands a chat's MCP servers and settings to Claude on its command line** when it is told which
   `claude` to run, where the remote's other users can read them. → Run the Claude that ships with the adapter, or
@@ -421,25 +454,22 @@ The `add-notify-backchannel` and `add-remote-agent` changes are withdrawn with i
   [relative paths](../../../docs/air-integration.md#mirrors-cover-roots-worktrees-resolve-by-path).
 - **A Detached workspace shows nothing locally** until the next attach. → Accepted: a client that wants the
   files attaches.
-- **"Mark done" on a project's only shown chat ends `air acp`.** Its `session/close` detaches the workspace, so
-  the `_session/archive` after it finds no chat to route to, which is an error
-  ([Events](../../../docs/ARCHITECTURE.md#events)); the chat is not marked done, and Air loses every other chat's
-  connection. → Unguarded in this change.
-- **Reopening a chat marked done ends `air acp`.** Its `_session/unarchive` names a chat that no session holds
-  any more ([Events](../../../docs/ARCHITECTURE.md#events)). → Unguarded in this change.
-- **A chat opened in a subdirectory of a project with a chat shown ends `air acp`.** The `Open` makes a second
-  session for the same workspace, whose attach is refused ([Events](../../../docs/ARCHITECTURE.md#events)).
-  → Unguarded in this change.
-- **A `$/cancel_request` for a request a workspace's adapter serves cancels nothing.** It names no chat, so it
-  reaches the adapter outside any workspace ([Events](../../../docs/ARCHITECTURE.md#events)). → Unguarded in this
-  change.
-- **A question asked while a project has no chat shown reaches Air before the chat is open.** It waits in the
-  adapter's line stream and is delivered when the next chat of the project opens, ahead of that open's answer
+- **The agent program's IDs are taken for Air's chat IDs.** Locating a chat and listing chats assume that the
+  adapter uses Claude's session UUID as the ACP session ID
+  ([The agent program knows where a chat belongs](#the-agent-program-knows-where-a-chat-belongs)); if it does not,
+  every chat that `air acp` does not hold gets an error and listed chats cannot be resumed. → Verify on the ACP
+  stream.
+- **Reopening a chat marked done gets an error for its `_session/unarchive`**, which names a chat that no session
+  holds any more and is not located ([Events](../../../docs/ARCHITECTURE.md#events)). → Unguarded in this change.
+- **A chat opened, closed or marked done in a subdirectory of a project with a chat shown ends `air acp`.** The
+  `Open`, or the chat located in that subdirectory, makes a second session for the same workspace, whose attach is
+  refused ([Events](../../../docs/ARCHITECTURE.md#events)). → Unguarded in this change.
+- **A question asked while a project has no chat shown reaches Air before a new chat is open.** It waits in the
+  adapter's line stream and is delivered when a new chat of the project opens, ahead of that open's answer
   ([Events](../../../docs/ARCHITECTURE.md#events)). → Unguarded in this change.
-- **Nothing in this change closes an adapter worker.** An adapter runs until the remote ends it, so a chat project's
-  workspace stays Detached and its relays Disconnected; a terminal worker ends when its command exits. → Accepted:
-  a Disconnected relay costs a Mutagen session and nothing travels on it
-  ([Close](../../../docs/ARCHITECTURE.md#close) is the operation that would end one).
+- **An adapter whose chats were only suspended runs on.** Its workspace stays Detached and its relays
+  Disconnected until a close leaves none of its conversations running. → Accepted: a Disconnected relay costs a Mutagen session and nothing
+  travels on it.
 
 ## Delivery
 
@@ -450,8 +480,6 @@ The build order is in [tasks.md](tasks.md).
 - **Which ACP version does Air ask for?** The adapter serves v1 and the v2 preview. They differ in what Hermod
   reads: v1 opens a chat with `session/load`, which replays and ends the replay with its answer; v2 uses
   `session/resume` with a `replay_complete` update. `acp` has to read the one Air uses.
-- **When exactly does Air start the entry's command?** At IDE start, or at the first use of the agent. It decides
-  only how early `air acp`'s own adapter runs.
 - **Terminal mode has not been observed.** Switching Air to it still opened the chat UI. That Air starts the
   configured path under its own name is assumed.
 - **`HERMOD_REMOTE` in terminal mode.** It has to be in Air's own environment (e.g. `~/.config/environment.d/`).
