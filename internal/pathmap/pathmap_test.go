@@ -1,37 +1,38 @@
 package pathmap
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
 
-func mustRoots(t *testing.T, pairs ...Pair) Roots {
+func mustMap(t *testing.T, places ...Place) Map {
 	t.Helper()
-	r, err := New(pairs...)
+	m, err := New(places...)
 	if err != nil {
-		t.Fatalf("New(%v) error: %v", pairs, err)
+		t.Fatalf("New(%v) error: %v", places, err)
 	}
-	return r
+	return m
 }
 
 func TestNewRejectsAmbiguousRoots(t *testing.T) {
 	cases := []struct {
 		name    string
-		pairs   []Pair
+		places  []Place
 		wantErr string // "" for a valid set
 	}{
 		{"no pairs", nil, ""},
-		{"distinct pairs", []Pair{{"/home/me/dev", "/home/u/dev"}, {"/home/me/dev/api-wt", "/home/u/dev/api-wt"}}, ""},
-		{"empty local root", []Pair{{"", "/home/u/dev"}}, "not absolute"},
-		{"empty sandbox root", []Pair{{"/home/me/dev", ""}}, "not absolute"},
-		{"relative local root", []Pair{{"dev", "/home/u/dev"}}, "not absolute"},
-		{"relative sandbox root", []Pair{{"/home/me/dev", "dev"}}, "not absolute"},
-		{"local root twice", []Pair{{"/home/me/dev", "/home/u/a"}, {"/home/me/dev/", "/home/u/b"}}, "local root"},
-		{"sandbox root twice", []Pair{{"/home/me/a", "/home/u/dev"}, {"/home/me/b", "/home/u/dev/"}}, "sandbox root"},
+		{"distinct pairs", []Place{{"/home/me/dev", "/home/u/dev"}, {"/home/me/dev/api-wt", "/home/u/dev/api-wt"}}, ""},
+		{"empty local root", []Place{{"", "/home/u/dev"}}, "not absolute"},
+		{"empty remote root", []Place{{"/home/me/dev", ""}}, "not absolute"},
+		{"relative local root", []Place{{"dev", "/home/u/dev"}}, "not absolute"},
+		{"relative remote root", []Place{{"/home/me/dev", "dev"}}, "not absolute"},
+		{"local root twice", []Place{{"/home/me/dev", "/home/u/a"}, {"/home/me/dev/", "/home/u/b"}}, "local root"},
+		{"remote root twice", []Place{{"/home/me/a", "/home/u/dev"}, {"/home/me/b", "/home/u/dev/"}}, "remote root"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := New(tc.pairs...)
+			_, err := New(tc.places...)
 			switch {
 			case tc.wantErr == "" && err != nil:
 				t.Fatalf("New() error: %v", err)
@@ -43,10 +44,10 @@ func TestNewRejectsAmbiguousRoots(t *testing.T) {
 }
 
 func TestPath(t *testing.T) {
-	nested := []Pair{{"/home/me/dev", "/home/u/dev"}, {"/home/me/dev/api-wt", "/home/u/dev/api-wt"}}
+	nested := []Place{{"/home/me/dev", "/home/u/dev"}, {"/home/me/dev/api-wt", "/home/u/dev/api-wt"}}
 	cases := []struct {
 		name    string
-		pairs   []Pair
+		places  []Place
 		toLocal bool
 		in      string
 		want    string
@@ -54,29 +55,30 @@ func TestPath(t *testing.T) {
 		{"longest prefix wins", nested, false, "/home/me/dev/api-wt/main.go", "/home/u/dev/api-wt/main.go"},
 		{"shorter root for a sibling", nested, false, "/home/me/dev/api/main.go", "/home/u/dev/api/main.go"},
 		{"longest prefix wins to local", nested, true, "/home/u/dev/api-wt/main.go", "/home/me/dev/api-wt/main.go"},
-		{"segment boundary respected", []Pair{{"/home/me/dev/api", "/home/u/dev/api"}}, false, "/home/me/dev/api2/x", "/home/me/dev/api2/x"},
-		{"root itself", []Pair{{"/home/me/dev/api", "/home/u/dev/api"}}, false, "/home/me/dev/api", "/home/u/dev/api"},
-		{"sandbox to local", []Pair{{"/home/me/dev/api", "/home/u/dev/api"}}, true, "/home/u/dev/api/x.go", "/home/me/dev/api/x.go"},
-		{"under no root unchanged", []Pair{{"/home/me/dev/api", "/home/u/dev/api"}}, false, "/etc/hosts", "/etc/hosts"},
-		{"other side's root not applied", []Pair{{"/home/me/dev/api", "/home/u/dev/api"}}, false, "/home/u/dev/api/x", "/home/u/dev/api/x"},
-		{"trailing slash on root ignored", []Pair{{"/home/me/dev/api/", "/home/u/dev/api/"}}, false, "/home/me/dev/api/x", "/home/u/dev/api/x"},
-		{"rest kept as written", []Pair{{"/home/me/dev/api", "/home/u/dev/api"}}, false, "/home/me/dev/api//x/../y", "/home/u/dev/api//x/../y"},
-		{"filesystem root maps below", []Pair{{"/", "/mnt/local"}}, false, "/etc/hosts", "/mnt/local/etc/hosts"},
-		{"filesystem root itself", []Pair{{"/", "/mnt/local"}}, false, "/", "/mnt/local"},
-		{"to filesystem root", []Pair{{"/", "/mnt/local"}}, true, "/mnt/local/etc", "/etc"},
-		{"relative path not under filesystem root", []Pair{{"/", "/mnt/local"}}, false, "etc", "etc"},
-		{"relative path not under a root's tail", []Pair{{"/home/me/dev", "/home/u/dev"}}, true, "dev/feature", "dev/feature"},
-		{"empty string unchanged", []Pair{{"/home/me/dev", "/home/u/dev"}}, false, "", ""},
+		{"segment boundary respected", []Place{{"/home/me/dev/api", "/home/u/dev/api"}}, false, "/home/me/dev/api2/x", "/home/me/dev/api2/x"},
+		{"root itself", []Place{{"/home/me/dev/api", "/home/u/dev/api"}}, false, "/home/me/dev/api", "/home/u/dev/api"},
+		{"remote to local", []Place{{"/home/me/dev/api", "/home/u/dev/api"}}, true, "/home/u/dev/api/x.go", "/home/me/dev/api/x.go"},
+		{"under no root unchanged", []Place{{"/home/me/dev/api", "/home/u/dev/api"}}, false, "/etc/hosts", "/etc/hosts"},
+		{"other side's root not applied", []Place{{"/home/me/dev/api", "/home/u/dev/api"}}, false, "/home/u/dev/api/x", "/home/u/dev/api/x"},
+		{"trailing slash on root ignored", []Place{{"/home/me/dev/api/", "/home/u/dev/api/"}}, false, "/home/me/dev/api/x", "/home/u/dev/api/x"},
+		{"rest kept as written", []Place{{"/home/me/dev/api", "/home/u/dev/api"}}, false, "/home/me/dev/api//x/../y", "/home/u/dev/api//x/../y"},
+		{"filesystem root maps below", []Place{{"/", "/mnt/local"}}, false, "/etc/hosts", "/mnt/local/etc/hosts"},
+		{"filesystem root itself", []Place{{"/", "/mnt/local"}}, false, "/", "/mnt/local"},
+		{"to filesystem root", []Place{{"/", "/mnt/local"}}, true, "/mnt/local/etc", "/etc"},
+		{"relative path not under filesystem root", []Place{{"/", "/mnt/local"}}, false, "etc", "etc"},
+		{"relative path not under a root's tail", []Place{{"/home/me/dev", "/home/u/dev"}}, true, "dev/feature", "dev/feature"},
+		{"empty string unchanged", []Place{{"/home/me/dev", "/home/u/dev"}}, false, "", ""},
 		{"no roots", nil, false, "/home/me/dev/x", "/home/me/dev/x"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := mustRoots(t, tc.pairs...).ToSandbox()
+			m := mustMap(t, tc.places...)
+			mapPath := m.ToRemote
 			if tc.toLocal {
-				m = mustRoots(t, tc.pairs...).ToLocal()
+				mapPath = m.ToLocal
 			}
-			if got := m.Path(tc.in); got != tc.want {
-				t.Errorf("Path(%q) = %q, want %q", tc.in, got, tc.want)
+			if got := mapPath(tc.in); got != tc.want {
+				t.Errorf("map(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -92,18 +94,20 @@ func TestZeroMapMapsNothing(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := (Map{}).Path(tc.in); got != tc.in {
-				t.Errorf("Path(%q) = %q, want it unchanged", tc.in, got)
+			for _, mapPath := range []func(string) string{Map{}.ToRemote, Map{}.ToLocal} {
+				if got := mapPath(tc.in); got != tc.in {
+					t.Errorf("map(%q) = %q, want it unchanged", tc.in, got)
+				}
 			}
 		})
 	}
 }
 
 func TestJSON(t *testing.T) {
-	api := []Pair{{"/home/me/dev/api", "/home/u/dev/api"}}
+	api := []Place{{"/home/me/dev/api", "/home/u/dev/api"}}
 	cases := []struct {
 		name    string
-		pairs   []Pair
+		places  []Place
 		toLocal bool
 		in      string
 		want    string
@@ -153,7 +157,7 @@ func TestJSON(t *testing.T) {
 		},
 		{
 			"mapped string written without HTML escapes",
-			[]Pair{{"/home/me/a&b", "/home/u/a<b>"}}, false,
+			[]Place{{"/home/me/a&b", "/home/u/a<b>"}}, false,
 			`"/home/me/a&b/x"`,
 			`"/home/u/a<b>/x"`,
 			false,
@@ -171,11 +175,12 @@ func TestJSON(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := mustRoots(t, tc.pairs...).ToSandbox()
+			m := mustMap(t, tc.places...)
+			mapJSON := m.ToRemoteJSON
 			if tc.toLocal {
-				m = mustRoots(t, tc.pairs...).ToLocal()
+				mapJSON = m.ToLocalJSON
 			}
-			got, err := m.JSON([]byte(tc.in))
+			got, err := mapJSON([]byte(tc.in))
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("JSON() error = %v, wantErr %v", err, tc.wantErr)
 			}
@@ -186,29 +191,23 @@ func TestJSON(t *testing.T) {
 	}
 }
 
-func TestLine(t *testing.T) {
-	api := []Pair{{"/home/me/dev/api", "/home/u/dev/api"}}
+func TestPlaces(t *testing.T) {
 	cases := []struct {
-		name    string
-		in      string
-		want    string
-		wantErr bool
+		name   string
+		places []Place
+		want   []Place
 	}{
-		{"newline-terminated line", "{\"cwd\":\"/home/u/dev/api\"}\n", "{\"cwd\":\"/home/me/dev/api\"}\n", false},
-		{"CRLF ending kept", "{\"cwd\":\"/home/u/dev/api\"}\r\n", "{\"cwd\":\"/home/me/dev/api\"}\r\n", false},
-		{"partial final line has no ending", "{\"cwd\":\"/home/u/dev/api/x\"}", "{\"cwd\":\"/home/me/dev/api/x\"}", false},
-		{"blank line unchanged", "\n", "\n", false},
-		{"whitespace-only line unchanged", "  \n", "  \n", false},
-		{"invalid line", "not json\n", "", true},
+		{"none", nil, nil},
+		{
+			"longest local root first, trailing slashes dropped",
+			[]Place{{"/home/me/dev", "/home/u/dev"}, {"/home/me/dev/api-wt/", "/home/u/wt"}, {"/", "/mnt/local"}},
+			[]Place{{"/home/me/dev/api-wt", "/home/u/wt"}, {"/home/me/dev", "/home/u/dev"}, {"/", "/mnt/local"}},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := mustRoots(t, api...).ToLocal().Line([]byte(tc.in))
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("Line() error = %v, wantErr %v", err, tc.wantErr)
-			}
-			if string(got) != tc.want {
-				t.Errorf("Line() = %q, want %q", got, tc.want)
+			if got := mustMap(t, tc.places...).Places(); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("Places() = %v, want %v", got, tc.want)
 			}
 		})
 	}

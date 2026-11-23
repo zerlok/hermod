@@ -5,69 +5,103 @@ import (
 	"context"
 	"errors"
 	"io"
-	"io/fs"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/zerlok/hermod/internal/env"
+	"github.com/zerlok/hermod/internal/secret"
 )
 
-// recShell records the last command it was asked to run and returns canned data.
-type recShell struct {
-	got Command
-	ret Result
-	err error
+// recExecutor records the command it was handed and runs nothing.
+type recExecutor struct {
+	got   Command
+	calls int
 }
 
-func (r *recShell) Run(_ context.Context, cmd Command) (Result, error) {
+func (r *recExecutor) Exec(_ context.Context, cmd Command) Execution {
 	r.got = cmd
-	return r.ret, r.err
+	r.calls++
+	return Finished(cmd, nil)
+}
+
+func vars(pairs ...string) env.Vars {
+	var out []env.Pair
+	for i := 0; i+1 < len(pairs); i += 2 {
+		out = append(out, env.Pair{Key: pairs[i], Value: env.Plain(pairs[i+1])})
+	}
+	return env.New(out...)
+}
+
+func secretVar(key, value string) env.Vars {
+	return env.New(env.Pair{Key: key, Value: env.Secret(secret.FromString(value))})
 }
 
 func TestSSHRewrite(t *testing.T) {
 	cases := []struct {
-		name string
-		host string
-		opts []SSHOption
-		in   Command
-		want []string
+		name    string
+		host    string
+		opts    []SSHOption
+		in      Command
+		want    []string
+		wantErr bool
 	}{
-		{"probe no tty", "prod", nil, Command{Argv: []string{"tmux", "has-session", "-t", "api"}}, []string{"ssh", "prod", "tmux has-session -t api"}},
-		{"interactive tty", "prod", []SSHOption{WithTty()}, Command{Argv: []string{"tmux", "new-session", "-A"}}, []string{"ssh", "-t", "prod", "tmux new-session -A"}},
-		{"quotes sandbox arg with space", "box", nil, Command{Argv: []string{"tmux", "new-session", "claude --model opus"}}, []string{"ssh", "box", "tmux new-session 'claude --model opus'"}},
+		{"probe no tty", "prod", nil, Command{Args: []string{"tmux", "has-session", "-t", "api"}}, []string{"ssh", "prod", "tmux has-session -t api"}, false},
+		{"interactive tty", "prod", []SSHOption{WithTty()}, Command{Args: []string{"tmux", "new-session", "-A"}}, []string{"ssh", "-t", "prod", "tmux new-session -A"}, false},
+		{"quotes remote arg with space", "box", nil, Command{Args: []string{"tmux", "new-session", "claude --model opus"}}, []string{"ssh", "box", "tmux new-session 'claude --model opus'"}, false},
 		{
 			"reverse forward after tty before host",
 			"prod", []SSHOption{WithTty(), WithReverseForward(45001, 38211)},
-			Command{Argv: []string{"tmux", "attach"}},
+			Command{Args: []string{"tmux", "attach"}},
 			[]string{"ssh", "-t", "-R", "45001:127.0.0.1:38211", "prod", "tmux attach"},
+			false,
 		},
 		{
 			"own connection after tty before forwards",
 			"prod", []SSHOption{WithReverseForward(45001, 38211), WithoutSharedMaster(), WithTty()},
-			Command{Argv: []string{"tmux", "attach"}},
+			Command{Args: []string{"tmux", "attach"}},
 			[]string{"ssh", "-t", "-o", "ControlPath=none", "-R", "45001:127.0.0.1:38211", "prod", "tmux attach"},
+			false,
 		},
-		{"own connection probe", "prod", []SSHOption{WithoutSharedMaster()}, Command{Argv: []string{"true"}}, []string{"ssh", "-o", "ControlPath=none", "prod", "true"}},
+		{"own connection probe", "prod", []SSHOption{WithoutSharedMaster()}, Command{Args: []string{"true"}}, []string{"ssh", "-o", "ControlPath=none", "prod", "true"}, false},
 		{
 			"two reverse forwards accumulate",
 			"prod", []SSHOption{WithTty(), WithReverseForward(45001, 1), WithReverseForward(45002, 2)},
-			Command{Argv: []string{"tmux", "attach"}},
+			Command{Args: []string{"tmux", "attach"}},
 			[]string{"ssh", "-t", "-R", "45001:127.0.0.1:1", "-R", "45002:127.0.0.1:2", "prod", "tmux attach"},
+			false,
 		},
+		{"remote dir folded into the remote line", "prod", nil, Command{Args: []string{"ls"}, Dir: "/home/u/my api"}, []string{"ssh", "prod", "cd '/home/u/my api' && ls"}, false},
+		{"remote env folded into the remote line", "prod", nil, Command{Args: []string{"ls"}, Env: vars("A", "1", "B", "x y")}, []string{"ssh", "prod", "A=1 B='x y' ls"}, false},
+		{"remote dir and env together", "prod", nil, Command{Args: []string{"ls"}, Dir: "/srv", Env: vars("A", "1")}, []string{"ssh", "prod", "cd /srv && A=1 ls"}, false},
+		{"secret variable refused", "prod", nil, Command{Args: []string{"claude"}, Env: secretVar("ANTHROPIC_API_KEY", "sk-ant-secret")}, nil, true},
+		{"remote dir without a command", "prod", nil, Command{Dir: "/srv"}, []string{"ssh", "prod", "cd /srv"}, false},
+		{"remote env without a command", "prod", nil, Command{Env: vars("A", "1")}, []string{"ssh", "prod", "A=1"}, false},
+		{"key with a ';' refused", "prod", nil, Command{Args: []string{"ls"}, Env: vars("A; rm -rf ~ #", "1")}, nil, true},
+		{"key with a '.' refused", "prod", nil, Command{Args: []string{"ls"}, Env: vars("FOO.BAR", "1")}, nil, true},
+		{"empty key refused", "prod", nil, Command{Args: []string{"ls"}, Env: vars("", "1")}, nil, true},
+		{"key starting with a digit refused", "prod", nil, Command{Args: []string{"ls"}, Env: vars("1A", "1")}, nil, true},
+		{"key of letters, digits and '_' kept", "prod", nil, Command{Args: []string{"ls"}, Env: vars("_a1_B", "1")}, []string{"ssh", "prod", "_a1_B=1 ls"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			inner := &recShell{}
-			NewSSH(inner, tc.host, tc.opts...).Run(context.Background(), tc.in)
-			if !reflect.DeepEqual(inner.got.Argv, tc.want) {
-				t.Errorf("argv = %q, want %q", inner.got.Argv, tc.want)
+			inner := &recExecutor{}
+			err := NewSSH(inner, tc.host, tc.opts...).Exec(context.Background(), tc.in).Wait()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Wait() = %v, want an error: %v", err, tc.wantErr)
 			}
-			if inner.got.Dir != "" || inner.got.Env != nil {
-				t.Errorf("sandbox intent leaked: dir=%q env=%v", inner.got.Dir, inner.got.Env)
+			if tc.wantErr && inner.calls != 0 {
+				t.Fatalf("refused command handed in: %q", inner.got.Args)
+			}
+			if !reflect.DeepEqual(inner.got.Args, tc.want) {
+				t.Errorf("args = %q, want %q", inner.got.Args, tc.want)
+			}
+			if inner.got.Dir != "" || inner.got.Env.Len() != 0 {
+				t.Errorf("remote intent leaked: dir=%q env=%v", inner.got.Dir, inner.got.Env)
 			}
 		})
 	}
@@ -76,42 +110,465 @@ func TestSSHRewrite(t *testing.T) {
 func TestTmuxRewrite(t *testing.T) {
 	tags := []SessionOption{{"@hermod-mode", "attach"}, {"@hermod-dir", "dev/my api"}}
 	cases := []struct {
-		name string
-		sess string
-		opts []TmuxOption
-		in   Command
-		want []string
+		name    string
+		sess    string
+		opts    []TmuxOption
+		in      Command
+		want    []string
+		wantErr bool
 	}{
-		{"default shell no command", "api", nil, Command{}, []string{"tmux", "new-session", "-A", "-s", "api"}},
-		{"with dir", "api", nil, Command{Dir: "/home/u/api"}, []string{"tmux", "new-session", "-A", "-s", "api", "-c", "/home/u/api"}},
-		{"a '#' in the dir is no format", "api", nil, Command{Dir: "dev/p#(id>T)C#"}, []string{"tmux", "new-session", "-A", "-s", "api", "-c", "dev/p##(id>T)C##"}},
-		{"with env", "api", nil, Command{Env: []string{"GIT_AUTHOR_NAME=Jane Doe"}}, []string{"tmux", "new-session", "-A", "-s", "api", "-e", "GIT_AUTHOR_NAME=Jane Doe"}},
-		{"passthrough joined", "api", nil, Command{Dir: "/home/u/api", Argv: []string{"claude", "--model", "opus"}}, []string{"tmux", "new-session", "-A", "-s", "api", "-c", "/home/u/api", "claude --model opus"}},
+		{"default shell no command", "api", nil, Command{}, []string{"tmux", "new-session", "-A", "-s", "api"}, false},
+		{"with dir", "api", nil, Command{Dir: "/home/u/api"}, []string{"tmux", "new-session", "-A", "-s", "api", "-c", "/home/u/api"}, false},
+		{"a '#' in the dir is no format", "api", nil, Command{Dir: "dev/p#(id>T)C#"}, []string{"tmux", "new-session", "-A", "-s", "api", "-c", "dev/p##(id>T)C##"}, false},
+		{"with env", "api", nil, Command{Env: vars("GIT_AUTHOR_NAME", "Jane Doe", "A", "1")}, []string{"tmux", "new-session", "-A", "-s", "api", "-e", "GIT_AUTHOR_NAME=Jane Doe", "-e", "A=1"}, false},
+		{"command joined", "api", nil, Command{Dir: "/home/u/api", Args: []string{"claude", "--model", "opus"}}, []string{"tmux", "new-session", "-A", "-s", "api", "-c", "/home/u/api", "claude --model opus"}, false},
+		{"secret variable refused", "api", nil, Command{Env: env.New(env.Pair{Key: "A", Value: env.Plain("1")}, env.Pair{Key: "ANTHROPIC_API_KEY", Value: env.Secret(secret.FromString("sk-ant-secret"))})}, nil, true},
+		{"key with a space refused", "api", nil, Command{Env: vars("A B", "1")}, nil, true},
+		{"key with a '=' refused", "api", nil, Command{Env: vars("A=B", "1")}, nil, true},
 		{
 			"session options follow the command",
 			"api", []TmuxOption{WithSessionOptions(tags...)},
-			Command{Dir: "dev/api", Argv: []string{"htop"}},
+			Command{Dir: "dev/api", Args: []string{"htop"}},
 			[]string{"tmux", "new-session", "-A", "-s", "api", "-c", "dev/api", "htop", ";", "set-option", "-t", "=api:", "-qo", "@hermod-mode", "attach", ";", "set-option", "-t", "=api:", "-qo", "@hermod-dir", "dev/my api"},
+			false,
 		},
 		{
 			"detached start",
 			"hermod-x", []TmuxOption{Detached(), WithSessionOptions(tags[0])},
-			Command{Argv: []string{"claude"}},
+			Command{Args: []string{"claude"}},
 			[]string{"tmux", "new-session", "-d", "-s", "hermod-x", "claude", ";", "set-option", "-t", "=hermod-x:", "-qo", "@hermod-mode", "attach"},
+			false,
 		},
 		{
 			"options target the name tmux stores",
 			"dev.api:2", []TmuxOption{WithSessionOptions(tags[0])},
 			Command{},
 			[]string{"tmux", "new-session", "-A", "-s", "dev.api:2", ";", "set-option", "-t", "=dev_api_2:", "-qo", "@hermod-mode", "attach"},
+			false,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			inner := &recShell{}
-			NewTmux(inner, tc.sess, tc.opts...).Run(context.Background(), tc.in)
-			if !reflect.DeepEqual(inner.got.Argv, tc.want) {
-				t.Errorf("argv = %q, want %q", inner.got.Argv, tc.want)
+			inner := &recExecutor{}
+			err := NewTmux(inner, tc.sess, tc.opts...).Exec(context.Background(), tc.in).Wait()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Wait() = %v, want an error: %v", err, tc.wantErr)
+			}
+			if tc.wantErr && inner.calls != 0 {
+				t.Fatalf("refused command handed in: %q", inner.got.Args)
+			}
+			if !reflect.DeepEqual(inner.got.Args, tc.want) {
+				t.Errorf("args = %q, want %q", inner.got.Args, tc.want)
+			}
+			if inner.got.Dir != "" || inner.got.Env.Len() != 0 {
+				t.Errorf("dir and env handed in as well: dir=%q env=%v", inner.got.Dir, inner.got.Env)
+			}
+		})
+	}
+}
+
+func TestLoginRewrite(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      Command
+		want    []string
+		wantDir string
+	}{
+		{"empty command untouched", Command{Dir: "/home/u/api"}, nil, "/home/u/api"},
+		{"single word wrapped", Command{Args: []string{"claude"}}, []string{"sh", "-c", `exec "$SHELL" -lc "$1"`, "sh", "claude"}, ""},
+		{"flags preserved in one word", Command{Args: []string{"claude", "--model", "opus"}}, []string{"sh", "-c", `exec "$SHELL" -lc "$1"`, "sh", "claude --model opus"}, ""},
+		{"inner spaces stay quoted", Command{Args: []string{"claude", "-p", "hi there"}}, []string{"sh", "-c", `exec "$SHELL" -lc "$1"`, "sh", "claude -p 'hi there'"}, ""},
+		{"dir kept for the wrapper inside", Command{Dir: "dev/api", Args: []string{"claude"}}, []string{"sh", "-c", `exec "$SHELL" -lc "$1"`, "sh", "claude"}, "dev/api"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inner := &recExecutor{}
+			NewLogin(inner).Exec(context.Background(), tc.in)
+			if !reflect.DeepEqual(inner.got.Args, tc.want) {
+				t.Errorf("args = %q, want %q", inner.got.Args, tc.want)
+			}
+			if inner.got.Dir != tc.wantDir {
+				t.Errorf("dir = %q, want %q", inner.got.Dir, tc.wantDir)
+			}
+		})
+	}
+}
+
+// TestNesting asserts each stack of wrappers hands one command line to the
+// leaf, and that a dry-run leaf under the same stack prints that line.
+func TestNesting(t *testing.T) {
+	cases := []struct {
+		name    string
+		stack   func(leaf Executor) Executor
+		in      Command
+		want    []string
+		plan    string
+		wantErr bool
+	}{
+		{
+			"tmux over ssh, no command",
+			func(leaf Executor) Executor { return NewTmux(NewSSH(leaf, "prod", WithTty()), "api") },
+			Command{Dir: "/home/u/api"},
+			[]string{"ssh", "-t", "prod", "tmux new-session -A -s api -c /home/u/api"},
+			"ssh -t prod 'tmux new-session -A -s api -c /home/u/api'\n",
+			false,
+		},
+		{
+			"tmux over ssh with identity",
+			func(leaf Executor) Executor { return NewTmux(NewSSH(leaf, "prod", WithTty()), "api") },
+			Command{Dir: "/home/u/api", Env: vars("GIT_AUTHOR_NAME", "Jane Doe"), Args: []string{"claude", "--model", "opus"}},
+			[]string{"ssh", "-t", "prod", "tmux new-session -A -s api -c /home/u/api -e 'GIT_AUTHOR_NAME=Jane Doe' 'claude --model opus'"},
+			`ssh -t prod 'tmux new-session -A -s api -c /home/u/api -e '\''GIT_AUTHOR_NAME=Jane Doe'\'' '\''claude --model opus'\'''` + "\n",
+			false,
+		},
+		{
+			"login over tmux over ssh",
+			func(leaf Executor) Executor { return NewLogin(NewTmux(NewSSH(leaf, "prod"), "api", Detached())) },
+			Command{Args: []string{"claude"}},
+			[]string{"ssh", "prod", `tmux new-session -d -s api 'sh -c '\''exec "$SHELL" -lc "$1"'\'' sh claude'`},
+			`ssh prod 'tmux new-session -d -s api '\''sh -c '\''\'\'''\''exec "$SHELL" -lc "$1"'\''\'\'''\'' sh claude'\'''` + "\n",
+			false,
+		},
+		{
+			"login over ssh",
+			func(leaf Executor) Executor { return NewLogin(NewSSH(leaf, "prod")) },
+			Command{Args: []string{"true"}},
+			[]string{"ssh", "prod", `sh -c 'exec "$SHELL" -lc "$1"' sh true`},
+			`ssh prod 'sh -c '\''exec "$SHELL" -lc "$1"'\'' sh true'` + "\n",
+			false,
+		},
+		{
+			"ssh with remote dir",
+			func(leaf Executor) Executor { return NewSSH(leaf, "prod") },
+			Command{Dir: "/home/u/api", Args: []string{"ls"}},
+			[]string{"ssh", "prod", "cd /home/u/api && ls"},
+			"ssh prod 'cd /home/u/api && ls'\n",
+			false,
+		},
+		{
+			"login over ssh with dir and env",
+			func(leaf Executor) Executor { return NewLogin(NewSSH(leaf, "prod")) },
+			Command{Dir: "/srv", Env: vars("A", "1"), Args: []string{"true"}},
+			[]string{"ssh", "prod", `cd /srv && A=1 sh -c 'exec "$SHELL" -lc "$1"' sh true`},
+			`ssh prod 'cd /srv && A=1 sh -c '\''exec "$SHELL" -lc "$1"'\'' sh true'` + "\n",
+			false,
+		},
+		{
+			"tmux over ssh refuses a secret",
+			func(leaf Executor) Executor { return NewTmux(NewSSH(leaf, "prod", WithTty()), "api") },
+			Command{Env: secretVar("ANTHROPIC_API_KEY", "sk-ant-secret"), Args: []string{"claude"}},
+			nil,
+			"",
+			true,
+		},
+		{
+			"login over ssh with dir, no command",
+			func(leaf Executor) Executor { return NewLogin(NewSSH(leaf, "prod")) },
+			Command{Dir: "/srv"},
+			[]string{"ssh", "prod", "cd /srv"},
+			"ssh prod 'cd /srv'\n",
+			false,
+		},
+		{
+			"login over ssh refuses a bad key",
+			func(leaf Executor) Executor { return NewLogin(NewSSH(leaf, "prod")) },
+			Command{Env: vars("A;B", "1"), Args: []string{"ls"}},
+			nil,
+			"",
+			true,
+		},
+		{
+			"tmux over ssh refuses a bad key",
+			func(leaf Executor) Executor { return NewTmux(NewSSH(leaf, "prod"), "api") },
+			Command{Env: vars("A B", "1")},
+			nil,
+			"",
+			true,
+		},
+		{
+			"login over ssh refuses a secret",
+			func(leaf Executor) Executor { return NewLogin(NewSSH(leaf, "prod")) },
+			Command{Env: secretVar("ANTHROPIC_API_KEY", "sk-ant-secret"), Args: []string{"claude"}},
+			nil,
+			"",
+			true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recExecutor{}
+			if err := tc.stack(rec).Exec(context.Background(), tc.in).Wait(); (err != nil) != tc.wantErr {
+				t.Fatalf("Wait() = %v, want an error: %v", err, tc.wantErr)
+			}
+			if !reflect.DeepEqual(rec.got.Args, tc.want) {
+				t.Errorf("args = %q, want %q", rec.got.Args, tc.want)
+			}
+			var plan bytes.Buffer
+			if err := tc.stack(NewDryRun(&plan)).Exec(context.Background(), tc.in).Wait(); (err != nil) != tc.wantErr {
+				t.Fatalf("dry run: %v, want an error: %v", err, tc.wantErr)
+			}
+			if plan.String() != tc.plan {
+				t.Errorf("plan = %q, want %q", plan.String(), tc.plan)
+			}
+		})
+	}
+}
+
+func TestFormat(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  Command
+		want string
+	}{
+		{"plain args", Command{Args: []string{"mutagen", "sync", "list"}}, "mutagen sync list"},
+		{"quotes arg with space", Command{Args: []string{"echo", "hello world"}}, "echo 'hello world'"},
+		{"env prefix quoted value", Command{Args: []string{"git", "commit"}, Env: vars("GIT_AUTHOR_NAME", "Jane Doe")}, "GIT_AUTHOR_NAME='Jane Doe' git commit"},
+		{"safe path unquoted", Command{Args: []string{"ls"}, Dir: "/home/u/api"}, "cd /home/u/api && ls"},
+		{"dir env and args", Command{Args: []string{"git", "commit"}, Dir: "/home/u/api", Env: vars("K", "v")}, "cd /home/u/api && K=v git commit"},
+		{"single quote in value", Command{Args: []string{"echo", "it's"}}, `echo 'it'\''s'`},
+		{
+			"secret masked",
+			Command{Args: []string{"claude"}, Env: env.New(env.Pair{Key: "ANTHROPIC_API_KEY", Value: env.Secret(secret.FromString("sk-ant-secret"))})},
+			"ANTHROPIC_API_KEY='secret.Token(redacted)' claude",
+		},
+		{"dir without a command", Command{Dir: "/srv"}, "cd /srv"},
+		{"env without a command", Command{Env: vars("A", "1")}, "A=1"},
+		{"dir and env without a command", Command{Dir: "/srv", Env: vars("A", "1")}, "cd /srv && A=1"},
+		{"empty", Command{}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := format(tc.cmd); got != tc.want {
+				t.Errorf("format() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// failingWriter fails every write.
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestDryRunPrintsAndRunsNothing(t *testing.T) {
+	errPlan := errors.New("plan closed")
+	cases := []struct {
+		name    string
+		plan    io.Writer
+		cmd     Command
+		want    string
+		wantErr error
+	}{
+		{"side effect printed", &bytes.Buffer{}, Command{Args: []string{"mutagen", "sync", "terminate", "api"}}, "mutagen sync terminate api\n", nil},
+		{"attach printed not run", &bytes.Buffer{}, Command{Args: []string{"ssh", "-t", "prod", "tmux", "attach"}}, "ssh -t prod tmux attach\n", nil},
+		{"plan that fails is the result", failingWriter{errPlan}, Command{Args: []string{"true"}}, "", errPlan},
+		{"key that is no shell name refused, nothing printed", &bytes.Buffer{}, Command{Args: []string{"ls"}, Env: vars("A;B", "1")}, "", errNotAName},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ex := NewDryRun(tc.plan).Exec(context.Background(), tc.cmd)
+			if _, err := ex.Stdin.Write([]byte("ignored")); err != nil {
+				t.Errorf("stdin write: %v", err)
+			}
+			if out, _ := io.ReadAll(ex.Stdout); len(out) != 0 {
+				t.Errorf("stdout = %q, want empty (nothing executed)", out)
+			}
+			if err := ex.Wait(); !errors.Is(err, tc.wantErr) {
+				t.Errorf("Wait() = %v, want %v", err, tc.wantErr)
+			}
+			if buf, ok := tc.plan.(*bytes.Buffer); ok && buf.String() != tc.want {
+				t.Errorf("printed %q, want %q", buf.String(), tc.want)
+			}
+		})
+	}
+}
+
+func TestRunCollects(t *testing.T) {
+	cases := []struct {
+		name       string
+		cmd        Command
+		wantStdout string
+		wantStderr string
+		wantCode   int // -1: no exit code, the command succeeded
+	}{
+		{"printf no newline", Command{Args: []string{"printf", "hello"}}, "hello", "", -1},
+		{"echo with newline", Command{Args: []string{"echo", "sync-ok"}}, "sync-ok\n", "", -1},
+		{"stderr collected separately", Command{Args: []string{"sh", "-c", "echo out; echo err >&2"}}, "out\n", "err\n", -1},
+		{"variables added", Command{Args: []string{"sh", "-c", "echo $HERMOD_TEST"}, Env: vars("HERMOD_TEST", "carried")}, "carried\n", "", -1},
+		{"secret variable revealed to the process", Command{Args: []string{"sh", "-c", "echo $HERMOD_TEST"}, Env: env.New(env.Pair{Key: "HERMOD_TEST", Value: env.Secret(secret.FromString("hidden"))})}, "hidden\n", "", -1},
+		{"directory", Command{Args: []string{"pwd"}, Dir: "/"}, "/\n", "", -1},
+		{"no stdin reads empty", Command{Args: []string{"cat"}}, "", "", -1},
+		{"given stdin read", Command{Args: []string{"cat"}, Stdin: strings.NewReader("given")}, "given", "", -1},
+		{"exit code", Command{Args: []string{"sh", "-c", "echo bad >&2; exit 7"}}, "", "bad\n", 7},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Run(context.Background(), NewLocal(), tc.cmd)
+			code, ok := ExitCode(err)
+			if !ok {
+				code = -1
+			}
+			if code != tc.wantCode || (code == -1 && err != nil) {
+				t.Errorf("err = %v (code %d), want code %d", err, code, tc.wantCode)
+			}
+			if out != (Output{Stdout: tc.wantStdout, Stderr: tc.wantStderr}) {
+				t.Errorf("Output = %+v, want stdout %q, stderr %q", out, tc.wantStdout, tc.wantStderr)
+			}
+		})
+	}
+}
+
+// TestExecutionPipes asserts the streams a Command leaves nil are pipes on its
+// Execution, and the streams it gives are used as they are.
+func TestExecutionPipes(t *testing.T) {
+	cases := []struct {
+		name       string
+		script     string
+		input      string
+		giveStdout bool
+		sequential bool // stdout read to its end before stderr is read
+		wantStdout string
+		wantStderr string
+	}{
+		{"stdin pipe to stdout pipe", "cat", "hello\n", false, false, "hello\n", ""},
+		{"stdin pipe to stderr pipe", "cat >&2", "line\n", false, false, "", "line\n"},
+		{"stdout given, stderr piped", "echo out; echo err >&2", "", true, false, "out\n", "err\n"},
+		{"each pipe ends on its own", "echo out; echo err >&2", "", false, true, "out\n", "err\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var given bytes.Buffer
+			cmd := Command{Args: []string{"sh", "-c", tc.script}}
+			if tc.giveStdout {
+				cmd.Stdout = &given
+			}
+			ex := NewLocal().Exec(context.Background(), cmd)
+			if (ex.Stdout == nil) != tc.giveStdout {
+				t.Fatalf("Stdout pipe = %v, want one only for a nil stream", ex.Stdout)
+			}
+			if _, err := io.WriteString(ex.Stdin, tc.input); err != nil {
+				t.Fatalf("write stdin: %v", err)
+			}
+			if err := ex.Stdin.Close(); err != nil {
+				t.Fatalf("close stdin: %v", err)
+			}
+			var stdout, stderr []byte
+			readStdout := func() {
+				if ex.Stdout != nil {
+					stdout, _ = io.ReadAll(ex.Stdout)
+				}
+			}
+			readStderr := func() { stderr, _ = io.ReadAll(ex.Stderr) }
+			var wg sync.WaitGroup
+			if tc.sequential {
+				wg.Go(func() { readStdout(); readStderr() })
+			} else {
+				wg.Go(readStdout)
+				wg.Go(readStderr)
+			}
+			if !waitWithin(&wg, 2*time.Second) {
+				t.Fatal("pipes did not end")
+			}
+			if err := ex.Wait(); err != nil {
+				t.Fatalf("Wait() = %v", err)
+			}
+			if tc.giveStdout {
+				stdout = given.Bytes()
+			}
+			if string(stdout) != tc.wantStdout || string(stderr) != tc.wantStderr {
+				t.Errorf("stdout, stderr = %q, %q, want %q, %q", stdout, stderr, tc.wantStdout, tc.wantStderr)
+			}
+		})
+	}
+}
+
+// TestExecutionThatNeverRan asserts a command that cannot start, and one no
+// Executor returned, report an error, and the pipes of one that cannot start
+// end at once.
+func TestExecutionThatNeverRan(t *testing.T) {
+	cases := []struct {
+		name string
+		ex   func() Execution
+	}{
+		{"no program", func() Execution { return NewLocal().Exec(context.Background(), Command{}) }},
+		{"program not found", func() Execution {
+			return NewLocal().Exec(context.Background(), Command{Args: []string{"/nonexistent/hermod-test-program"}})
+		}},
+		{"zero execution", func() Execution { return Execution{} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ex := tc.ex()
+			for _, r := range []io.Reader{ex.Stdout, ex.Stderr} {
+				if r == nil {
+					continue
+				}
+				if out, err := io.ReadAll(r); len(out) != 0 || err != nil {
+					t.Errorf("pipe = %q, %v, want empty", out, err)
+				}
+			}
+			if err := ex.Wait(); err == nil {
+				t.Error("Wait() = nil, want an error")
+			}
+		})
+	}
+}
+
+func TestExitCode(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		wantCode int
+		wantOK   bool
+	}{
+		{"no error", nil, 0, false},
+		{"not a process error", errors.New("plain"), 0, false},
+		{"process exit", exitError(3), 3, true},
+		{"wrapped process exit", errors.Join(errors.New("context"), exitError(5)), 5, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, ok := ExitCode(tc.err)
+			if code != tc.wantCode || ok != tc.wantOK {
+				t.Errorf("ExitCode() = %d, %v, want %d, %v", code, ok, tc.wantCode, tc.wantOK)
+			}
+		})
+	}
+}
+
+// exitError carries an exit code, as a fake Executor's result may.
+type exitError int
+
+func (e exitError) Error() string { return "exit" }
+func (e exitError) ExitCode() int { return int(e) }
+
+// TestWrappersCarryStreams asserts every wrapper hands the command's streams
+// and interrupt through to the leaf, so a stream given at the top of a stack
+// is the one the child runs with.
+func TestWrappersCarryStreams(t *testing.T) {
+	cases := []struct {
+		name  string
+		stack func(inner Executor) Executor
+	}{
+		{"ssh", func(in Executor) Executor { return NewSSH(in, "prod") }},
+		{"tmux", func(in Executor) Executor { return NewTmux(in, "api") }},
+		{"login", func(in Executor) Executor { return NewLogin(in) }},
+		{"login over ssh", func(in Executor) Executor { return NewLogin(NewSSH(in, "prod")) }},
+		{"full attach stack", func(in Executor) Executor { return NewLogin(NewTmux(NewSSH(in, "prod", WithTty()), "api")) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stdin := strings.NewReader("in")
+			var stdout, stderr bytes.Buffer
+			cmd := Command{Args: []string{"claude", "auth", "status"}, Stdin: stdin, Stdout: &stdout, Stderr: &stderr, Interrupt: syscall.SIGTERM}
+			inner := &recExecutor{}
+			tc.stack(inner).Exec(context.Background(), cmd)
+			if inner.got.Stdin != cmd.Stdin || inner.got.Stdout != cmd.Stdout || inner.got.Stderr != cmd.Stderr {
+				t.Errorf("streams = %v, %v, %v, want %v, %v, %v",
+					inner.got.Stdin, inner.got.Stdout, inner.got.Stderr, cmd.Stdin, cmd.Stdout, cmd.Stderr)
+			}
+			if inner.got.Interrupt != cmd.Interrupt {
+				t.Errorf("Interrupt = %v, want %v", inner.got.Interrupt, cmd.Interrupt)
 			}
 		})
 	}
@@ -136,236 +593,18 @@ func TestNoInputIsEmpty(t *testing.T) {
 	}
 }
 
-func TestLoginShellRewrite(t *testing.T) {
-	cases := []struct {
-		name string
-		in   Command
-		want []string
-	}{
-		{"empty command untouched", Command{Dir: "/home/u/api"}, nil},
-		{"single word wrapped", Command{Argv: []string{"claude"}}, []string{"sh", "-c", `exec "$SHELL" -lc "$1"`, "sh", "claude"}},
-		{"flags preserved in one word", Command{Argv: []string{"claude", "--model", "opus"}}, []string{"sh", "-c", `exec "$SHELL" -lc "$1"`, "sh", "claude --model opus"}},
-		{"inner spaces stay quoted", Command{Argv: []string{"claude", "-p", "hi there"}}, []string{"sh", "-c", `exec "$SHELL" -lc "$1"`, "sh", "claude -p 'hi there'"}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			inner := &recShell{}
-			NewLoginShell(inner).Run(context.Background(), tc.in)
-			if !reflect.DeepEqual(inner.got.Argv, tc.want) {
-				t.Errorf("argv = %q, want %q", inner.got.Argv, tc.want)
-			}
-		})
-	}
-}
-
-// TestAttachStack asserts the full interactive stack (Tmux → SSH → leaf) yields
-// one copy-pasteable ssh command line.
-func TestAttachStack(t *testing.T) {
-	cases := []struct {
-		name    string
-		host    string
-		session string
-		in      Command
-		want    []string
-	}{
-		{
-			"default shell",
-			"prod", "api",
-			Command{Dir: "/home/u/api"},
-			[]string{"ssh", "-t", "prod", "tmux new-session -A -s api -c /home/u/api"},
-		},
-		{
-			"passthrough with identity",
-			"prod", "api",
-			Command{Dir: "/home/u/api", Env: []string{"GIT_AUTHOR_NAME=Jane Doe"}, Argv: []string{"claude", "--model", "opus"}},
-			[]string{"ssh", "-t", "prod", "tmux new-session -A -s api -c /home/u/api -e 'GIT_AUTHOR_NAME=Jane Doe' 'claude --model opus'"},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			inner := &recShell{}
-			stack := NewTmux(NewSSH(inner, tc.host, WithTty()), tc.session)
-			stack.Run(context.Background(), tc.in)
-			if !reflect.DeepEqual(inner.got.Argv, tc.want) {
-				t.Errorf("argv = %q, want %q", inner.got.Argv, tc.want)
-			}
-		})
-	}
-}
-
-func TestFormat(t *testing.T) {
-	cases := []struct {
-		name string
-		cmd  Command
-		want string
-	}{
-		{"plain argv", Command{Argv: []string{"mutagen", "sync", "list"}}, "mutagen sync list"},
-		{"quotes arg with space", Command{Argv: []string{"echo", "hello world"}}, "echo 'hello world'"},
-		{"env prefix quoted value", Command{Argv: []string{"git", "commit"}, Env: []string{"GIT_AUTHOR_NAME=Jane Doe"}}, "GIT_AUTHOR_NAME='Jane Doe' git commit"},
-		{"safe path unquoted", Command{Argv: []string{"ls"}, Dir: "/home/u/api"}, "cd /home/u/api && ls"},
-		{"dir env and argv", Command{Argv: []string{"git", "commit"}, Dir: "/home/u/api", Env: []string{"K=v"}}, "cd /home/u/api && K=v git commit"},
-		{"single quote in value", Command{Argv: []string{"echo", "it's"}}, `echo 'it'\''s'`},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := format(tc.cmd); got != tc.want {
-				t.Errorf("format() = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestDryRunLeafPrintsAndDoesNotExecute(t *testing.T) {
-	cases := []struct {
-		name string
-		cmd  Command
-		want string
-	}{
-		{"side effect printed", Command{Argv: []string{"mutagen", "sync", "terminate", "api"}}, "mutagen sync terminate api\n"},
-		{"attach printed not run", Command{Argv: []string{"ssh", "-t", "prod", "tmux", "attach"}}, "ssh -t prod tmux attach\n"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			res, err := NewDryRun(&buf).Run(context.Background(), tc.cmd)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if res.Stdout != "" {
-				t.Errorf("Stdout = %q, want empty (nothing executed)", res.Stdout)
-			}
-			if got := buf.String(); got != tc.want {
-				t.Errorf("printed %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestSubprocessCapture(t *testing.T) {
+// TestInterrupt asserts a cancelled command given an Interrupt gets that
+// signal and the time to act on it, and one without is killed at once.
+func TestInterrupt(t *testing.T) {
 	cases := []struct {
 		name       string
-		argv       []string
-		wantStdout string
-		wantStderr string
-	}{
-		{"printf no newline", []string{"printf", "hello"}, "hello", ""},
-		{"echo with newline", []string{"echo", "sync-ok"}, "sync-ok\n", ""},
-		{"stderr captured separately", []string{"sh", "-c", "echo out; echo err >&2"}, "out\n", "err\n"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			res, err := runSubprocess(context.Background(), Command{Argv: tc.argv, Capture: true})
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if res.Stdout != tc.wantStdout {
-				t.Errorf("Stdout = %q, want %q", res.Stdout, tc.wantStdout)
-			}
-			if res.Stderr != tc.wantStderr {
-				t.Errorf("Stderr = %q, want %q", res.Stderr, tc.wantStderr)
-			}
-		})
-	}
-}
-
-func TestSubprocessEnv(t *testing.T) {
-	cases := []struct {
-		name string
-		env  []string
-		want string
-	}{
-		{"exported var visible", []string{"HERMOD_TEST=carried"}, "carried\n"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			res, err := runSubprocess(context.Background(), Command{
-				Argv:    []string{"sh", "-c", "echo $HERMOD_TEST"},
-				Env:     tc.env,
-				Capture: true,
-			})
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if res.Stdout != tc.want {
-				t.Errorf("Stdout = %q, want %q", res.Stdout, tc.want)
-			}
-		})
-	}
-}
-
-func TestSubprocessEmptyArgv(t *testing.T) {
-	cases := []struct {
-		name string
-		argv []string
-	}{
-		{"nil argv", nil},
-		{"empty argv", []string{}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := runSubprocess(context.Background(), Command{Argv: tc.argv})
-			if err == nil {
-				t.Fatal("expected error for empty argv, got nil")
-			}
-			if !strings.Contains(err.Error(), "argv") {
-				t.Errorf("error = %v, want it to mention argv", err)
-			}
-		})
-	}
-}
-
-// TestDecoratorsCarryStreams asserts every transport hands the command's streams
-// and capture mode through to the leaf, so a stream given at the top of a stack
-// is the one the child runs with.
-func TestDecoratorsCarryStreams(t *testing.T) {
-	cases := []struct {
-		name    string
-		stack   func(inner Shell) Shell
-		capture bool
-	}{
-		{"ssh", func(in Shell) Shell { return NewSSH(in, "prod") }, false},
-		{"tmux", func(in Shell) Shell { return NewTmux(in, "api") }, false},
-		{"login shell", func(in Shell) Shell { return NewLoginShell(in) }, false},
-		{"login over ssh", func(in Shell) Shell { return NewLoginShell(NewSSH(in, "prod")) }, false},
-		{"full attach stack", func(in Shell) Shell { return NewLoginShell(NewTmux(NewSSH(in, "prod", WithTty()), "api")) }, false},
-		{"capture through ssh", func(in Shell) Shell { return NewSSH(in, "prod") }, true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			stdin := strings.NewReader("in")
-			var stdout, stderr bytes.Buffer
-			cmd := Command{Argv: []string{"claude", "auth", "status"}, Capture: tc.capture, Stdin: stdin, Interrupt: syscall.SIGTERM}
-			if !tc.capture {
-				cmd.Stdout, cmd.Stderr = &stdout, &stderr
-			}
-			inner := &recShell{}
-			tc.stack(inner).Run(context.Background(), cmd)
-			if inner.got.Stdin != cmd.Stdin || inner.got.Stdout != cmd.Stdout || inner.got.Stderr != cmd.Stderr {
-				t.Errorf("streams = %v, %v, %v, want %v, %v, %v",
-					inner.got.Stdin, inner.got.Stdout, inner.got.Stderr, cmd.Stdin, cmd.Stdout, cmd.Stderr)
-			}
-			if inner.got.Capture != tc.capture {
-				t.Errorf("Capture = %v, want %v", inner.got.Capture, tc.capture)
-			}
-			if inner.got.Interrupt != cmd.Interrupt {
-				t.Errorf("Interrupt = %v, want %v", inner.got.Interrupt, cmd.Interrupt)
-			}
-		})
-	}
-}
-
-// TestSubprocessInterrupt asserts a cancelled command given an Interrupt gets
-// that signal and the time to act on it, and one without is killed at once.
-func TestSubprocessInterrupt(t *testing.T) {
-	const script = `trap 'echo interrupted; exit 3' TERM; echo ready; while :; do sleep 0.05; done`
-	cases := []struct {
-		name       string
+		script     string
 		interrupt  os.Signal
 		wantStdout string
 		wantCode   int // -1: killed by a signal
 	}{
-		{"interrupted", syscall.SIGTERM, "ready\ninterrupted\n", 3},
-		{"killed", nil, "ready\n", -1},
+		{"interrupted", `trap 'echo interrupted; exit 3' TERM; echo ready; while :; do sleep 0.05; done`, syscall.SIGTERM, "ready\ninterrupted\n", 3},
+		{"killed", `trap 'echo interrupted; exit 3' TERM; echo ready; while :; do sleep 0.05; done`, nil, "ready\n", -1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -376,7 +615,7 @@ func TestSubprocessInterrupt(t *testing.T) {
 				<-out.ready
 				cancel()
 			}()
-			_, err := runSubprocess(ctx, Command{Argv: []string{"sh", "-c", script}, Stdin: NoInput, Stdout: out, Interrupt: tc.interrupt})
+			err := NewLocal().Exec(ctx, Command{Args: []string{"sh", "-c", tc.script}, Stdin: NoInput, Stdout: out, Stderr: io.Discard, Interrupt: tc.interrupt}).Wait()
 			code, ok := ExitCode(err)
 			if !ok || code != tc.wantCode {
 				t.Errorf("exit = %v (%d), want code %d", err, code, tc.wantCode)
@@ -409,107 +648,22 @@ func (w *signalOnWrite) String() string {
 	return w.buf.String()
 }
 
-func TestSubprocessExplicitStreams(t *testing.T) {
-	cases := []struct {
-		name       string
-		script     string
-		stdin      string
-		wantStdout string
-		wantStderr string
-	}{
-		{"stdin to stdout", "cat", "hello\n", "hello\n", ""},
-		{"stdin to stderr", "cat >&2", "line\n", "", "line\n"},
-		{"both streams", "echo out; echo err >&2", "", "out\n", "err\n"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			res, err := runSubprocess(context.Background(), Command{
-				Argv:   []string{"sh", "-c", tc.script},
-				Stdin:  strings.NewReader(tc.stdin),
-				Stdout: &stdout,
-				Stderr: &stderr,
-			})
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if stdout.String() != tc.wantStdout || stderr.String() != tc.wantStderr {
-				t.Errorf("stdout, stderr = %q, %q, want %q, %q", stdout.String(), stderr.String(), tc.wantStdout, tc.wantStderr)
-			}
-			if res != (Result{}) {
-				t.Errorf("Result = %+v, want empty: nothing is captured", res)
-			}
-		})
-	}
-}
-
-func TestSubprocessCaptureReadsStdin(t *testing.T) {
-	cases := []struct {
-		name  string
-		stdin io.Reader
-		want  string
-	}{
-		{"explicit stdin", strings.NewReader("given"), "given"},
-		{"no stdin reads empty", nil, ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			res, err := runSubprocess(context.Background(), Command{Argv: []string{"cat"}, Capture: true, Stdin: tc.stdin})
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if res.Stdout != tc.want {
-				t.Errorf("Stdout = %q, want %q", res.Stdout, tc.want)
-			}
-		})
-	}
-}
-
-// TestSubprocessCaptureRejectsStreams asserts the contradictory command fails
-// before anything runs.
-func TestSubprocessCaptureRejectsStreams(t *testing.T) {
-	cases := []struct {
-		name   string
-		stdout io.Writer
-		stderr io.Writer
-	}{
-		{"stdout given", &bytes.Buffer{}, nil},
-		{"stderr given", nil, &bytes.Buffer{}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			marker := filepath.Join(t.TempDir(), "ran")
-			_, err := runSubprocess(context.Background(), Command{
-				Argv:    []string{"touch", marker},
-				Capture: true,
-				Stdout:  tc.stdout,
-				Stderr:  tc.stderr,
-			})
-			if err == nil {
-				t.Fatal("expected an error, got nil")
-			}
-			if _, statErr := os.Stat(marker); !errors.Is(statErr, fs.ErrNotExist) {
-				t.Errorf("command ran: stat %s = %v", marker, statErr)
-			}
-		})
-	}
-}
-
-// TestSubprocessReturnsDespiteALeftChild asserts a command returns soon after it
-// ends or is cancelled even while a child it left behind holds its output open,
-// and that a command which succeeded still reports success.
-func TestSubprocessReturnsDespiteALeftChild(t *testing.T) {
+// TestReturnsDespiteALeftChild asserts a command returns soon after it ends or
+// is cancelled even while a child it left behind holds its output open, and
+// that a command which succeeded still reports success.
+func TestReturnsDespiteALeftChild(t *testing.T) {
 	cases := []struct {
 		name    string
-		argv    []string
-		capture bool
+		args    []string
+		piped   bool
 		timeout time.Duration // 0: never cancelled
 		within  time.Duration // well under the left child's life
 		wantErr bool
 	}{
-		{"cancelled, captured", []string{"sh", "-c", "sleep 3 & sleep 3"}, true, 100 * time.Millisecond, 2 * time.Second, true},
-		{"cancelled, streamed", []string{"sh", "-c", "sleep 3 & sleep 3"}, false, 100 * time.Millisecond, 2 * time.Second, true},
-		{"succeeded, captured", []string{"sh", "-c", "sleep 3 & echo done"}, true, 0, 2 * time.Second, false},
+		{"cancelled, collected", []string{"sh", "-c", "sleep 3 & sleep 3"}, false, 100 * time.Millisecond, 2 * time.Second, true},
+		{"cancelled, piped", []string{"sh", "-c", "sleep 3 & sleep 3"}, true, 100 * time.Millisecond, 2 * time.Second, true},
+		{"succeeded, collected", []string{"sh", "-c", "sleep 3 & echo done"}, false, 0, 2 * time.Second, false},
+		{"succeeded, piped", []string{"sh", "-c", "sleep 3 & echo done"}, true, 0, 2 * time.Second, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -519,17 +673,76 @@ func TestSubprocessReturnsDespiteALeftChild(t *testing.T) {
 				ctx, cancel = context.WithTimeout(ctx, tc.timeout)
 				defer cancel()
 			}
-			cmd := Command{Argv: tc.argv, Capture: tc.capture, Stdin: NoInput}
-			if !tc.capture {
-				cmd.Stdout, cmd.Stderr = &bytes.Buffer{}, &bytes.Buffer{}
-			}
+			cmd := Command{Args: tc.args, Stdin: NoInput}
 			start := time.Now()
-			_, err := runSubprocess(ctx, cmd)
+			var err error
+			if tc.piped {
+				ex := NewLocal().Exec(ctx, cmd)
+				var wg sync.WaitGroup
+				wg.Go(func() { _, _ = io.Copy(io.Discard, ex.Stdout) })
+				wg.Go(func() { _, _ = io.Copy(io.Discard, ex.Stderr) })
+				wg.Wait()
+				err = ex.Wait()
+			} else {
+				_, err = Run(ctx, NewLocal(), cmd)
+			}
 			if took := time.Since(start); took > tc.within {
 				t.Errorf("returned after %v, want within %v", took, tc.within)
 			}
 			if (err != nil) != tc.wantErr {
 				t.Errorf("error = %v, want one: %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// waitWithin reports whether wg is done before d passes.
+func waitWithin(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+// TestCancelledWithUnreadPipes asserts a cancelled command returns, and its
+// pipes end, even though the caller stopped reading one of them while the
+// command was still writing to it.
+func TestCancelledWithUnreadPipes(t *testing.T) {
+	cases := []struct {
+		name       string
+		script     string // writes more to stderr than a pipe holds
+		readStdout bool
+		within     time.Duration // well under the command's own life
+	}{
+		{"neither pipe read", "head -c 1000000 /dev/zero >&2; sleep 5", false, 2 * time.Second},
+		{"only stdout read", "echo out; head -c 1000000 /dev/zero >&2; sleep 5", true, 2 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			start := time.Now()
+			ex := NewLocal().Exec(ctx, Command{Args: []string{"sh", "-c", tc.script}, Stdin: NoInput})
+			var wg sync.WaitGroup
+			wg.Go(func() {
+				if tc.readStdout {
+					_, _ = io.Copy(io.Discard, ex.Stdout)
+				}
+				_ = ex.Wait()
+			})
+			if !waitWithin(&wg, tc.within) {
+				t.Fatalf("Wait did not return within %v", tc.within)
+			}
+			wg.Go(func() { _, _ = io.Copy(io.Discard, ex.Stderr) })
+			if !waitWithin(&wg, tc.within-time.Since(start)) {
+				t.Errorf("the unread pipe did not end within %v", tc.within)
 			}
 		})
 	}

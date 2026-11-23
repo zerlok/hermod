@@ -5,41 +5,44 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 	"testing"
 )
 
-const value = "0123456789abcdef"
-
 func TestTokenNeverPrints(t *testing.T) {
+	const value = "0123456789abcdef"
 	tok := FromString(value)
 	cases := []struct {
 		name   string
 		render func() string
+		hidden []string // what the rendering must not contain
+		want   string   // what it must contain
 	}{
-		{"%v", func() string { return fmt.Sprintf("%v", tok) }},
-		{"%+v", func() string { return fmt.Sprintf("%+v", tok) }},
-		{"%#v", func() string { return fmt.Sprintf("%#v", tok) }},
-		{"%s", func() string { return fmt.Sprintf("%s", tok) }},
-		{"%q", func() string { return fmt.Sprintf("%q", tok) }},
-		{"%x", func() string { return fmt.Sprintf("%x", tok) }},
-		{"%X", func() string { return fmt.Sprintf("%X", tok) }},
-		{"pointer %v", func() string { return fmt.Sprintf("%v", &tok) }},
-		{"inside a struct %+v", func() string { return fmt.Sprintf("%+v", struct{ T Token }{tok}) }},
-		{"inside a struct %#v", func() string { return fmt.Sprintf("%#v", struct{ T Token }{tok}) }},
-		{"String", tok.String},
-		{"error wrap", func() string { return fmt.Errorf("bad %v", tok).Error() }},
-		{"JSON", func() string { b, _ := json.Marshal(struct{ T Token }{tok}); return string(b) }},
+		{"%v", func() string { return fmt.Sprintf("%v", tok) }, []string{value}, mask},
+		{"%+v", func() string { return fmt.Sprintf("%+v", tok) }, []string{value}, mask},
+		{"%#v", func() string { return fmt.Sprintf("%#v", tok) }, []string{value}, mask},
+		{"%s", func() string { return fmt.Sprintf("%s", tok) }, []string{value}, mask},
+		{"%q", func() string { return fmt.Sprintf("%q", tok) }, []string{value}, mask},
+		{"%x", func() string { return fmt.Sprintf("%x", tok) }, []string{value, fmt.Sprintf("%x", value)}, mask},
+		{"%X", func() string { return fmt.Sprintf("%X", tok) }, []string{value, fmt.Sprintf("%X", value)}, mask},
+		{"pointer %v", func() string { return fmt.Sprintf("%v", &tok) }, []string{value}, mask},
+		{"inside a struct %+v", func() string { return fmt.Sprintf("%+v", struct{ T Token }{tok}) }, []string{value}, mask},
+		{"inside a struct %#v", func() string { return fmt.Sprintf("%#v", struct{ T Token }{tok}) }, []string{value}, mask},
+		{"String", tok.String, []string{value}, mask},
+		{"error wrap", func() string { return fmt.Errorf("bad %v", tok).Error() }, []string{value}, mask},
+		{"JSON", func() string { b, _ := json.Marshal(struct{ T Token }{tok}); return string(b) }, []string{value}, mask},
+		{"zero token", Token{}.String, nil, "secret.Token(none)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := tc.render()
-			if strings.Contains(got, value) || strings.Contains(got, fmt.Sprintf("%x", value)) {
-				t.Errorf("rendered %q reveals the token", got)
+			for _, h := range tc.hidden {
+				if strings.Contains(got, h) {
+					t.Errorf("rendered %q reveals %q", got, h)
+				}
 			}
-			if !strings.Contains(got, "secret.Token") {
-				t.Errorf("rendered %q does not say a token is there", got)
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("rendered %q, want it to contain %q", got, tc.want)
 			}
 		})
 	}
@@ -115,49 +118,6 @@ func TestTokenEqualAndZero(t *testing.T) {
 			}
 			if got := tc.a.String(); got != tc.wantPrint {
 				t.Errorf("String() = %q, want %q", got, tc.wantPrint)
-			}
-		})
-	}
-}
-
-func TestEnvNeverPrints(t *testing.T) {
-	const credential = "sk-ant-secret"
-	env := NewEnv([]string{"ANTHROPIC_API_KEY=" + credential, "A=1"})
-	cases := []struct {
-		name   string
-		render func() string
-		want   string
-	}{
-		{"%v", func() string { return fmt.Sprintf("%v", env) }, "secret.Env(2 entries)"},
-		{"%#v", func() string { return fmt.Sprintf("%#v", env) }, "secret.Env(2 entries)"},
-		{"%q", func() string { return fmt.Sprintf("%q", env) }, "secret.Env(2 entries)"},
-		{"inside a struct %+v", func() string { return fmt.Sprintf("%+v", struct{ E Env }{env}) }, "{E:secret.Env(2 entries)}"},
-		{"JSON", func() string { b, _ := json.Marshal(struct{ E Env }{env}); return string(b) }, `{"E":"secret.Env(2 entries)"}`},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.render(); got != tc.want {
-				t.Errorf("rendered %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestEnvOperations(t *testing.T) {
-	cases := []struct {
-		name string
-		env  Env
-		want []string
-	}{
-		{"reveal", NewEnv([]string{"A=1", "B=2"}), []string{"A=1", "B=2"}},
-		{"with", NewEnv([]string{"A=1"}).With("B=2"), []string{"A=1", "B=2"}},
-		{"filter by key", NewEnv([]string{"A=1", "B=2", "noequals"}).Filter(func(k, _ string) bool { return k != "A" }), []string{"B=2"}},
-		{"empty", NewEnv(nil), nil},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.env.Reveal(); !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("Reveal() = %q, want %q", got, tc.want)
 			}
 		})
 	}

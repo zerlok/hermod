@@ -5,13 +5,13 @@ import (
 	"strings"
 )
 
-// tmux wraps a command as a persistent tmux window, attaching to the named
-// session if it exists and creating it otherwise (`new-session -A`). The start
-// directory (cmd.Dir) and environment (cmd.Env) are applied via tmux's own -c
-// and -e flags, which take effect only when the session is created. An empty
-// inner argv means "no command": tmux spawns the default shell.
+// tmux wraps a command as a persistent tmux session, attaching to the named
+// session if it exists and creating it otherwise (`new-session -A`). The
+// command's directory and variables become tmux's own -c and -e flags, which
+// take effect only when the session is created. A command with no arguments
+// starts the default shell.
 type tmux struct {
-	inner    Shell
+	inner    Executor
 	session  string
 	detached bool
 	options  []SessionOption
@@ -24,7 +24,7 @@ type SessionOption struct {
 	Value string
 }
 
-// TmuxOption configures a tmux transport at construction.
+// TmuxOption configures a tmux wrapper at construction.
 type TmuxOption func(*tmux)
 
 // Detached creates the session without attaching to it (`new-session -d`), for
@@ -42,7 +42,7 @@ func WithSessionOptions(opts ...SessionOption) TmuxOption {
 }
 
 // NewTmux wraps inner so its command runs in the named tmux session.
-func NewTmux(inner Shell, session string, opts ...TmuxOption) Shell {
+func NewTmux(inner Executor, session string, opts ...TmuxOption) Executor {
 	t := tmux{inner: inner, session: session}
 	for _, o := range opts {
 		o(&t)
@@ -50,24 +50,34 @@ func NewTmux(inner Shell, session string, opts ...TmuxOption) Shell {
 	return t
 }
 
-func (t tmux) Run(ctx context.Context, cmd Command) (Result, error) {
-	argv := []string{"tmux", "new-session"}
+// Exec hands the command inward as a tmux command line. A variable's value
+// is on that line, so a secret one is refused.
+func (t tmux) Exec(ctx context.Context, cmd Command) Execution {
+	if err := refuseSecrets("tmux", cmd); err != nil {
+		return Finished(cmd, err)
+	}
+	// tmux splits each -e entry at its first '=', so a key holding one would
+	// set another variable, and the session's shell reads only shell names.
+	if err := refuseBadKeys("tmux", cmd); err != nil {
+		return Finished(cmd, err)
+	}
+	args := []string{"tmux", "new-session"}
 	if t.detached {
-		argv = append(argv, "-d")
+		args = append(args, "-d")
 	} else {
-		argv = append(argv, "-A")
+		args = append(args, "-A")
 	}
-	argv = append(argv, "-s", t.session)
+	args = append(args, "-s", t.session)
 	if cmd.Dir != "" {
-		argv = append(argv, "-c", formatLiteral(cmd.Dir))
+		args = append(args, "-c", formatLiteral(cmd.Dir))
 	}
-	for _, e := range cmd.Env {
-		argv = append(argv, "-e", e)
+	for _, e := range cmd.Env.Reveal() {
+		args = append(args, "-e", e)
 	}
-	if len(cmd.Argv) > 0 {
-		// Pass the sandbox command as one string so tmux runs it via the shell
-		// and does not mistake the command's own flags for tmux options.
-		argv = append(argv, join(cmd.Argv))
+	if len(cmd.Args) > 0 {
+		// One string, so tmux runs it through the shell and does not take the
+		// command's own flags for its options.
+		args = append(args, join(cmd.Args))
 	}
 	// A lone ";" word separates tmux commands. Each option names its session
 	// (see target): without one, tmux sets it on the session of the client's
@@ -75,10 +85,9 @@ func (t tmux) Run(ctx context.Context, cmd Command) (Result, error) {
 	// an option that is already set from failing the sequence and showing an
 	// error in the client.
 	for _, o := range t.options {
-		argv = append(argv, ";", "set-option", "-t", target(t.session), "-qo", o.Name, o.Value)
+		args = append(args, ";", "set-option", "-t", target(t.session), "-qo", o.Name, o.Value)
 	}
-	// Dir/Env are consumed into the tmux flags above.
-	return t.inner.Run(ctx, cmd.rewrapped(argv))
+	return t.inner.Exec(ctx, cmd.rewrapped(args))
 }
 
 // formatLiteral is s as a tmux format that expands to s itself. tmux expands

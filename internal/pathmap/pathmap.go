@@ -1,8 +1,9 @@
-// Package pathmap translates paths between the local machine and the sandbox.
-// A set of (local root, sandbox root) pairs maps a path by the pair whose root is
-// its longest prefix at a path-segment boundary, and the same mapping applies to
-// every string inside a JSON value. It knows nothing about the programs whose
-// arguments, settings or streams carry the paths.
+// Package pathmap maps paths between the local and the remote workstation. A
+// Map is built from places, each a local root and the remote root it is joined
+// to, and maps a path by the place whose root is its longest prefix at a
+// path-segment boundary, in either direction; the same mapping applies to every
+// string inside a JSON value. It knows nothing about the programs whose
+// arguments, settings or messages carry the paths.
 package pathmap
 
 import (
@@ -15,80 +16,79 @@ import (
 	"strings"
 )
 
-// Pair is one local root and the sandbox root it is mirrored to. Roots are
-// absolute, slash-separated, and taken as written apart from any trailing slash.
-// A relative root would match any string that merely starts with its first
-// segment, such as a branch name or a word of prose in a stream, whereas the
-// paths that programs write into arguments, hook bodies and streams are
+// Place is one local root and the remote root it lies at. Roots are absolute,
+// slash-separated, and taken as written apart from any trailing slash. A
+// relative root would match any string that merely starts with its first
+// segment, such as a branch name or a word of prose in a message, whereas the
+// paths that programs write into arguments, hook bodies and messages are
 // absolute.
-type Pair struct {
-	Local   string
-	Sandbox string
+type Place struct {
+	Local  string
+	Remote string
 }
 
-// Roots is a validated set of pairs. Its zero value holds no pair and maps
-// nothing.
-type Roots struct {
-	pairs []Pair
-}
-
-// New validates the pairs into Roots. A root must be absolute, and no two pairs
-// may share a root on either side, because a path under a shared root would map
-// to two places in one direction.
-func New(pairs ...Pair) (Roots, error) {
-	seenLocal := map[string]bool{}
-	seenSandbox := map[string]bool{}
-	out := make([]Pair, 0, len(pairs))
-	for _, p := range pairs {
-		local, sandbox := trimRoot(p.Local), trimRoot(p.Sandbox)
-		switch {
-		case !strings.HasPrefix(local, "/") || !strings.HasPrefix(sandbox, "/"):
-			return Roots{}, fmt.Errorf("pathmap: pair %q → %q has a root that is not absolute", p.Local, p.Sandbox)
-		case seenLocal[local]:
-			return Roots{}, fmt.Errorf("pathmap: local root %q is given twice", p.Local)
-		case seenSandbox[sandbox]:
-			return Roots{}, fmt.Errorf("pathmap: sandbox root %q is given twice", p.Sandbox)
-		}
-		seenLocal[local], seenSandbox[sandbox] = true, true
-		out = append(out, Pair{Local: local, Sandbox: sandbox})
-	}
-	return Roots{pairs: out}, nil
-}
-
-// ToSandbox maps local paths to sandbox paths.
-func (r Roots) ToSandbox() Map {
-	rules := make([]rule, len(r.pairs))
-	for i, p := range r.pairs {
-		rules[i] = rule{from: p.Local, to: p.Sandbox}
-	}
-	return newMap(rules)
-}
-
-// ToLocal maps sandbox paths to local paths.
-func (r Roots) ToLocal() Map {
-	rules := make([]rule, len(r.pairs))
-	for i, p := range r.pairs {
-		rules[i] = rule{from: p.Sandbox, to: p.Local}
-	}
-	return newMap(rules)
-}
-
-// Map translates paths in one direction. Its zero value maps nothing.
+// Map maps paths between the workstations. Its zero value holds no place and
+// maps nothing.
 type Map struct {
-	rules []rule // longest root first, so the first match is the longest prefix
+	places   []Place
+	toRemote []rule // longest root first, so the first match is the longest prefix
+	toLocal  []rule
 }
 
 type rule struct{ from, to string }
 
-func newMap(rules []rule) Map {
-	sort.SliceStable(rules, func(i, j int) bool { return len(rules[i].from) > len(rules[j].from) })
-	return Map{rules: rules}
+// New builds a Map from places. A root must be absolute, and no two places may
+// share a root on either side, because a path under a shared root would map to
+// two places in one direction.
+func New(places ...Place) (Map, error) {
+	seenLocal := map[string]bool{}
+	seenRemote := map[string]bool{}
+	m := Map{places: make([]Place, 0, len(places))}
+	for _, p := range places {
+		local, remote := trimRoot(p.Local), trimRoot(p.Remote)
+		switch {
+		case !strings.HasPrefix(local, "/") || !strings.HasPrefix(remote, "/"):
+			return Map{}, fmt.Errorf("pathmap: place %q → %q has a root that is not absolute", p.Local, p.Remote)
+		case seenLocal[local]:
+			return Map{}, fmt.Errorf("pathmap: local root %q is given twice", p.Local)
+		case seenRemote[remote]:
+			return Map{}, fmt.Errorf("pathmap: remote root %q is given twice", p.Remote)
+		}
+		seenLocal[local], seenRemote[remote] = true, true
+		m.places = append(m.places, Place{Local: local, Remote: remote})
+		m.toRemote = append(m.toRemote, rule{from: local, to: remote})
+		m.toLocal = append(m.toLocal, rule{from: remote, to: local})
+	}
+	sort.SliceStable(m.places, func(i, j int) bool { return len(m.places[i].Local) > len(m.places[j].Local) })
+	longestFirst(m.toRemote)
+	longestFirst(m.toLocal)
+	return m, nil
 }
 
-// Path maps one path. A path under no root is returned unchanged; the part below
-// the root is kept as written.
-func (m Map) Path(p string) string {
-	for _, r := range m.rules {
+func longestFirst(rules []rule) {
+	sort.SliceStable(rules, func(i, j int) bool { return len(rules[i].from) > len(rules[j].from) })
+}
+
+// Places are the map's places, longest local root first.
+func (m Map) Places() []Place { return append([]Place(nil), m.places...) }
+
+// ToRemote maps a local path to the remote. A path under no root is returned
+// unchanged; the part below the root is kept as written.
+func (m Map) ToRemote(p string) string { return apply(m.toRemote, p) }
+
+// ToLocal maps a remote path to the local workstation, as ToRemote does the
+// other way.
+func (m Map) ToLocal(p string) string { return apply(m.toLocal, p) }
+
+// ToRemoteJSON maps every string inside a JSON document to the remote.
+func (m Map) ToRemoteJSON(doc []byte) ([]byte, error) { return JSON(doc, m.ToRemote) }
+
+// ToLocalJSON maps every string inside a JSON document to the local
+// workstation.
+func (m Map) ToLocalJSON(doc []byte) ([]byte, error) { return JSON(doc, m.ToLocal) }
+
+func apply(rules []rule, p string) string {
+	for _, r := range rules {
 		if rest, ok := under(p, r.from); ok {
 			return join(r.to, rest)
 		}
@@ -96,11 +96,11 @@ func (m Map) Path(p string) string {
 	return p
 }
 
-// JSON maps every string value inside one JSON document, at any depth. Object
-// keys, every other value, the order of members and the document's whitespace
-// are left as they are; only a string that maps to a different path is
-// re-encoded.
-func (m Map) JSON(doc []byte) ([]byte, error) {
+// JSON applies mapPath to every string value inside one JSON document, at any
+// depth. Object keys, every other value, the order of members and the
+// document's whitespace are left as they are; only a string that maps to a
+// different one is encoded again, so escapes the producer chose are kept.
+func JSON(doc []byte, mapPath func(string) string) ([]byte, error) {
 	if !json.Valid(doc) {
 		return nil, errors.New("pathmap: not a JSON document")
 	}
@@ -119,7 +119,7 @@ func (m Map) JSON(doc []byte) ([]byte, error) {
 			out.Write(literal)
 			continue
 		}
-		mapped, err := m.literal(literal)
+		mapped, err := mapLiteral(literal, mapPath)
 		if err != nil {
 			return nil, err
 		}
@@ -128,36 +128,21 @@ func (m Map) JSON(doc []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// Line maps one newline-delimited JSON line, as a stream-json channel carries
-// it. The line's ending, "\n" or "\r\n", or its absence on a final partial line,
-// is kept; a blank line is returned unchanged.
-func (m Map) Line(line []byte) ([]byte, error) {
-	body := bytes.TrimRight(line, "\r\n")
-	if len(bytes.TrimSpace(body)) == 0 {
-		return line, nil
-	}
-	mapped, err := m.JSON(body)
-	if err != nil {
-		return nil, err
-	}
-	return append(mapped, line[len(body):]...), nil
-}
-
-// literal maps one encoded JSON string, returning it byte for byte when its
-// path does not change, so escapes the producer chose are kept.
-func (m Map) literal(lit []byte) ([]byte, error) {
+// mapLiteral maps one encoded JSON string, returning it byte for byte when it
+// does not change.
+func mapLiteral(lit []byte, mapPath func(string) string) ([]byte, error) {
 	var s string
 	if err := json.Unmarshal(lit, &s); err != nil {
 		return nil, fmt.Errorf("pathmap: decode string: %w", err)
 	}
-	mapped := m.Path(s)
+	mapped := mapPath(s)
 	if mapped == s {
 		return lit, nil
 	}
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
 	// Paths may hold '&', '<' or '>', which the default encoder escapes for
-	// HTML; the stream is not HTML, so they are written as they are.
+	// HTML; the document is not HTML, so they are written as they are.
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(mapped); err != nil {
 		return nil, fmt.Errorf("pathmap: encode string: %w", err)
@@ -219,8 +204,8 @@ func Under(p, root string) (rel string, ok bool) {
 	}
 }
 
-// Absolute is a sandbox path as an absolute, clean one: a relative path is
-// relative to home, as ssh, tmux and Mutagen all take it on the sandbox.
+// Absolute is a remote path as an absolute, clean one: a relative path is
+// relative to home, as ssh, tmux and Mutagen all take it on the remote.
 func Absolute(home, p string) string {
 	if path.IsAbs(p) {
 		return path.Clean(p)

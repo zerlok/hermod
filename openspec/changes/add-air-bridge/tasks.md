@@ -10,11 +10,11 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 ## 1. Foundation: `env`, `secret`, `shell`, `pathmap`
 
-- [ ] 1.1 Create `internal/env` with `Vars`, the one place that splits and joins `KEY=VALUE`: build from pairs and from a process environment, read a key, select by key, and render for a command. A value may be a `secret.Token`, which prints masked; move `secret.Env`'s behaviour here
-- [ ] 1.2 Reduce `internal/secret` to `Token`: keep `NewToken`, `FromString`, `Reveal`, `IsZero`, `Equal` and every masked form; remove `secret.Env` once `env.Vars` replaces it
-- [ ] 1.3 In `internal/shell`, turn `Shell.Run` into `Executor.Exec(Command) Execution` ([`shell.Executor`](../../../docs/ARCHITECTURE.md#shellexecutor--a-workstation)): one `Command` with the arguments, directory, `env.Vars` and streams; an `Execution` with the running command's streams and its result. Keep `local`, dry-run, `ssh` (with `WithTty`, `WithoutSharedMaster`, `WithReverseForward`), `login` and `tmux`, `Quote` and `ExitCode`, rewritten to the new types
-- [ ] 1.4 In `internal/pathmap`, rename the API to `Map` with `ToRemote` and `ToLocal` and `Place`, built from pairs of a local and a remote root, longest root first, and applied to a string and to every string in a JSON value ([How relays enter a workspace](../../../docs/ARCHITECTURE.md#how-relays-enter-a-workspace)); keep the matching at a path-segment boundary, `Under` and `Absolute`
-- [ ] 1.5 Tests: `env.Vars` split, join and masking; `secret.Token` in every `fmt` form; each `Executor` rewrite and the nesting of wrappers with dry-run chosen at the innermost one; `pathmap` in both directions, a path under no root, nested roots and JSON values
+- [x] 1.1 Create `internal/env` with `Vars`, the one place that splits and joins `KEY=VALUE`: build from pairs and from a process environment, read a key, select by key, and render for a command. A value may be a `secret.Token`, which prints masked; move `secret.Env`'s behaviour here
+- [x] 1.2 Reduce `internal/secret` to `Token`: keep `NewToken`, `FromString`, `Reveal`, `IsZero`, `Equal` and every masked form; remove `secret.Env` once `env.Vars` replaces it
+- [x] 1.3 In `internal/shell`, turn `Shell.Run` into `Executor.Exec(Command) Execution` ([`shell.Executor`](../../../docs/ARCHITECTURE.md#shellexecutor--a-workstation)): one `Command` with the arguments, directory, `env.Vars` and streams; an `Execution` with the running command's streams and its result. Keep `local`, dry-run, `ssh` (with `WithTty`, `WithoutSharedMaster`, `WithReverseForward`), `login` and `tmux`, `Quote` and `ExitCode`, rewritten to the new types
+- [x] 1.4 In `internal/pathmap`, rename the API to `Map` with `ToRemote` and `ToLocal` and `Place`, built from pairs of a local and a remote root, longest root first, and applied to a string and to every string in a JSON value ([How relays enter a workspace](../../../docs/ARCHITECTURE.md#how-relays-enter-a-workspace)); keep the matching at a path-segment boundary, `Under` and `Absolute`
+- [x] 1.5 Tests: `env.Vars` split, join and masking; `secret.Token` in every `fmt` form; each `Executor` rewrite and the nesting of wrappers with dry-run chosen at the innermost one; `pathmap` in both directions, a path under no root, nested roots and JSON values
 
 ## 2. Domain: `relay`
 
