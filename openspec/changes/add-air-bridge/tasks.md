@@ -27,10 +27,10 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 ## 3. Domain: `worker`
 
-- [ ] 3.1 Create `internal/worker` with `Worker`, `State` (Absent, Running, Exited), `Spec` (key, directory, command, files, variables, tags, `Form`), `Form` (terminal, line stream), `Stdio` and `List` by tag ([Worker](../../../docs/ARCHITECTURE.md#worker)); it knows nothing about what its process is. Move the tmux session handling of `internal/sandbox` (start, `has-session`, `kill-session`, `remain-on-exit failed`, tags)
-- [ ] 3.2 Embed the [remote scripts](../../../docs/ARCHITECTURE.md#remote-scripts), one that keeps a failed process's pane and one that gives a line stream its FIFO and logs, and send each to the remote's `sh` on stdin with its inputs as arguments and environment
-- [ ] 3.3 Write the [worker's directory](../../../docs/ARCHITECTURE.md#a-workers-directory) (mode `0700`) over ssh stdin, run every setup command with stdin from `/dev/null`, and close a worker with SIGHUP, waiting on a line stream's process ID
-- [ ] 3.4 Tests: the state table and diagram of [Worker](../../../docs/ARCHITECTURE.md#worker); argv for start in each form, list by tag, close and remove; no secret in any argv
+- [x] 3.1 Create `internal/worker` with `Worker`, `State` (Absent, Running, Exited), `Spec` (key, directory, command, files, variables, tags, `Form`), `Form` (terminal, line stream), `Stdio` and `List` by tag ([Worker](../../../docs/ARCHITECTURE.md#worker)); it knows nothing about what its process is. Move the tmux session handling of `internal/sandbox` (start, `has-session`, `kill-session`, `remain-on-exit failed`, tags)
+- [x] 3.2 Embed the [remote scripts](../../../docs/ARCHITECTURE.md#remote-scripts), one that keeps a failed process's pane and one that gives a line stream its FIFO and logs, and send each to the remote's `sh` on stdin with its inputs as arguments and environment
+- [x] 3.3 Write the [worker's directory](../../../docs/ARCHITECTURE.md#a-workers-directory) (mode `0700`) over ssh stdin, run every setup command with stdin from `/dev/null`, and close a worker with SIGHUP, waiting on a line stream's process ID
+- [x] 3.4 Tests: the state table and diagram of [Worker](../../../docs/ARCHITECTURE.md#worker); argv for start in each form, list by tag, close and remove; no secret in any argv
 
 ## 4. Domain: `agent`
 
