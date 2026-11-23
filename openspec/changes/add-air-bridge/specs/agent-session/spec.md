@@ -5,264 +5,307 @@ Hermod SHALL classify the command `attach` was given before doing anything else:
 
 | Claude's arguments | Kind |
 |---|---|
-| a subcommand (`auth`, `mcp`, …), `--version`, `--help`, or `-p` with no session | utility call |
-| `--input-format stream-json` with `--session-id` or `--resume <uuid>` | chat session |
-| anything else with `--session-id` or `--resume <uuid>` | terminal session |
-| anything else, or a command that is not `claude` | not an agent session |
+| a subcommand (`auth`, `mcp`, …), `--version`, `--help`, or `-p` with no session | one-shot call |
+| `--session-id <uuid>` or `--resume <uuid>` | conversation |
+| anything else, or a command that is not `claude` | no agent: a worker that runs the command as given |
 
-A session is keyed by the UUID Claude stores it under: `--session-id`, else the `--resume <uuid>`. With
+A conversation is keyed by the UUID Claude stores it under: `--session-id`, else the `--resume <uuid>`. With
 `--fork-session` Claude stores the resumed conversation under a new UUID, so only `--session-id` keys it, and a fork
-without one has no session in the table above.
+without one is no conversation in the table above.
 
-A command that is not an agent session SHALL run as today's attach, in a tmux session named after the directory.
+A conversation SHALL run only with a terminal on the caller's side. Without one Hermod SHALL refuse it before doing
+anything on the remote, and name `hermod air acp` as the way a program holds a conversation.
 
-#### Scenario: Subcommand is a utility call
+#### Scenario: Subcommand is a one-shot call
 - **WHEN** the command is `claude auth status`
-- **THEN** it is classified as a utility call
+- **THEN** it is classified as a one-shot call
 
-#### Scenario: Settings read is a utility call
+#### Scenario: Settings read is a one-shot call
 - **WHEN** the command is `claude -p --input-format stream-json --output-format stream-json --verbose`
-- **THEN** it is classified as a utility call
+- **THEN** it is classified as a one-shot call
 
-#### Scenario: SDK session is a chat session
-- **WHEN** the command is `claude --output-format stream-json --input-format stream-json --session-id=<uuid>`
-- **THEN** it is classified as a chat session keyed by `<uuid>`
-
-#### Scenario: Terminal session
-- **WHEN** the command is `claude --resume <uuid> --settings <file>`
-- **THEN** it is classified as a terminal session keyed by `<uuid>`
+#### Scenario: Terminal conversation
+- **WHEN** the command is `claude --resume <uuid> --settings <file>` on a terminal
+- **THEN** it is classified as a conversation keyed by `<uuid>`
 
 #### Scenario: Fork keyed by its new session
 - **WHEN** the command is `claude --resume <uuid> --fork-session --session-id <new uuid>`
-- **THEN** it is classified as a terminal session keyed by `<new uuid>`
+- **THEN** it is classified as a conversation keyed by `<new uuid>`
+
+#### Scenario: Conversation without a terminal
+- **WHEN** the command is `claude --output-format stream-json --input-format stream-json --session-id=<uuid>` and
+  the caller's streams are not a terminal
+- **THEN** Hermod refuses it, naming `hermod air acp`, and runs nothing on the remote
 
 #### Scenario: Plain claude
 - **WHEN** the command is `claude --model opus`
-- **THEN** it is not an agent session and runs as today's attach
+- **THEN** it runs as a worker with no agent, as `hermod attach` runs any other command
 
-### Requirement: Utility calls run straight on the sandbox
-A utility call SHALL run `ssh <sandbox> claude ARGS…` with the caller's stdin, stdout and stderr, and Hermod SHALL
-exit with its exit code. A utility call SHALL open no mirror, no tmux session and no hook proxy. It SHALL run in the
-project's sandbox directory when that exists on the sandbox, and in the sandbox user's home otherwise. The project's
-sandbox directory SHALL be found from the read-only listing of the sandbox's mirrors (`mutagen sync list
---label-selector hermod-sandbox=<sandbox>`), and a listing that cannot be read SHALL NOT fail the call.
+### Requirement: One-shot calls run straight on the remote
+A one-shot call SHALL run `claude ARGS…` on the remote with the caller's stdin, stdout and stderr, and Hermod SHALL
+exit with its exit code. It SHALL run in the project's remote directory when that exists on the remote, and in the
+remote user's home otherwise. A one-shot call SHALL start no worker and SHALL make, connect or remove no relay;
+finding the project's remote directory only reads the relays already there, and a read that fails SHALL NOT fail
+the call.
 
 #### Scenario: Exit code passed back
-- **WHEN** `claude auth status` exits with code 1 on the sandbox
+- **WHEN** `claude auth status` exits with code 1 on the remote
 - **THEN** Hermod exits with code 1
 
 #### Scenario: Project settings seen
-- **WHEN** `claude mcp list` runs for a project already mirrored to the sandbox
-- **THEN** it runs in the project's sandbox directory
+- **WHEN** `claude mcp list` runs for a project already relayed to the remote
+- **THEN** it runs in the project's remote directory
 
 #### Scenario: Nothing else started
-- **WHEN** a utility call runs
-- **THEN** the only Mutagen command issued is the read-only listing of the sandbox's mirrors
-- **AND** no tmux or hook-proxy command is issued
+- **WHEN** a one-shot call runs
+- **THEN** no worker is started and no relay changes state
 
-### Requirement: Setup leaves stdin for Claude
-Every command Hermod runs to set up an agent session SHALL take its stdin from `/dev/null`. Only the connection
-that carries Claude's own stdio SHALL receive the caller's stdin.
+### Requirement: Setup leaves stdin for the agent
+Every command Hermod runs to set up a call or a worker SHALL take its stdin from `/dev/null`. Only the connection
+that carries the agent program's own stdio SHALL receive the caller's stdin.
 
-#### Scenario: Initialize reaches Claude
-- **WHEN** the caller writes `initialize` to stdin as soon as the stand-in starts
+#### Scenario: Settings read reaches Claude
+- **WHEN** the caller of a one-shot call writes its first message to stdin as soon as Hermod starts
 - **THEN** no setup command consumes it, and it reaches Claude
 
-### Requirement: Claude says what state a session is in
-Before starting or attaching, Hermod SHALL run one ssh call that runs `claude agents --json` on the sandbox and
-checks for tmux session `hermod-<uuid>` and the session's transcript, and SHALL act on the result:
+### Requirement: Decide from the conversation's and the worker's states
+Before starting or attaching a conversation, Hermod SHALL read whether the agent program lists the conversation as
+running and the state of the conversation's worker, and SHALL act on the pair:
 
-| Claude lists the UUID | tmux `hermod-<uuid>` | Transcript | Then |
-|---|---|---|---|
-| yes | yes | — | running: attach |
-| yes | no | — | running outside Hermod: refuse |
-| no | — | yes | closed: start with `--resume`, copying the transcript up first if it exists only locally |
-| no | — | no | new: start, or fail if the caller asked to `--resume` |
+| Conversation | Worker | Then |
+|---|---|---|
+| running | running | attach |
+| running | absent | refuse: it runs outside Hermod, and a start would be a second copy |
+| not running | running or exited | remove the worker, then act as for absent |
+| not running | absent | start, with the caller's arguments as given |
 
-A tmux session `hermod-<uuid>` left without its Claude SHALL be removed before a start. The session directory SHALL
-NOT be used to decide the state. A Claude that Hermod started for the UUID, by the pid the session directory records
-and its `HERMOD_SESSION`, whose tmux session is gone is being hung up on by a close: the check SHALL give it the
-close's 5 s to exit before reading Claude's list.
+Both states SHALL be read from the agent program and tmux every time, and never from files a worker left behind.
+Whether a conversation that is not running can be resumed SHALL be left to the agent program: Hermod starts it
+with the caller's arguments, and Claude refuses a resume that has nothing to resume.
 
-#### Scenario: Running session
-- **WHEN** Claude lists the UUID and `hermod-<uuid>` exists
+#### Scenario: Running conversation
+- **WHEN** Claude lists the UUID and its worker is running
 - **THEN** Hermod attaches without starting Claude
 
 #### Scenario: Running outside Hermod
-- **WHEN** Claude lists the UUID and no `hermod-<uuid>` exists
+- **WHEN** Claude lists the UUID and no worker runs it
 - **THEN** Hermod refuses and starts no second Claude
 
-#### Scenario: Reopened while being closed
-- **WHEN** the check runs while a close of the session has killed `hermod-<uuid>` and its Claude is still exiting
-- **THEN** Hermod waits for that Claude to exit and takes the session for closed, not for running outside Hermod
+#### Scenario: Stale worker
+- **WHEN** Claude does not list the UUID but its worker exists
+- **THEN** Hermod removes that worker before starting
 
-#### Scenario: Closed session with a local-only transcript
-- **WHEN** Claude does not list the UUID and the transcript exists only locally
-- **THEN** Hermod copies the transcript to the sandbox and starts Claude with `--resume <uuid>`
+#### Scenario: Resume of an unknown conversation
+- **WHEN** the caller asked to `--resume <uuid>` and no transcript of `<uuid>` exists on either workstation
+- **THEN** Hermod starts Claude with the caller's arguments, and Claude's refusal reaches the caller
 
-#### Scenario: Resume of an unknown session
-- **WHEN** the caller asked to `--resume <uuid>` and neither Claude nor any transcript knows it
-- **THEN** Hermod fails without starting Claude
+### Requirement: A conversation's transcripts are on the remote before it starts
+Before starting a conversation Hermod SHALL connect and flush the file relays the agent declares for its
+transcripts, so that a conversation that exists only locally is on the remote before Claude resumes it, and the
+remote's conversations appear in the local config directory.
 
-#### Scenario: Stale tmux session
-- **WHEN** Claude does not list the UUID but `hermod-<uuid>` exists
-- **THEN** Hermod removes that tmux session before starting
+#### Scenario: Local-only transcript resumed
+- **WHEN** a conversation whose transcript exists only locally is resumed
+- **THEN** the transcript is on the remote before Claude starts with `--resume <uuid>`
 
-### Requirement: The session directory holds what the running process needs
-For an agent session Hermod SHALL create `~/.hermod/s/<uuid>/` on the sandbox with mode `0700` when it is missing,
-holding `hookport`, `token`, `env`, `settings.json`, `mcp.json`, `pid` (the pid of the Claude it last started) and,
-for a chat session, `in.fifo` and `out.log`. Secrets SHALL
-reach it only over ssh stdin, never on a command line. The directory SHALL stay after the session closes.
+#### Scenario: Remote conversation listed locally
+- **WHEN** a conversation started on the remote has written its transcript
+- **THEN** the transcript appears in the local config directory
+
+### Requirement: A worker's directory holds what its process needs
+Hermod SHALL give every worker that runs an agent program or its adapter a directory of its own on the remote,
+created when missing with mode `0700`, holding the files the process was started with and nothing that decides a
+state. Secrets SHALL reach the remote only inside that directory or on the worker's own stdin, written over ssh
+stdin and never on a command line. The directory SHALL stay after the worker closes.
 
 #### Scenario: Directory created private
-- **WHEN** a new agent session starts
-- **THEN** `~/.hermod/s/<uuid>/` exists with mode `0700`
+- **WHEN** a new conversation starts
+- **THEN** its worker's directory exists on the remote with mode `0700`
 
 #### Scenario: No secret on a command line
-- **WHEN** Hermod writes `token`, `env`, `settings.json` or `mcp.json`
+- **WHEN** Hermod writes a token, the variables or the settings into the worker's directory
 - **THEN** their contents travel on ssh stdin and appear in no argv
 
-### Requirement: Rewrite Claude's arguments for the sandbox
-Hermod SHALL rewrite a session's arguments before starting Claude: the contents of the `--settings` file SHALL be
-written to the session directory's `settings.json` and the argument pointed at it; local paths in any argument SHALL
-be mapped to the sandbox through the run's path map; every `--mcp-config` value, inline or a file, SHALL be merged
-into the session directory's `mcp.json`, without the servers whose command is a local program, and the option
-pointed at it; `--session-id` and `--resume` SHALL pass through unchanged. Hermod SHALL NOT add `--name` or
+### Requirement: Rewrite Claude's arguments for the remote
+Hermod SHALL rewrite a conversation's arguments before starting Claude: the contents of the `--settings` file SHALL
+be written into the worker's directory, with its hooks aimed as the `hook-proxy` capability specifies, and the
+argument pointed at that file; local paths in every argument SHALL be mapped to the remote through the run's path
+map; `--session-id` and `--resume` SHALL pass through unchanged. The MCP servers the arguments name SHALL be passed
+on as given, with only their paths mapped, and run on the remote: each `--mcp-config` value, inline or a file, SHALL
+be written into the worker's directory and the option pointed at that file. Hermod SHALL NOT add `--name` or
 otherwise change Claude's session name.
 
-#### Scenario: Settings moved to the session directory
+#### Scenario: Settings moved to the worker's directory
 - **WHEN** the command carries `--settings <local file>`
-- **THEN** Claude on the sandbox is started with `--settings` naming the session's `settings.json`
+- **THEN** Claude on the remote is started with `--settings` naming the file in its worker's directory
 
-#### Scenario: Local MCP server removed
-- **WHEN** `--mcp-config` holds `jetbrains_air_ide` whose command is the local IDE binary
-- **THEN** Claude on the sandbox is started without that server
+#### Scenario: MCP configuration passed on
+- **WHEN** the command carries `--mcp-config <local file>`
+- **THEN** Claude on the remote is started with the same option naming a file in its worker's directory, its paths
+  mapped to the remote and nothing removed from it
 
 #### Scenario: MCP secrets off the command line
-- **WHEN** `--mcp-config` holds a server that runs on the sandbox with a credential in its `env` or `headers`
-- **THEN** that server reaches the sandbox in `mcp.json` over ssh stdin, and Claude's argv names only that file
+- **WHEN** `--mcp-config` holds a server with a credential in its `env` or `headers`
+- **THEN** that server reaches the remote over ssh stdin, and Claude's argv names only the file
 
 #### Scenario: Session name untouched
-- **WHEN** Hermod starts Claude for a session
+- **WHEN** Hermod starts Claude for a conversation
 - **THEN** the argv carries no `--name` that the caller did not pass
 
-### Requirement: Carry Claude's environment to the sandbox
-Hermod SHALL write the caller's `CLAUDE_*`, `ANTHROPIC_*` and `MAX_THINKING_TOKENS` variables and the git identity
-into the session's `env` file, leaving out `CLAUDE_CODE_EXECUTABLE` and `CLAUDE_CONFIG_DIR`, which name local paths,
-and the variables a running Claude sets for the programs it starts (such as `CLAUDE_CODE_EXECPATH`, `CLAUDE_PID`
-and `CLAUDE_CODE_MESSAGING_TOKEN`), which belong to one local process.
-Claude SHALL be started with `HERMOD_SESSION`, `HERMOD_MODE` and `HERMOD_ORIGIN` in its environment, with the mode
-and origin of its tmux session, so a Claude without `HERMOD_SESSION` is known to have been started on the sandbox
-itself.
+### Requirement: Only declared variables reach the remote
+A worker that runs Claude or its ACP adapter SHALL be given only the variables Claude declares and the git
+identity: the caller's `CLAUDE_*`, `ANTHROPIC_*` and `MAX_THINKING_TOKENS`, leaving out `CLAUDE_CODE_EXECUTABLE`
+and `CLAUDE_CONFIG_DIR`, which name local paths, and the variables a running Claude sets for the programs it starts
+(such as `CLAUDE_CODE_EXECPATH`, `CLAUDE_PID` and `CLAUDE_CODE_MESSAGING_TOKEN`), which belong to one local process.
+No other local variable SHALL reach the remote.
 
 #### Scenario: Local paths not carried
 - **WHEN** the caller's environment has `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_EXECUTABLE` and `CLAUDE_CONFIG_DIR`
-- **THEN** the `env` file holds `CLAUDE_CODE_ENTRYPOINT` and neither of the other two
+- **THEN** the worker is given `CLAUDE_CODE_ENTRYPOINT` and neither of the other two
 
 #### Scenario: A parent Claude's variables not carried
 - **WHEN** Hermod itself runs under a Claude that set `CLAUDE_CODE_EXECPATH` and `CLAUDE_CODE_MESSAGING_TOKEN`
-- **THEN** the `env` file holds neither
+- **THEN** the worker is given neither
 
-#### Scenario: Claude process carries tags
-- **WHEN** Hermod starts Claude for an Air chat
-- **THEN** Claude's environment has `HERMOD_SESSION=<uuid>` and `HERMOD_MODE=air-acp`
+#### Scenario: Undeclared variable stays local
+- **WHEN** the caller's environment holds a credential under a name Claude does not declare
+- **THEN** no worker is given it
 
-### Requirement: Start a session in tmux
-Hermod SHALL start an agent session as tmux session `hermod-<uuid>`, tagged as the `remote-session` capability
-specifies, in the project's directory, sourcing the session directory's `env` and then running
-`exec claude <rewritten args>`. In a chat session Claude's
-stdin SHALL be `in.fifo`, held open by the tmux session so Claude never sees EOF, and its stdout SHALL be appended to
-`out.log`.
+### Requirement: Start a conversation in a worker
+Hermod SHALL start a conversation as a worker of the workspace its directory belongs to, keyed by the
+conversation's UUID, tagged as the `remote-session` capability specifies, in the directory's remote path, running
+Claude with the rewritten arguments and the declared variables, on a terminal.
 
-#### Scenario: Chat session runtime
-- **WHEN** a chat session starts
-- **THEN** Claude reads from `in.fifo` and appends to `out.log`
-- **AND** a detach does not close `in.fifo` for Claude
+#### Scenario: Conversation started
+- **WHEN** a new conversation starts in a project directory
+- **THEN** a worker keyed by its UUID runs Claude in the directory's remote path
 
-### Requirement: Attach to a terminal session
-Hermod SHALL attach a terminal session with `tmux attach-session -t hermod-<uuid>` on a tty, over one ssh connection
-that refuses a shared master connection. The attach SHALL join only a session that exists and SHALL NOT create one,
-which would be a shell under the session's name. Claude SHALL run with tmux's `remain-on-exit failed`, so a Claude
-that fails leaves its pane, its error and its exit status for the attach to show. A session gone by the time of the
-attach SHALL fail the run.
+### Requirement: Attach to a terminal conversation
+Hermod SHALL attach a terminal conversation by joining its worker on a tty. The attach SHALL join only a worker that exists and SHALL NOT create one, which would be
+a shell under the conversation's name. A Claude that fails SHALL leave the worker Exited, with its error and exit
+status kept for the attach to show. A worker gone by the time of the attach SHALL fail the run.
 
 #### Scenario: Terminal attach
-- **WHEN** a terminal session is attached
-- **THEN** ssh runs with a tty and without a shared master, and joins `hermod-<uuid>`
+- **WHEN** a terminal conversation is attached
+- **THEN** the caller is joined to the conversation's worker on a tty
 
 #### Scenario: Claude failed
 - **WHEN** Claude exits with an error after its start
-- **THEN** its pane stays, and the attach shows Claude's error and exit status
+- **THEN** the worker is kept, and the attach shows Claude's error and exit status
 
-#### Scenario: Session gone
-- **WHEN** `hermod-<uuid>` no longer exists when the attach runs
-- **THEN** no session is created and the run fails
+#### Scenario: Worker gone
+- **WHEN** the conversation's worker no longer exists when the attach runs
+- **THEN** no worker is created and the run fails
 
-### Requirement: Attach to a chat session as a stream
-Hermod SHALL attach a chat session over one ssh connection that refuses a shared master and runs a shell line that
-tails `out.log` to stdout and copies stdin into `in.fifo` one complete line at a time. Hermod SHALL pass each line
-through the run's path map, local to sandbox on stdin and sandbox to local on stdout, line by line and unbuffered.
+### Requirement: Leaving ends only the attach
+Stdin EOF, a signal or a dropped connection SHALL end the attach and nothing else: the worker and its agent keep
+running, and the workspace's relays are left as the `session-orchestration` capability specifies for a workspace
+with a worker. Hermod SHALL then exit at once, so the program that started it never has to kill it.
 
-#### Scenario: Paths mapped in the stream
-- **WHEN** Claude writes a line naming a sandbox path to `out.log`
-- **THEN** the caller receives that line with the local path
+#### Scenario: Terminal closed
+- **WHEN** the terminal of an attached conversation is closed
+- **THEN** Hermod exits, and the conversation's worker keeps running on the remote
 
-#### Scenario: Partial line never reaches Claude
-- **WHEN** the connection drops in the middle of a stdin line
-- **THEN** Claude receives no part of that line
+### Requirement: Each workspace's chats run in one adapter
+`hermod air acp` SHALL hold the client's one ACP connection for every chat of every project, and run each
+project's chats in one ACP adapter on the remote: a worker of the workspace the chat's directory belongs to, its
+stdio a line stream. A request that opens a chat (`session/new`, `session/load`, `session/resume`) SHALL be routed
+by the directory it names, attaching that workspace and starting its adapter when none runs; every later message
+of the chat SHALL be routed by the chat's session ID to the same adapter. Every message SHALL reach the adapter
+with its paths mapped to the remote, and the client with its paths mapped back. A line SHALL reach the adapter only
+whole. A second `hermod air acp` that opens a chat in a workspace whose adapter is already attached SHALL end
+with that error, and the first SHALL keep its adapter.
 
-### Requirement: A detach never ends the session
-Stdin EOF, SIGTERM or a dropped connection SHALL end the attach and nothing else: the tmux session and Claude keep
-running. Hermod SHALL exit within the SDK's window of 2 s after stdin EOF plus 5 s after SIGTERM.
+#### Scenario: Two chats of one project
+- **WHEN** Air opens two chats in the same project
+- **THEN** both reach the same adapter, and only one adapter runs for the project
 
-#### Scenario: Air closes a tab
-- **WHEN** the caller closes stdin
-- **THEN** Hermod settles its mirrors and exits within the window
-- **AND** `hermod-<uuid>` keeps running on the sandbox
+#### Scenario: Chats of two projects
+- **WHEN** Air opens one chat in each of two projects on the same remote
+- **THEN** each chat's messages reach the adapter of its own project's workspace
 
-### Requirement: Reattach to a running chat session
-When a chat session is running, Hermod SHALL attach to the running Claude instead of starting another: it SHALL
-answer the SDK's `initialize` from the first response in `out.log`, re-deliver control requests still waiting for an
-answer, resend prompts that `out.log` has not echoed, and stream the log from its end. Where this live reattach is
-not available, or fails, Hermod SHALL instead close the tmux session and start the session with `--resume`.
+#### Scenario: Paths mapped
+- **WHEN** Air sends a message naming a file under the local project root
+- **THEN** the adapter receives the corresponding path under the remote root, and its answer reaches Air with the
+  local path
 
-#### Scenario: Live reattach
-- **WHEN** Air reopens a chat whose Claude is running
-- **THEN** the SDK's `initialize` is answered from the log and no second Claude starts
+#### Scenario: Next IDE run returns
+- **WHEN** a new `hermod air acp` opens a chat in a project whose adapter still runs
+- **THEN** the chat reaches that adapter and no new one is started
 
-#### Scenario: Pending permission prompt re-delivered
-- **WHEN** Claude raised a permission request while nobody was attached
-- **THEN** the reattached caller receives that request
+#### Scenario: Later message found by its chat
+- **WHEN** Air sends a prompt that names only a chat's session ID
+- **THEN** it reaches the adapter of the workspace the chat was opened in
 
-#### Scenario: Fallback to resume
-- **WHEN** a running chat session is reopened and live reattach is not available
-- **THEN** Hermod closes `hermod-<uuid>` and starts Claude with `--resume <uuid>`
+#### Scenario: Partial line never reaches the adapter
+- **WHEN** the connection drops in the middle of a line to the adapter
+- **THEN** the adapter receives no part of that line
 
-### Requirement: Close a session
-Closing an agent session SHALL run `tmux kill-session -t hermod-<uuid>` on the sandbox, wait up to 5 s for its Claude
-to exit, and leave the session directory for a later `--resume`. The mirrors serving the directory the tmux session
-is tagged with SHALL be opened under a lease before the hang-up and settled after it by the pause-vs-teardown rule;
-when the hang-up fails, or Claude outlives the wait, they SHALL be paused. A session whose tmux session is already
-gone SHALL have nothing closed and its mirrors SHALL NOT be settled: the directory that names them is known only from
-the tmux session's tag. A chat that Air reopens SHALL NOT be closed after: a close still queued for it SHALL be
-dropped, and a close already under way SHALL skip the hang-up and settle the mirrors as a detach does.
+#### Scenario: Adapter held by another IDE
+- **WHEN** a second IDE's `hermod air acp` opens a chat in a project whose adapter the first one is attached to
+- **THEN** the second `hermod air acp` exits with the error, and the first keeps its adapter
 
-#### Scenario: Close keeps the directory
-- **WHEN** a session is closed
-- **THEN** `hermod-<uuid>` no longer exists and `~/.hermod/s/<uuid>/` remains
+### Requirement: What belongs to no workspace
+`hermod air acp` SHALL answer `initialize` and `session/list` through one more adapter of its own on the remote,
+which runs for as long as `hermod air acp` runs. It SHALL remove the `fs` and `terminal` client capabilities from
+`initialize`, so the agent reads, writes and runs everything on the remote, and SHALL send the same `initialize` to
+every workspace's adapter it starts.
 
-#### Scenario: Close does not race an attach
-- **WHEN** a session is closed while a stand-in is attached to another session on the same mirror
-- **THEN** the mirror is not closed under the attached stand-in
+#### Scenario: Client capabilities removed
+- **WHEN** Air's `initialize` declares the `fs` and `terminal` capabilities
+- **THEN** no adapter receives either of them
 
-#### Scenario: Session already gone
-- **WHEN** a session is closed whose `hermod-<uuid>` no longer exists
-- **THEN** nothing is closed and its mirrors are left as the last detach left them
+#### Scenario: A new adapter is initialized
+- **WHEN** a chat opens in a project whose adapter is not running
+- **THEN** the adapter is started and receives Air's `initialize` before the request that opens the chat
 
-#### Scenario: Chat reopened while its close is under way
-- **WHEN** Air reopens a chat after its close has begun and before the hang-up
-- **THEN** `hermod-<uuid>` keeps running and its mirrors are settled as a detach settles them
+#### Scenario: Chats listed from the remote
+- **WHEN** Air sends `session/list` for a project directory
+- **THEN** the answer lists the chats whose transcripts are on the remote
 
-#### Scenario: Chat reopened while its close is queued
-- **WHEN** Air reopens a chat whose close has not begun
-- **THEN** the close is dropped and `hermod-<uuid>` is not touched
+### Requirement: A closed tab leaves its chat running
+`session/close`, which Air sends for every closed tab and for every open chat at an IDE quit, SHALL be answered by
+Hermod with an empty result and SHALL NOT reach the adapter, so the chat's agent keeps running. While a chat is
+hidden and another chat of its workspace is shown, a request its adapter sends for it SHALL be held and delivered
+right after the answer to the request that opens the chat again, and the chat's other output SHALL NOT be sent,
+since the adapter replays the chat when it is opened again. When no chat of a workspace is shown any more, Hermod
+SHALL detach the workspace, and its adapter keeps running.
+
+#### Scenario: Tab closed
+- **WHEN** Air sends `session/close` for a chat
+- **THEN** Air receives an empty result, the adapter receives nothing, and the chat's agent keeps running
+
+#### Scenario: Last tab of a project closed
+- **WHEN** Air closes the only open chat of a project
+- **THEN** the workspace is detached and its adapter keeps running on the remote
+
+#### Scenario: Question asked while hidden
+- **WHEN** the adapter sends `session/request_permission` for a chat whose tab is closed while another chat of its
+  project is shown, and Air opens the chat again
+- **THEN** Air receives the answer to its `session/resume` first and the permission request after it
+
+### Requirement: Mark done ends a chat
+`_session/archive`, which Air sends when a chat is marked done, SHALL reach the chat's adapter while another chat
+of its workspace is shown, and the adapter ends the chat's agent. Hermod SHALL then forget the chat, and pass to Air as it is whatever the adapter still sends of it.
+
+#### Scenario: Chat marked done
+- **WHEN** Air sends `_session/archive` for a chat of a project whose workspace has another chat open
+- **THEN** the archive reaches the adapter, and the chat's agent stops
+
+#### Scenario: Only shown chat marked done
+- **WHEN** Air marks done the only shown chat of a project
+- **THEN** `hermod air acp` ends with the error, and the chat is not marked done
+
+### Requirement: The adapters' requests are renumbered
+Every request an adapter sends SHALL reach the client under an ID unique on the client's connection, and the
+client's answer SHALL reach the adapter that asked under that adapter's own ID. The client's requests SHALL keep
+their IDs. A request whose adapter is detached before it is answered SHALL be forgotten.
+
+#### Scenario: Two adapters use the same ID
+- **WHEN** the adapters of two projects each send `session/request_permission` with ID 0
+- **THEN** Air receives two requests with different IDs, and each answer reaches the adapter that asked, under
+  ID 0
+
+#### Scenario: Client IDs unchanged
+- **WHEN** Air sends a prompt with ID 7
+- **THEN** the adapter receives it with ID 7

@@ -1,35 +1,32 @@
 ## ADDED Requirements
 
-### Requirement: Register a sandbox with Air
-`hermod air configure claude [<sandbox>]` SHALL create or repair the stand-in link `~/.local/share/hermod/bin/claude`
-and merge one entry into `~/.jetbrains/acp.json` under `agent_servers`, keeping every other entry and key. The entry
-SHALL run the `hermod` binary by absolute path with `air acp claude --node=<node> --acp=<adapter>`, and its `env`
-SHALL hold `HERMOD_SANDBOX=<sandbox>`, `CLAUDE_CODE_EXECUTABLE` set to the link, and `CLAUDE_CONFIG_DIR` set to
-`~/.local/share/hermod/air/<sandbox>/claude`. The sandbox SHALL come from the argument or `HERMOD_SANDBOX`, and SHALL
-be written only into `env`, never into `args`. With neither, the command SHALL fail before doing anything.
+### Requirement: Register a remote with Air
+`hermod air configure claude [<remote>]` SHALL merge one entry into `~/.jetbrains/acp.json` under `agent_servers`,
+keeping every other entry and key. The entry's `command` SHALL be the `hermod` binary's absolute path and its `args`
+SHALL be `air acp claude <remote>`. The remote SHALL come from the argument, else from `HERMOD_REMOTE`; with neither,
+the command SHALL fail before changing anything.
 
 #### Scenario: Entry merged
 - **WHEN** `acp.json` holds another agent and the user runs `hermod air configure claude prod-box`
-- **THEN** `acp.json` holds the other agent unchanged and an entry `Claude (prod-box)` with `HERMOD_SANDBOX=prod-box` in its `env`
+- **THEN** `acp.json` holds the other agent unchanged and an entry `Claude (prod-box)` whose `command` is an absolute path to `hermod` and whose `args` are `air acp claude prod-box`
 
-#### Scenario: Link repaired
-- **WHEN** the stand-in link is missing or points elsewhere
-- **THEN** configure makes it a link to the running `hermod` binary
+#### Scenario: Remote from the environment
+- **WHEN** configure runs with no remote argument and `HERMOD_REMOTE=prod-box`
+- **THEN** the entry's `args` end with `prod-box`
 
-#### Scenario: Each sandbox lists its own chats
-- **WHEN** entries are configured for `box-a` and `box-b`
-- **THEN** their `CLAUDE_CONFIG_DIR` values differ
+#### Scenario: No remote
+- **WHEN** configure runs with no remote argument and `HERMOD_REMOTE` unset
+- **THEN** it fails and `acp.json` is unchanged
+
+#### Scenario: Each remote is its own agent
+- **WHEN** configure runs for `box-a` and then for `box-b`
+- **THEN** `acp.json` holds two entries, `Claude (box-a)` and `Claude (box-b)`
 
 ### Requirement: Configure options
-`--node` and `--acp` SHALL default to `node` and `claude-agent-acp` found on the user's `PATH` and SHALL be written
-as absolute paths. `--name` SHALL set the entry's name, `Claude (<sandbox>)` by default; configuring an existing name
-SHALL replace that entry. `--origin=<name>` SHALL write `HERMOD_ORIGIN` into the entry's `env`, `--origin=` writing it
+`--name` SHALL set the entry's name, `Claude (<remote>)` by default, and configuring an existing name SHALL replace
+that entry. `--origin=<name>` SHALL write `HERMOD_ORIGIN` into the entry's `env`, and `--origin=` SHALL write it
 empty; without the flag the `HERMOD_ORIGIN` that `configure` runs with SHALL be written, and with neither the entry
-SHALL carry no `HERMOD_ORIGIN`. `-n` SHALL print the entry and change nothing.
-
-#### Scenario: Paths resolved from PATH
-- **WHEN** configure runs without `--node` and `--acp`
-- **THEN** the entry's `args` carry the absolute paths of `node` and `claude-agent-acp` from `PATH`
+SHALL have no `env`. `-n` SHALL print the entry and change nothing.
 
 #### Scenario: Same name replaces
 - **WHEN** configure runs twice with `--name=Remote`
@@ -39,37 +36,41 @@ SHALL carry no `HERMOD_ORIGIN`. `-n` SHALL print the entry and change nothing.
 - **WHEN** configure runs with `--origin=`
 - **THEN** the entry's `env` holds `HERMOD_ORIGIN` set to empty
 
+#### Scenario: No origin
+- **WHEN** configure runs without `--origin` and `HERMOD_ORIGIN` unset
+- **THEN** the entry has no `env`
+
 #### Scenario: Dry run
 - **WHEN** configure runs with `-n`
-- **THEN** the entry is printed and neither `acp.json` nor the link changes
+- **THEN** the entry is printed and `acp.json` is unchanged
 
 ### Requirement: Configure prints the terminal-mode setup
-`hermod air configure` SHALL print the stand-in link's path, to be entered as Air's Claude executable, and the
-`HERMOD_SANDBOX=<sandbox>` line Air's own environment needs for terminal mode.
+`hermod air configure` SHALL print the `HERMOD_REMOTE=<remote>` line that Air's own environment needs for terminal
+mode, and, when it finds the stand-in link (a `claude` on its `PATH` that links to `hermod`, else the link at the
+installer's default place), that link's path, to be entered as Air's Claude executable. It SHALL NOT create or
+change the link.
 
 #### Scenario: Terminal-mode lines
-- **WHEN** configure runs for `prod-box`
-- **THEN** it prints the link path and `HERMOD_SANDBOX=prod-box`
+- **WHEN** configure runs for `prod-box` and the stand-in link exists
+- **THEN** it prints the link's path and `HERMOD_REMOTE=prod-box`
 
-### Requirement: Wrap the ACP adapter
-`hermod air acp claude [<sandbox>]` SHALL start the adapter as `--node` running `--acp`, with its own environment
-unchanged, and SHALL copy ACP messages between its caller and the adapter verbatim in both directions. On a
-`_session/archive` for a session, it SHALL close that session on the sandbox as the `agent-session` capability
-specifies. On a `_session/unarchive` for a session, it SHALL keep a close of that session still to come from ending
-the reopened chat, as the `agent-session` capability specifies.
+#### Scenario: Link left alone
+- **WHEN** configure runs and no stand-in link is found
+- **THEN** it prints `HERMOD_REMOTE=<remote>` and creates no link
 
-#### Scenario: Messages copied verbatim
-- **WHEN** Air sends `session/new` and the adapter answers
-- **THEN** each message passes through unchanged
+### Requirement: One chat agent per remote
+`hermod air acp claude [<remote>]` SHALL be Air's chat agent for the one remote it names, the remote falling back to
+`HERMOD_REMOTE`. It SHALL run once per IDE run, from when Air starts the entry's command, and SHALL serve every chat
+of every project Air holds on its one ACP connection as the `agent-session` capability specifies.
 
-#### Scenario: Mark done closes the session
-- **WHEN** Air sends `_session/archive` for `<uuid>`
-- **THEN** `hermod-<uuid>` is closed on the sandbox and the message still reaches the adapter
+#### Scenario: Remote from the environment
+- **WHEN** Air starts `hermod air acp claude` with no remote argument and `HERMOD_REMOTE=prod-box`
+- **THEN** its chats run on `prod-box`
 
-#### Scenario: Reopen keeps the session
-- **WHEN** Air sends `_session/unarchive` for `<uuid>` while a close of it is queued
-- **THEN** that close is dropped and the message still reaches the adapter
+### Requirement: Air ends the agent, not the chats
+`hermod air acp` SHALL run until Air closes its stdin or sends SIGTERM. It SHALL then detach every workspace it
+holds and exit, leaving every adapter and chat on the remote running.
 
-#### Scenario: Environment reaches every chat
-- **WHEN** the adapter spawns the stand-in for a chat
-- **THEN** the stand-in sees the entry's `HERMOD_SANDBOX`
+#### Scenario: IDE quits
+- **WHEN** Air closes `air acp`'s stdin
+- **THEN** `air acp` exits and every adapter it used still runs on the remote
