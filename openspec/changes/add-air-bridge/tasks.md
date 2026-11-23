@@ -89,8 +89,8 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 ## 11. Adapter: `git`
 
-- [ ] 11.1 In `internal/git`, keep `Identity` and `Read`, and add `MainWorktree`, the main working tree of a linked worktree, as read-only `git` commands
-- [ ] 11.2 Tests: identity present and missing; a directory in a main tree, in a linked worktree and outside any repository
+- [x] 11.1 In `internal/git`, keep `Identity` and `Read`, and add `MainWorktree`, the main working tree of a linked worktree, as read-only `git` commands
+- [x] 11.2 Tests: identity present and missing; a directory in a main tree, in a linked worktree and outside any repository
 
 ## 12. Adapter: `cli`
 
