@@ -76,9 +76,13 @@ type fake struct {
 	probe        string                       // what the agent program says of the conversation
 	listFails    bool                         // Mutagen cannot list its sessions
 	attach       ending
-	signal       context.CancelFunc // stops the session when a joined terminal signals
-	forwardFails bool               // a forward's remote port is taken
-	exitCode     int                // a one-shot call's exit status
+	signal       context.CancelFunc   // stops the session when a joined terminal signals
+	forwardFails bool                 // a forward's remote port is taken
+	exitCode     int                  // a one-shot call's exit status
+	convs        []agent.Conversation // the conversations the agent program has, by remote directory
+	queryFails   bool                 // the agent program's listing and lookup fail
+	queryGarbled bool                 // the agent program's listing and lookup print what cannot be read
+	workersFail  bool                 // tmux cannot list its sessions
 	ran          []string
 }
 
@@ -278,7 +282,11 @@ func sessionOf(target string) string {
 func (f *fake) onRemote(words []string, port string) play {
 	switch {
 	case len(words) == 5 && words[0] == "sh" && words[2] == `exec "$SHELL" -lc "$1"`:
-		return f.oneShot(splitWords(words[4]))
+		inner := splitWords(words[4])
+		if len(inner) == 2 && (inner[0] == agentList || inner[0] == agentLocate) {
+			return f.query(inner[0], inner[1])
+		}
+		return f.oneShot(inner)
 	case len(words) > 7 && words[0] == "sh" && words[1] == "-c" && words[3] == "act":
 		return f.act(words[7], words[8:])
 	case len(words) > 4 && words[0] == "sh" && words[1] == "-c" && words[3] == "write":
@@ -302,6 +310,37 @@ func (f *fake) oneShot(words []string) play {
 		f.record(append([]string{"run in", words[4]}, words[5:]...)...)
 		if f.exitCode != 0 {
 			return exitError(f.exitCode)
+		}
+		return nil
+	}
+}
+
+// The commands fakeAgent declares for its listing and its lookup.
+const (
+	agentList   = "agent-list"
+	agentLocate = "agent-locate"
+)
+
+// query answers the agent program's listing of a directory, every
+// conversation in it or under it, or its lookup of one conversation, a line
+// "ID DIR STATE" for each.
+func (f *fake) query(verb, arg string) play {
+	return func(_ context.Context, _ io.Reader, out, errOut io.Writer) error {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.queryFails {
+			_, _ = fmt.Fprintln(errOut, "claude: command not found")
+			return exitError(127)
+		}
+		if f.queryGarbled {
+			_, _ = fmt.Fprintln(out, "garbled")
+			return nil
+		}
+		for _, c := range f.convs {
+			_, under := pathmap.Under(c.Dir, arg)
+			if (verb == agentList && under) || (verb == agentLocate && c.ID == arg) {
+				_, _ = fmt.Fprintf(out, "%s %s %s\n", c.ID, c.Dir, c.State)
+			}
 		}
 		return nil
 	}
@@ -375,6 +414,9 @@ func (f *fake) act(op string, args []string) play {
 		defer f.mu.Unlock()
 		switch op {
 		case "list":
+			if f.workersFail {
+				return exitError(unreadable)
+			}
 			tag := ""
 			if fields := strings.Fields(args[0]); len(fields) == 3 {
 				tag = strings.TrimSuffix(strings.TrimPrefix(fields[1], "#{"), "}")
@@ -473,8 +515,9 @@ func dead(s worker.State) string {
 
 // fakeAgent answers the agent's questions from what a test gave it.
 type fakeAgent struct {
-	call  agent.Call
-	needs agent.Needs
+	call      agent.Call
+	needs     agent.Needs
+	handshake agent.Handshake
 }
 
 func (a fakeAgent) Parse([]string) agent.Call { return a.call }
@@ -507,11 +550,46 @@ func (a fakeAgent) Probe(id string) agent.Probe {
 	})
 }
 
-func (a fakeAgent) Connect() agent.Handshake { return agent.Handshake{} }
+func (a fakeAgent) Connect() agent.Handshake { return a.handshake }
 
-func (a fakeAgent) List(string) agent.Listing { return agent.Listing{} }
+func (a fakeAgent) List(dir string) agent.Listing {
+	return agent.NewListing(dir, []string{agentList, dir}, readConversations)
+}
 
-func (a fakeAgent) Locate(string) agent.Lookup { return agent.Lookup{} }
+func (a fakeAgent) Locate(id string) agent.Lookup {
+	return agent.NewLookup(id, []string{agentLocate, id}, func(out []byte) (agent.Conversation, bool, error) {
+		found, err := readConversations(out)
+		if err != nil || len(found) == 0 {
+			return agent.Conversation{}, false, err
+		}
+		return found[0], true, nil
+	})
+}
+
+// readConversations reads the fake program's lines "ID DIR STATE".
+func readConversations(out []byte) ([]agent.Conversation, error) {
+	var found []agent.Conversation
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if len(fields) != 3 {
+			return nil, fmt.Errorf("unreadable %q", line)
+		}
+		c := agent.Conversation{ID: fields[0], Dir: fields[1]}
+		switch fields[2] {
+		case agent.Running.String():
+			c.State = agent.Running
+		case agent.Stopped.String():
+			c.State = agent.Stopped
+		default:
+			return nil, fmt.Errorf("unreadable state %q", fields[2])
+		}
+		found = append(found, c)
+	}
+	return found, nil
+}
 
 // Hooks stamps the port and the token on the document, so a test reads what
 // the worker's settings carry.
