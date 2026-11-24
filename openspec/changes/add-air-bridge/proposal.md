@@ -60,6 +60,6 @@ and flows are in [ARCHITECTURE](../../../docs/ARCHITECTURE.md).
 - Files: `~/.jetbrains/acp.json` locally; the rest are in
   [Storage](../../../docs/ARCHITECTURE.md#storage) and [Names and tags](../../../docs/ARCHITECTURE.md#names-and-tags).
 - Dependencies: the remote needs what
-  [docs/air-integration.md](../../../docs/air-integration.md#nothing-of-hermods-runs-on-the-sandbox) lists, and
+  [docs/air-integration.md](../../../docs/air-integration.md#nothing-of-hermods-runs-on-the-remote) lists, and
   `claude-agent-acp` for chat mode. Nothing of Hermod's is installed on the remote.
 - Docs: README.md, docs/ARCHITECTURE.md and docs/air-integration.md follow the new command line and packages.

@@ -108,7 +108,7 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 ## 14. Documentation
 
-- [ ] 14.1 Update README.md for remotes: usage of `attach`, `air configure` and `air acp`, the variables, `attach -R`, the stand-in link from `make install`, and the project structure from [Packages](../../../docs/ARCHITECTURE.md#packages); retarget its link to `design.md#agent-session`, a heading design.md does not have, to [Session](../../../docs/ARCHITECTURE.md#session)
+- [x] 14.1 Update README.md for remotes: usage of `attach`, `air configure` and `air acp`, the variables, `attach -R`, the stand-in link from `make install`, and the project structure from [Packages](../../../docs/ARCHITECTURE.md#packages); retarget its link to `design.md#agent-session`, a heading design.md does not have, to [Session](../../../docs/ARCHITECTURE.md#session)
 - [x] 14.2 In docs/ARCHITECTURE.md, retarget the Workspace section's link to `design.md#workspace` to [Which workspace a directory belongs to](../../../docs/ARCHITECTURE.md#which-workspace-a-directory-belongs-to) and [How relays enter a workspace](../../../docs/ARCHITECTURE.md#how-relays-enter-a-workspace)
-- [ ] 14.3 In docs/air-integration.md, retarget the links to `#hermod-air-configure-claude-remote` and `#an-fs-relay-never-picks-a-winner`, and replace the sandbox, `hermod-<uuid>`, pause and teardown and `--node`/`--acp` wording
-- [ ] 14.4 Run `openspec validate add-air-bridge --strict`
+- [x] 14.3 In docs/air-integration.md, retarget the links to `#hermod-air-configure-claude-remote` and `#an-fs-relay-never-picks-a-winner`, and replace the sandbox, `hermod-<uuid>`, pause and teardown and `--node`/`--acp` wording
+- [x] 14.4 Run `openspec validate add-air-bridge --strict`
