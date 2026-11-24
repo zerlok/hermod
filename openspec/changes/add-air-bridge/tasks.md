@@ -81,11 +81,11 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 ## 10. Adapter: `air`
 
-- [ ] 10.1 Rewrite `internal/air` with `Config` (`Load`, `Merge`, `Save`) and `Entry`, keeping every entry and key it does not own and writing `command` as an absolute path ([`hermod air configure claude [REMOTE]`](design.md#hermod-air-configure-claude-remote)); move `ReadACP`, `Merge` and the file replacement of `air.go`
-- [ ] 10.2 `Configure`: merge the remote's entry, and return the stand-in link's path when one is found and the `HERMOD_REMOTE=<remote>` line for terminal mode ([Registration](../../../docs/ARCHITECTURE.md#registration-hermod-air-configure))
-- [ ] 10.3 `Methods`: Air's table for `acp`, `session/close` as `Suspend` and `_session/archive` as `Close`, and no standard ACP method, which `acp` gives its `Kind`; move the method names of `archive.go`
-- [ ] 10.4 Remove `LinkStandIn` and `StandInPath`'s creation and repair; add the link to `make install`
-- [ ] 10.5 Tests: merge into an empty, a full and a linked `acp.json`, idempotent; `--name` and `--origin` set, empty and absent; the methods table
+- [x] 10.1 Rewrite `internal/air` with `Config` (`Load`, `Merge`, `Save`) and `Entry`, keeping every entry and key it does not own and writing `command` as an absolute path ([`hermod air configure claude [REMOTE]`](design.md#hermod-air-configure-claude-remote)); move `ReadACP`, `Merge` and the file replacement of `air.go`
+- [x] 10.2 `Configure`: merge the remote's entry, and return the stand-in link's path when one is found and the `HERMOD_REMOTE=<remote>` line for terminal mode ([Registration](../../../docs/ARCHITECTURE.md#registration-hermod-air-configure))
+- [x] 10.3 `Methods`: Air's table for `acp`, `session/close` as `Suspend` and `_session/archive` as `Close`, and no standard ACP method, which `acp` gives its `Kind`; move the method names of `archive.go`
+- [x] 10.4 Remove `LinkStandIn` and `StandInPath`'s creation and repair; add the link to `make install`
+- [x] 10.5 Tests: merge into an empty, a full and a linked `acp.json`, idempotent; `--name` and `--origin` set, empty and absent; the methods table
 
 ## 11. Adapter: `git`
 
