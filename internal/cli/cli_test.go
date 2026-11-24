@@ -1,284 +1,696 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/zerlok/hermod/internal/control"
-	"github.com/zerlok/hermod/internal/sandbox"
-	"github.com/zerlok/hermod/internal/secret"
+	"github.com/zerlok/hermod/internal/session"
+	"github.com/zerlok/hermod/internal/worker"
 )
 
-// capture records the arguments the runner was handed.
-type capture struct {
-	called  bool
-	sandbox string
-	opts    []control.Option
+// attachView is what an attach's request resolved, comparable in a table.
+// A stream or the plan is named by the process's stream it is, "" for none.
+type attachView struct {
+	remote, remoteHome string
+	dir, name          string
+	args               []string
+	forwards           []session.Forward
+	origin, locks      string
+	in, out, err       string
+	plan               string
 }
 
-// resolved replays the captured options into an Options, exactly as control.Run
-// would, so a test can assert the effective settings the invocation produced.
-func (c capture) resolved() control.Options {
-	o := control.Options{Sandbox: c.sandbox}
-	for _, opt := range c.opts {
-		opt(&o)
+func viewAttach(req session.Request, r *recorder) attachView {
+	v := attachView{
+		remote: req.Remote.Host, remoteHome: req.Remote.Home,
+		dir: req.Dir, name: req.Name, args: req.Args, forwards: req.Forwards,
+		origin: req.Local.Origin, locks: req.Local.Locks,
+		in: r.streamName(req.Streams.In), out: r.streamName(req.Streams.Out), err: r.streamName(req.Streams.Err),
 	}
-	return o
-}
-
-// env is a fixed environment; a key that is absent is unset.
-type env map[string]string
-
-func (e env) lookup(key string) (string, bool) {
-	v, ok := e[key]
-	return v, ok
-}
-
-// environ is the environment as KEY=VALUE entries, in key order.
-func (e env) environ() []string {
-	var out []string
-	for k, v := range e {
-		out = append(out, k+"="+v)
+	if p, dry := req.Remote.Exec.(planner); dry {
+		v.plan = r.streamName(p.plan)
 	}
-	sort.Strings(out)
-	return out
+	return v
 }
 
-// testApp wires the commands to a capturing runner and a fixed environment so
-// parsing is deterministic.
-func testApp(c *capture, e env, hostname func() (string, error), home string) app {
-	return app{
-		run: func(_ context.Context, sandbox string, opts ...control.Option) error {
-			c.called = true
-			c.sandbox = sandbox
-			c.opts = opts
-			return nil
-		},
-		cwd:       func() (string, error) { return "/home/u/api", nil },
-		home:      func() (string, error) { return home, nil },
-		hostname:  hostname,
-		lookupEnv: e.lookup,
-		environ:   e.environ,
-	}
+var attachBase = attachView{
+	remote: "prod-box", remoteHome: testRemoteHome,
+	dir: testCwd, name: "dev-api",
+	origin: testHostname, locks: testHome + "/.cache/hermod/lease",
+	in: "stdin", out: "stdout", err: "stderr",
 }
 
-func fixedHostname(name string) func() (string, error) {
-	return func() (string, error) { return name, nil }
+func attachWith(change func(v *attachView)) attachView {
+	v := attachBase
+	change(&v)
+	return v
 }
 
-func failingHostname() (string, error) { return "", errors.New("no hostname") }
-
-func TestAttachResolvesOptions(t *testing.T) {
+// TestAttachResolves runs every argument and variable of `attach`, and of the
+// stand-in, which is `attach -- claude ARGS…` under another name, and checks
+// the request each one hands the core.
+func TestAttachResolves(t *testing.T) {
 	cases := []struct {
-		name        string
-		commandLine string // the args as typed, split on spaces for readability
-		env         env
-		hostname    func() (string, error)
-		wantSandbox string
-		wantSession string
-		wantDir     string
-		wantRemote  string
-		wantCommand sandbox.Command
-		wantOrigin  string
-		wantDryRun  bool
-		wantQuiet   bool
+		name     string
+		argv     string // split on spaces; the first word is the program name
+		env      vars
+		terminal bool
+		want     attachView
 	}{
-		{"defaults from cwd", "attach prod", env{}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.Command{}, "laptop", false, false},
-		{"explicit session", "attach prod -s my-session", env{}, fixedHostname("laptop"),
-			"prod", "my-session", "/home/u/api", "api", sandbox.Command{}, "laptop", false, false},
-		{"explicit directory slug session", "attach prod -C /home/u/work/svc", env{}, fixedHostname("laptop"),
-			"prod", "work-svc", "/home/u/work/svc", "work/svc", sandbox.Command{}, "laptop", false, false},
-		{"dry-run flag", "attach prod -n", env{}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.Command{}, "laptop", true, false},
-		{"quiet flag", "attach prod -q", env{}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.Command{}, "laptop", false, true},
-		{"passthrough verbatim", "attach prod -- htop -d 5", env{}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.Exec([]string{"htop", "-d", "5"}), "laptop", false, false},
-		{"flags then passthrough", "attach prod -n -- htop -d 5", env{}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.Exec([]string{"htop", "-d", "5"}), "laptop", true, false},
-		{"sandbox from the environment", "attach", env{envSandbox: "env-box"}, fixedHostname("laptop"),
-			"env-box", "api", "/home/u/api", "api", sandbox.Command{}, "laptop", false, false},
-		{"sandbox from the environment with flags and passthrough", "attach -n -- htop", env{envSandbox: "env-box"}, fixedHostname("laptop"),
-			"env-box", "api", "/home/u/api", "api", sandbox.Exec([]string{"htop"}), "laptop", true, false},
-		{"argument wins over the environment's sandbox", "attach prod", env{envSandbox: "env-box"}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.Command{}, "laptop", false, false},
-		{"command line from the environment", "attach prod", env{envSandboxCmd: "htop -d 5 | tee log"}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.ShellLine("htop -d 5 | tee log"), "laptop", false, false},
-		{"passthrough wins over the environment's command", "attach prod -- top", env{envSandboxCmd: "htop"}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.Exec([]string{"top"}), "laptop", false, false},
-		{"empty passthrough falls back to the environment's command", "attach prod --", env{envSandboxCmd: "htop"}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.ShellLine("htop"), "laptop", false, false},
-		{"empty environment command runs the default shell", "attach prod", env{envSandboxCmd: ""}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.Command{}, "laptop", false, false},
-		{"blank environment command runs the default shell", "attach prod", env{envSandboxCmd: "   "}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.Command{}, "laptop", false, false},
-		{"blank environment sandbox yields to the argument", "attach prod", env{envSandbox: "  "}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.Command{}, "laptop", false, false},
-		{"origin from the environment", "attach prod", env{envOrigin: "work-laptop"}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.Command{}, "work-laptop", false, false},
-		{"empty origin names nothing", "attach prod", env{envOrigin: ""}, fixedHostname("laptop"),
-			"prod", "api", "/home/u/api", "api", sandbox.Command{}, "", false, false},
-		{"origin reduced to safe characters", "attach prod", env{}, fixedHostname("my laptop_2.local"),
-			"prod", "api", "/home/u/api", "api", sandbox.Command{}, "my-laptop-2.local", false, false},
-		{"unreadable hostname names nothing", "attach prod", env{}, failingHostname,
-			"prod", "api", "/home/u/api", "api", sandbox.Command{}, "", false, false},
+		{"the remote as an argument", "hermod attach prod-box", vars{}, true, attachBase},
+		{"the remote from the environment", "hermod attach", vars{envRemote: "prod-box"}, true, attachBase},
+		{"an argument wins over the environment", "hermod attach prod-box", vars{envRemote: "other"}, true, attachBase},
+		{"a blank variable is unset", "hermod attach prod-box", vars{envRemote: " "}, true, attachBase},
+		{"a worker's name", "hermod attach prod-box -s my-session", vars{}, true,
+			attachWith(func(v *attachView) { v.name = "my-session" })},
+		{"a directory", "hermod attach prod-box -C /home/me/work/web.v2", vars{}, true,
+			attachWith(func(v *attachView) { v.dir, v.name = "/home/me/work/web.v2", "work-web-v2-7422e219" })},
+		{"a directory whose dash is its own", "hermod attach prod-box -C /home/me/work/web-v2", vars{}, true,
+			attachWith(func(v *attachView) { v.dir, v.name = "/home/me/work/web-v2", "work-web-v2" })},
+		{"a directory of a key's characters", "hermod attach prod-box -C ~/a@b+c_d", vars{}, true,
+			attachWith(func(v *attachView) { v.dir, v.name = "/home/me/a@b+c_d", "a@b+c_d" })},
+		{"a directory starting with a dash", "hermod attach prod-box -C ~/-foo", vars{}, true,
+			attachWith(func(v *attachView) { v.dir, v.name = "/home/me/-foo", "foo-9e796486" })},
+		{"a directory under the home", "hermod attach prod-box -C ~/work", vars{}, true,
+			attachWith(func(v *attachView) { v.dir, v.name = "/home/me/work", "work" })},
+		{"a relative directory", "hermod attach prod-box -C ../web", vars{}, true,
+			attachWith(func(v *attachView) { v.dir, v.name = "/home/me/dev/web", "dev-web" })},
+		{"a directory outside the home", "hermod attach prod-box -C /opt/work/api", vars{}, true,
+			attachWith(func(v *attachView) { v.dir, v.name = "/opt/work/api", "opt-work-api" })},
+		{"the root directory", "hermod attach prod-box -C /", vars{}, true,
+			attachWith(func(v *attachView) { v.dir, v.name = "/", "8a5edab2" })},
+		{"a directory in another script", "hermod attach prod-box -C ~/проект", vars{}, true,
+			attachWith(func(v *attachView) { v.dir, v.name = "/home/me/проект", "e5f78e8f" })},
+		{"a directory partly in another script", "hermod attach prod-box -C ~/a-проект", vars{}, true,
+			attachWith(func(v *attachView) { v.dir, v.name = "/home/me/a-проект", "a-f80b8c35" })},
+		{"the home itself", "hermod attach prod-box -C ~", vars{}, true,
+			attachWith(func(v *attachView) { v.dir, v.name = testHome, "me" })},
+		{"a command", "hermod attach prod-box -- htop -d 5", vars{}, true,
+			attachWith(func(v *attachView) { v.args = []string{"htop", "-d", "5"} })},
+		{"a command line from the environment", "hermod attach prod-box", vars{envRemoteCmd: "htop -d 5"}, true,
+			attachWith(func(v *attachView) { v.args = []string{"sh", "-c", userShellLine, "sh", "htop -d 5"} })},
+		{"a command wins over the environment", "hermod attach prod-box -- htop", vars{envRemoteCmd: "top"}, true,
+			attachWith(func(v *attachView) { v.args = []string{"htop"} })},
+		{"a blank command line is the shell", "hermod attach prod-box", vars{envRemoteCmd: "  "}, true, attachBase},
+		{"a relay", "hermod attach prod-box -R 9000:localhost:8080", vars{}, true,
+			attachWith(func(v *attachView) { v.forwards = []session.Forward{{Port: 9000, Address: "localhost:8080"}} })},
+		{"two relays", "hermod attach prod-box -R 9000:localhost:8080 -R 9001:127.0.0.1:8081", vars{}, true,
+			attachWith(func(v *attachView) {
+				v.forwards = []session.Forward{{Port: 9000, Address: "localhost:8080"}, {Port: 9001, Address: "127.0.0.1:8081"}}
+			})},
+		{"a dry run", "hermod attach prod-box -n", vars{}, true,
+			attachWith(func(v *attachView) { v.plan = "stdout" })},
+		{"an origin", "hermod attach prod-box", vars{envOrigin: "work-laptop"}, true,
+			attachWith(func(v *attachView) { v.origin = "work-laptop" })},
+		{"an empty origin names none", "hermod attach prod-box", vars{envOrigin: ""}, true,
+			attachWith(func(v *attachView) { v.origin = "" })},
+		{"a runtime directory for the locks", "hermod attach prod-box", vars{envRuntimeDir: "/run/user/1000"}, true,
+			attachWith(func(v *attachView) { v.locks = "/run/user/1000/hermod/lease" })},
+		{"a cache home for the locks", "hermod attach prod-box", vars{envCacheHome: "/xdg/cache"}, true,
+			attachWith(func(v *attachView) { v.locks = "/xdg/cache/hermod/lease" })},
+		{"a relative cache home is ignored", "hermod attach prod-box", vars{envCacheHome: "cache"}, true, attachBase},
+		{"hermod by its path", "/usr/local/bin/hermod attach prod-box -- claude --version", vars{}, true,
+			attachWith(func(v *attachView) { v.args = []string{"claude", "--version"} })},
+
+		{"started as claude", "claude --session-id 0b7e5f3c-2a41-4c8e-9d6f-1e2a3b4c5d6e", vars{envRemote: "prod-box"}, true,
+			attachWith(func(v *attachView) {
+				v.args = []string{"claude", "--session-id", "0b7e5f3c-2a41-4c8e-9d6f-1e2a3b4c5d6e"}
+			})},
+		{"started by the link's path", "/home/me/.local/share/hermod/bin/claude auth status", vars{envRemote: "prod-box"}, false,
+			attachWith(func(v *attachView) { v.args = []string{"claude", "auth", "status"} })},
+		{"Hermod's flags stay Claude's", "claude -n", vars{envRemote: "prod-box"}, true,
+			attachWith(func(v *attachView) { v.args = []string{"claude", "-n"} })},
+		{"Hermod's command stays Claude's", "claude attach other-box", vars{envRemote: "prod-box"}, false,
+			attachWith(func(v *attachView) { v.args = []string{"claude", "attach", "other-box"} })},
+		{"the stand-in ignores the command line", "claude --model opus", vars{envRemote: "prod-box", envRemoteCmd: "htop"}, true,
+			attachWith(func(v *attachView) { v.args = []string{"claude", "--model", "opus"} })},
+		{"a one-shot call without a terminal", "claude --version", vars{envRemote: "prod-box"}, false,
+			attachWith(func(v *attachView) { v.args = []string{"claude", "--version"} })},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var c capture
-			cmd := newRootCmd(testApp(&c, tc.env, tc.hostname, "/home/u"))
-			cmd.SetArgs(strings.Fields(tc.commandLine))
-			cmd.SetOut(io.Discard)
-			cmd.SetErr(io.Discard)
-			if err := cmd.Execute(); err != nil {
-				t.Fatalf("Execute() error: %v", err)
+			a, r := newApp(t, setup{env: tc.env, terminal: tc.terminal})
+			if err := execute(context.Background(), a, strings.Fields(tc.argv)); err != nil {
+				t.Fatalf("execute: %v", err)
 			}
-			if !c.called {
-				t.Fatal("runner was not called")
+			if len(r.attached) != 1 {
+				t.Fatalf("attached %d times, want once", len(r.attached))
 			}
-			want := control.Options{
-				Sandbox:   tc.wantSandbox,
-				Session:   tc.wantSession,
-				LocalDir:  tc.wantDir,
-				RemoteDir: tc.wantRemote,
-				Command:   tc.wantCommand,
-				Origin:    tc.wantOrigin,
-				DryRun:    tc.wantDryRun,
-				Quiet:     tc.wantQuiet,
-
-				Environ:         secret.NewEnv(tc.env.environ()),
-				ClaudeConfigDir: "/home/u/.claude",
-				LeaseDir:        "/home/u/.cache/hermod/lease",
+			req := r.attached[0]
+			if got := viewAttach(req, r); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("request\n%+v\nwant\n%+v", got, tc.want)
 			}
-			if got := c.resolved(); !reflect.DeepEqual(got, want) {
-				t.Errorf("Options = %+v, want %+v", got, want)
+			if req.Agent == nil {
+				t.Error("the request carries no agent")
 			}
 		})
 	}
 }
 
-// TestInvocationErrorsRunNothing asserts every rejected invocation fails before
-// the runner, which starts all syncs and sessions, is reached.
-func TestInvocationErrorsRunNothing(t *testing.T) {
+// The git commands an attach reads the developer's facts with.
+const (
+	gitName      = "git config --get user.name"
+	gitEmail     = "git config --get user.email"
+	gitRevParse  = "git rev-parse --path-format=absolute --git-dir --git-common-dir --show-toplevel"
+	gitWorktrees = "git worktree list --porcelain"
+)
+
+// TestAttachReadsGit checks that the developer's git identity and the linked
+// worktree the directory lies in reach the request.
+func TestAttachReadsGit(t *testing.T) {
 	cases := []struct {
-		name        string
-		commandLine string
-		env         env
+		name         string
+		git          map[string]string
+		wantIdentity session.Identity
+		wantMain     string
+		wantRoot     string
 	}{
-		{"no sandbox anywhere", "attach", env{}},
-		{"empty environment sandbox", "attach", env{envSandbox: ""}},
-		{"blank environment sandbox", "attach", env{envSandbox: "  "}},
-		{"environment sandbox read as an ssh option", "attach", env{envSandbox: "-oProxyCommand=touch /tmp/x"}},
-		{"argument starting with a dash", "attach -", env{}},
-		{"argument holding a quote", `attach we"ird`, env{}},
-		{"environment sandbox holding a tab", "attach", env{envSandbox: "a\tb"}},
-		{"only passthrough", "attach -- htop", env{}},
-		{"only flags", "attach -n -s x", env{envSandboxCmd: "htop"}},
-		{"two aliases", "attach prod staging", env{}},
-		{"bare sandbox form", "prod", env{}},
-		{"bare sandbox form with the environment set", "prod", env{envSandbox: "prod"}},
-		{"removed notify command", "notify done", env{envSandbox: "prod"}},
-		{"removed no-notify flag", "attach prod -N", env{}},
+		{"no repository", nil, session.Identity{}, "", ""},
+		{"an identity", map[string]string{gitName: "Ann\n", gitEmail: "ann@example.com\n"},
+			session.Identity{Name: "Ann", Email: "ann@example.com"}, "", ""},
+		{"a main working tree", map[string]string{
+			gitRevParse: "/home/me/dev/api/.git\n/home/me/dev/api/.git\n/home/me/dev/api\n",
+		}, session.Identity{}, "", ""},
+		{"a linked worktree", map[string]string{
+			gitRevParse:  "/home/me/src/api/.git/worktrees/api\n/home/me/src/api/.git\n/home/me/dev/api\n",
+			gitWorktrees: "worktree /home/me/src/api\nHEAD abc\nbranch refs/heads/main\n\nworktree /home/me/dev/api\n",
+		}, session.Identity{}, "/home/me/src/api", "/home/me/dev/api"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var c capture
-			cmd := newRootCmd(testApp(&c, tc.env, fixedHostname("laptop"), "/home/u"))
-			cmd.SetArgs(strings.Fields(tc.commandLine))
-			cmd.SetOut(io.Discard)
-			cmd.SetErr(io.Discard)
-			if err := cmd.Execute(); err == nil {
-				t.Fatal("expected error, got nil")
+			a, r := newApp(t, setup{answers: tc.git})
+			if err := execute(context.Background(), a, strings.Fields("hermod attach prod-box")); err != nil {
+				t.Fatalf("execute: %v", err)
 			}
-			if c.called {
-				t.Error("runner was called despite an invocation error")
+			if len(r.attached) != 1 {
+				t.Fatalf("attached %d times, want once", len(r.attached))
+			}
+			req := r.attached[0]
+			if req.Identity != tc.wantIdentity || req.Tree.Main != tc.wantMain || req.Tree.Root != tc.wantRoot {
+				t.Errorf("identity, main, root = %+v, %q, %q, want %+v, %q, %q",
+					req.Identity, req.Tree.Main, req.Tree.Root, tc.wantIdentity, tc.wantMain, tc.wantRoot)
 			}
 		})
 	}
 }
 
-// TestAttachCompletesSandboxHosts runs cobra's completion entry point, which the
-// generated shell scripts call, so the hosts reach `hermod attach <TAB>`.
-func TestAttachCompletesSandboxHosts(t *testing.T) {
+// TestRefusesBeforeAnything checks that an invocation that cannot be
+// resolved fails before it runs any command or hands anything to the core.
+func TestRefusesBeforeAnything(t *testing.T) {
 	cases := []struct {
-		name      string
-		sshConfig string
-		args      []string
-		want      []string
+		name     string
+		argv     string
+		env      vars
+		terminal bool
+		wantErr  string
 	}{
-		{"first argument offers hosts", "Host prod-box\nHost api\nHost *\n", []string{"attach", ""}, []string{"api", "prod-box"}},
-		{"after flags still offers hosts", "Host prod-box\n", []string{"attach", "-n", ""}, []string{"prod-box"}},
-		{"second argument offers nothing", "Host prod-box\n", []string{"attach", "prod-box", ""}, nil},
-		{"no ssh config offers nothing", "", []string{"attach", ""}, nil},
+		{"attach without a remote", "hermod attach", vars{}, true, envRemote},
+		{"attach with a blank remote", "hermod attach", vars{envRemote: "  "}, true, envRemote},
+		{"a remote read as an ssh option", "hermod attach", vars{envRemote: "-oProxyCommand=x"}, true, "starts with '-'"},
+		{"a remote holding a quote", "hermod attach", vars{envRemote: "prod'box"}, true, "quote"},
+		{"two remotes", "hermod attach prod-box dev-box", vars{}, true, "only one remote"},
+		{"a relay without an address", "hermod attach prod-box -R 9000", vars{}, true, "PORT:ADDRESS"},
+		{"a relay to no port", "hermod attach prod-box -R 9000:localhost", vars{}, true, "host:port"},
+		{"a relay from no port", "hermod attach prod-box -R http:localhost:80", vars{}, true, "PORT:ADDRESS"},
+		{"the bare form", "hermod prod-box", vars{envRemote: "prod-box"}, true, "unknown command"},
+		{"acp without a remote", "hermod air acp claude", vars{}, true, envRemote},
+		{"acp for another agent", "hermod air acp codex prod-box", vars{}, true, "unknown agent"},
+		{"acp without an agent", "hermod air acp", vars{envRemote: "prod-box"}, true, "name the agent"},
+		{"configure without a remote", "hermod air configure claude", vars{}, true, envRemote},
+		{"configure with two remotes", "hermod air configure claude a b", vars{}, true, "only one remote"},
+		{"air without a subcommand", "hermod air", vars{}, true, "name a subcommand"},
+		{"the stand-in without a remote", "claude --version", vars{}, true, envRemote},
+		{"the stand-in's argument is no remote", "claude prod-box", vars{}, true, envRemote},
+		{"the stand-in with a remote holding a newline", "claude --version", vars{envRemote: "prod\nbox"}, true, "control character"},
+		{"a conversation without a terminal", "claude --session-id 0b7e5f3c-2a41-4c8e-9d6f-1e2a3b4c5d6e", vars{envRemote: "prod-box"}, false, "hermod air acp"},
+		{"Claude's own session without a terminal", "claude", vars{envRemote: "prod-box"}, false, "hermod air acp"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			home := t.TempDir()
-			if tc.sshConfig != "" {
-				if err := os.MkdirAll(filepath.Join(home, ".ssh"), 0o700); err != nil {
+			a, r := newApp(t, setup{env: tc.env, terminal: tc.terminal})
+			err := execute(context.Background(), a, strings.Fields(tc.argv))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("execute: %v, want an error mentioning %q", err, tc.wantErr)
+			}
+			if r.called() != 0 || len(r.local.ran) != 0 || len(r.logs) != 0 {
+				t.Errorf("handed in %d requests, ran %q and opened %d logs, want nothing", r.called(), r.local.ran, len(r.logs))
+			}
+		})
+	}
+}
+
+// chatView is what an `air acp`'s request resolved.
+type chatView struct {
+	remote, remoteHome string
+	origin, locks      string
+}
+
+// TestACPResolves checks the request `air acp` hands the core.
+func TestACPResolves(t *testing.T) {
+	base := chatView{remote: "prod-box", remoteHome: testRemoteHome, origin: testHostname, locks: testHome + "/.cache/hermod/lease"}
+	cases := []struct {
+		name string
+		argv string
+		env  vars
+		want chatView
+	}{
+		{"the remote as an argument", "hermod air acp claude prod-box", vars{}, base},
+		{"the remote from the environment", "hermod air acp claude", vars{envRemote: "prod-box"}, base},
+		{"an argument wins over the environment", "hermod air acp claude prod-box", vars{envRemote: "other"}, base},
+		{"an origin from the entry", "hermod air acp claude prod-box", vars{envOrigin: "work"}, chatView{
+			remote: "prod-box", remoteHome: testRemoteHome, origin: "work", locks: base.locks,
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, r := newApp(t, setup{env: tc.env})
+			if err := execute(context.Background(), a, strings.Fields(tc.argv)); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if len(r.chats) != 1 {
+				t.Fatalf("served %d chats, want one", len(r.chats))
+			}
+			req := r.chats[0]
+			got := chatView{remote: req.Remote.Host, remoteHome: req.Remote.Home, origin: req.Local.Origin, locks: req.Local.Locks}
+			if got != tc.want {
+				t.Errorf("request %+v, want %+v", got, tc.want)
+			}
+			if req.Client == nil || req.Agent == nil || req.Attach == nil {
+				t.Errorf("client, agent, attach = %v, %v, %v; want all given", req.Client, req.Agent, req.Attach != nil)
+			}
+			if _, dry := req.Remote.Exec.(planner); dry {
+				t.Error("a chat plans its commands, want them run")
+			}
+		})
+	}
+}
+
+// configureView is what an `air configure`'s request resolved.
+type configureView struct {
+	remote, name, hermod, dataHome string
+	env                            map[string]string
+	searchPath                     []string
+	dryRun                         bool
+}
+
+// TestConfigureResolves checks the request `air configure` hands Air's
+// adapter, and what it prints.
+func TestConfigureResolves(t *testing.T) {
+	base := configureView{remote: "prod-box", hermod: testHermod, dataHome: testHome + "/.local/share"}
+	with := func(change func(v *configureView)) configureView {
+		v := base
+		change(&v)
+		return v
+	}
+	cases := []struct {
+		name       string
+		argv       string
+		env        vars
+		want       configureView
+		wantOutput []string
+	}{
+		{"the remote as an argument", "hermod air configure claude prod-box", vars{}, base,
+			[]string{"written to " + testHome + "/.jetbrains/acp.json", envRemote + "=prod-box", "make install"}},
+		{"the remote from the environment", "hermod air configure claude", vars{envRemote: "prod-box"}, base,
+			[]string{"written to"}},
+		{"an argument wins over the environment", "hermod air configure claude prod-box", vars{envRemote: "other"}, base,
+			[]string{envRemote + "=prod-box"}},
+		{"a name", "hermod air configure claude prod-box --name Prod", vars{}, with(func(v *configureView) { v.name = "Prod" }),
+			[]string{`"Prod"`}},
+		{"an origin", "hermod air configure claude prod-box --origin=work", vars{},
+			with(func(v *configureView) { v.env = map[string]string{envOrigin: "work"} }), nil},
+		{"an empty origin", "hermod air configure claude prod-box --origin=", vars{envOrigin: "home"},
+			with(func(v *configureView) { v.env = map[string]string{envOrigin: ""} }), nil},
+		{"an origin from the environment", "hermod air configure claude prod-box", vars{envOrigin: "home"},
+			with(func(v *configureView) { v.env = map[string]string{envOrigin: "home"} }), nil},
+		{"an empty origin from the environment", "hermod air configure claude prod-box", vars{envOrigin: ""},
+			with(func(v *configureView) { v.env = map[string]string{envOrigin: ""} }), nil},
+		{"a data home", "hermod air configure claude prod-box", vars{envDataHome: "/xdg/data"},
+			with(func(v *configureView) { v.dataHome = "/xdg/data" }), nil},
+		{"the search path", "hermod air configure claude prod-box", vars{envPath: "/usr/bin:/home/me/bin"},
+			with(func(v *configureView) { v.searchPath = []string{"/usr/bin", "/home/me/bin"} }), nil},
+		{"a dry run", "hermod air configure claude prod-box -n", vars{}, with(func(v *configureView) { v.dryRun = true }),
+			[]string{"Dry run", `"command": "` + testHermod + `"`}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, r := newApp(t, setup{env: tc.env})
+			if err := execute(context.Background(), a, strings.Fields(tc.argv)); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if len(r.configured) != 1 {
+				t.Fatalf("configured %d times, want once", len(r.configured))
+			}
+			req := r.configured[0]
+			got := configureView{
+				remote: req.Remote, name: req.Name, hermod: req.Hermod, dataHome: req.DataHome,
+				env: req.Env, searchPath: req.SearchPath, dryRun: req.DryRun,
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("request\n%+v\nwant\n%+v", got, tc.want)
+			}
+			if req.Home != testHome || req.RemoteVariable != envRemote {
+				t.Errorf("home, remote variable = %q, %q, want %q, %q", req.Home, req.RemoteVariable, testHome, envRemote)
+			}
+			for _, want := range tc.wantOutput {
+				if !strings.Contains(r.stdout.String(), want) {
+					t.Errorf("output %q, want it to hold %q", r.stdout.String(), want)
+				}
+			}
+			if len(r.local.ran) != 0 {
+				t.Errorf("ran %q, want nothing", r.local.ran)
+			}
+		})
+	}
+}
+
+// TestStandInOutput checks that the stand-in leaves stdout to Claude's
+// caller, writing Hermod's own lines to stderr and to the log of the
+// session, named after the conversation or the worker; that a log that
+// cannot be opened costs only the log; and that a stderr whose reader has
+// gone costs no line of the log and does not fail the run.
+func TestStandInOutput(t *testing.T) {
+	const say = "worker dev-api: attach"
+	logs := testHome + "/.cache/hermod/air/"
+	cases := []struct {
+		name       string
+		argv       string
+		env        vars
+		logFails   bool
+		stderrGone bool
+		wantLog    string // "" opens none
+		wantStderr []string
+	}{
+		{"a conversation", "claude --resume 0b7e5f3c-2a41-4c8e-9d6f-1e2a3b4c5d6e", vars{envRemote: "prod-box"}, false, false,
+			logs + "0b7e5f3c-2a41-4c8e-9d6f-1e2a3b4c5d6e.log", []string{say}},
+		{"Claude's own session", "claude", vars{envRemote: "prod-box"}, false, false, logs + "dev-api.log", []string{say}},
+		{"a cache home", "claude", vars{envRemote: "prod-box", envCacheHome: "/xdg/cache"}, false, false,
+			"/xdg/cache/hermod/air/dev-api.log", []string{say}},
+		{"a log that cannot be opened", "claude", vars{envRemote: "prod-box"}, true, false, "",
+			[]string{say, "read-only file system"}},
+		{"stderr gone", "claude", vars{envRemote: "prod-box"}, false, true, logs + "dev-api.log", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, r := newApp(t, setup{env: tc.env, terminal: true, say: say, logFails: tc.logFails, stderrGone: tc.stderrGone})
+			if err := execute(context.Background(), a, strings.Fields(tc.argv)); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if r.stdout.Len() != 0 {
+				t.Errorf("stdout %q, want nothing of Hermod's", r.stdout.String())
+			}
+			for _, want := range tc.wantStderr {
+				if !strings.Contains(r.stderr.String(), want) {
+					t.Errorf("stderr %q, want it to hold %q", r.stderr.String(), want)
+				}
+			}
+			if tc.wantLog == "" {
+				if len(r.logs) != 0 {
+					t.Errorf("opened logs %v, want none", r.logs)
+				}
+				return
+			}
+			l, ok := r.logs[tc.wantLog]
+			if !ok || len(r.logs) != 1 {
+				t.Fatalf("opened logs %v, want only %s", r.logs, tc.wantLog)
+			}
+			if !strings.Contains(l.String(), say) || !l.closed {
+				t.Errorf("log %q, closed %v, want it to hold %q and be closed", l.String(), l.closed, say)
+			}
+		})
+	}
+}
+
+// TestMutagenOutput checks that the stand-in also writes what its Mutagen
+// commands print to stderr and the log, and nothing of it to stdout; that it
+// copies no other command's output; and that attach leaves Mutagen's output
+// to the core.
+func TestMutagenOutput(t *testing.T) {
+	const (
+		mutagen = "mutagen sync flush hermod-api"
+		other   = "tmux ls"
+		printed = "Flushed the session"
+	)
+	answers := map[string]string{mutagen: printed + "\n", other: printed + "\n"}
+	logName := testHome + "/.cache/hermod/air/dev-api.log"
+	cases := []struct {
+		name       string
+		argv       string
+		run        string
+		wantStderr bool
+		wantLog    bool
+	}{
+		{"the stand-in's Mutagen command", "claude", mutagen, true, true},
+		{"the stand-in's other command", "claude", other, false, false},
+		{"attach's Mutagen command", "hermod attach prod-box", mutagen, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, r := newApp(t, setup{env: vars{envRemote: "prod-box"}, terminal: true, answers: answers, run: []string{tc.run}})
+			if err := execute(context.Background(), a, strings.Fields(tc.argv)); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if r.stdout.Len() != 0 {
+				t.Errorf("stdout %q, want nothing", r.stdout.String())
+			}
+			if got := strings.Contains(r.stderr.String(), printed); got != tc.wantStderr {
+				t.Errorf("stderr %q holds the output: %v, want %v", r.stderr.String(), got, tc.wantStderr)
+			}
+			l := r.logs[logName]
+			if got := l != nil && strings.Contains(l.String(), printed); got != tc.wantLog {
+				t.Errorf("log %v holds the output: %v, want %v", r.logs, got, tc.wantLog)
+			}
+		})
+	}
+}
+
+// TestReadRemote checks the read of the remote's home and Claude's config
+// directory there. A row with a remote environment runs the command readRemote
+// sends under a real sh, so its quoting and the order of its answer are
+// checked as well as their parsing.
+func TestReadRemote(t *testing.T) {
+	cases := []struct {
+		name       string
+		out        string
+		err        error
+		remoteEnv  []string // nil answers out
+		wantHome   string
+		wantConfig string
+		wantErr    bool
+	}{
+		{"an answer", "/home/u\n/home/u/.claude\n", nil, nil, "/home/u", "/home/u/.claude", false},
+		{"after a profile's own lines", "Welcome!\n/home/u\n/srv/claude\n", nil, nil, "/home/u", "/srv/claude", false},
+		{"a relative home", "u\n/home/u/.claude\n", nil, nil, "", "", true},
+		{"one line", "/home/u\n", nil, nil, "", "", true},
+		{"ssh fails", "", errors.New("exit status 255"), nil, "", "", true},
+		{"the command, with Claude's directory unset", "", nil,
+			[]string{"SHELL=/bin/sh", "HOME=/nonexistent/u"}, "/nonexistent/u", "/nonexistent/u/.claude", false},
+		{"the command, with Claude's directory set", "", nil,
+			[]string{"SHELL=/bin/sh", "HOME=/nonexistent/u", envClaudeConfigDir + "=/srv/claude"}, "/nonexistent/u", "/srv/claude", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, r := newApp(t, setup{})
+			r.local.remoteOut, r.local.remoteErr, r.local.remoteEnv = tc.out, tc.err, tc.remoteEnv
+			remote, configDir, err := a.readRemote(context.Background(), "prod-box", r.local)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("readRemote: %v, want error %v", err, tc.wantErr)
+			}
+			if remote.Home != tc.wantHome || configDir != tc.wantConfig {
+				t.Errorf("home, config = %q, %q, want %q, %q", remote.Home, configDir, tc.wantHome, tc.wantConfig)
+			}
+		})
+	}
+}
+
+// TestAdapterLog checks where `air acp` logs an adapter's stderr: a
+// timestamped log named by the adapter's key, closed with it.
+func TestAdapterLog(t *testing.T) {
+	cases := []struct {
+		name     string
+		env      vars
+		key      string
+		logFails bool
+		wantLog  string // "" opens none
+	}{
+		{"by the key", vars{}, "hermod-acp-api", false, testHome + "/.cache/hermod/air/hermod-acp-api.log"},
+		{"under a cache home", vars{envCacheHome: "/xdg/cache"}, "hermod-acp-api", false, "/xdg/cache/hermod/air/hermod-acp-api.log"},
+		{"a log that cannot be opened", vars{}, "hermod-acp-api", true, ""},
+	}
+	const line = "adapter: bad request\n"
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, r := newApp(t, setup{env: tc.env, logFails: tc.logFails})
+			key, err := worker.NewKey(tc.key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w, err := a.adapterLog(testHome)(key)
+			if (err != nil) != (tc.wantLog == "") {
+				t.Fatalf("open: %v, want a log %q", err, tc.wantLog)
+			}
+			if tc.wantLog == "" {
+				if len(r.logs) != 0 {
+					t.Errorf("opened logs %v, want none", r.logs)
+				}
+				return
+			}
+			if _, err := io.WriteString(w, line); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			l, ok := r.logs[tc.wantLog]
+			if !ok || len(r.logs) != 1 {
+				t.Fatalf("opened logs %v, want only %s", r.logs, tc.wantLog)
+			}
+			if got := l.String(); !strings.HasSuffix(got, " "+line) || got == line || !l.closed {
+				t.Errorf("log %q, closed %v, want %q timestamped and closed", got, l.closed, line)
+			}
+		})
+	}
+}
+
+func TestExitCode(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantCode   int
+		wantStderr string
+	}{
+		{"success", nil, 0, ""},
+		{"the program's code passed on silently", session.ExitStatus(3), 3, ""},
+		{"a wrapped program's code", fmt.Errorf("run: %w", session.ExitStatus(127)), 127, ""},
+		{"Hermod's own failure", errors.New("open workspace: boom"), 1, "hermod: open workspace: boom\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr strings.Builder
+			if got := exitCode(tc.err, &stderr); got != tc.wantCode || stderr.String() != tc.wantStderr {
+				t.Errorf("exitCode = %d, %q, want %d, %q", got, stderr.String(), tc.wantCode, tc.wantStderr)
+			}
+		})
+	}
+}
+
+func TestOpenLogIsPrivate(t *testing.T) {
+	cases := []struct {
+		name     string
+		under    string // the log's place under a temporary directory
+		wantMode os.FileMode
+	}{
+		{"in a directory that exists", "a.log", 0o600},
+		{"in directories it makes", "hermod/air/a.log", 0o600},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			name := filepath.Join(t.TempDir(), tc.under)
+			f, err := openLog(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = f.Close()
+			info, err := os.Stat(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode().Perm(); got != tc.wantMode {
+				t.Errorf("mode %o, want %o", got, tc.wantMode)
+			}
+		})
+	}
+}
+
+func TestTimestamped(t *testing.T) {
+	at := time.Date(2026, 11, 24, 9, 30, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		writes []string
+		want   string
+	}{
+		{"one line", []string{"a\n"}, "2026/11/24 09:30:00 a\n"},
+		{"a line in two writes", []string{"a", "b\n"}, "2026/11/24 09:30:00 ab\n"},
+		{"two lines in one write", []string{"a\nb\n"}, "2026/11/24 09:30:00 a\n2026/11/24 09:30:00 b\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var b strings.Builder
+			w := &timestamped{w: &b, now: func() time.Time { return at }}
+			for _, s := range tc.writes {
+				if _, err := w.Write([]byte(s)); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(filepath.Join(home, ".ssh", "config"), []byte(tc.sshConfig), 0o600); err != nil {
-					t.Fatal(err)
-				}
 			}
-			var c capture
-			var out bytes.Buffer
-			cmd := newRootCmd(testApp(&c, env{}, fixedHostname("laptop"), home))
-			cmd.SetArgs(append([]string{"__complete"}, tc.args...))
-			cmd.SetOut(&out)
-			cmd.SetErr(io.Discard)
-			if err := cmd.Execute(); err != nil {
-				t.Fatalf("Execute() error: %v", err)
-			}
-			if got := completions(out.String()); !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("completions = %q, want %q", got, tc.want)
-			}
-			if c.called {
-				t.Error("runner was called while completing")
+			if b.String() != tc.want {
+				t.Errorf("log %q, want %q", b.String(), tc.want)
 			}
 		})
 	}
 }
 
-// completions reads the candidates from cobra's `__complete` output, which ends
-// with a `:<directive>` line.
-func completions(out string) []string {
-	var got []string
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if line == "" || strings.HasPrefix(line, ":") {
-			continue
-		}
-		got = append(got, line)
+func TestIsTerminal(t *testing.T) {
+	// A pty's master side answers for its terminal, so it stands for one
+	// without a controlling terminal; a system without ptys skips its row.
+	ptmx, ptmxErr := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if ptmxErr == nil {
+		defer ptmx.Close()
 	}
-	return got
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devNull.Close()
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pipeR.Close()
+	defer pipeW.Close()
+	cases := []struct {
+		name string
+		f    *os.File
+		want bool
+	}{
+		{"a terminal", ptmx, true},
+		{"a character device that is no terminal", devNull, false},
+		{"a pipe", pipeR, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.f == nil {
+				t.Skipf("no pty: %v", ptmxErr)
+			}
+			if got := isTerminal(tc.f); got != tc.want {
+				t.Errorf("isTerminal = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestParseSSHHosts(t *testing.T) {
 	cases := []struct {
-		name  string
-		input string
-		want  []string
+		name   string
+		config string
+		want   []string
 	}{
-		{"aliases sorted and deduped", "Host prod-box\nHost api\nHost prod-box\n", []string{"api", "prod-box"}},
-		{"multiple aliases per line", "Host a b c\n", []string{"a", "b", "c"}},
-		{"patterns skipped", "Host *\nHost web-?\nHost real\n", []string{"real"}},
-		{"case-insensitive keyword and indentation", "  host  Web\n", []string{"Web"}},
-		{"empty config", "", nil},
+		{"concrete aliases, sorted", "Host prod-box\nHost dev a\n", []string{"a", "dev", "prod-box"}},
+		{"patterns left out", "Host *\nHost web-?\nHost prod\n", []string{"prod"}},
+		{"case-insensitive keyword, duplicates once", "host prod\nHOST prod\n", []string{"prod"}},
+		{"none", "Match all\n", nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := parseSSHHosts(strings.NewReader(tc.input)); !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("parseSSHHosts() = %v, want %v", got, tc.want)
+			if got := parseSSHHosts(strings.NewReader(tc.config)); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("hosts %q, want %q", got, tc.want)
 			}
 		})
 	}

@@ -12,8 +12,8 @@ import (
 )
 
 // sshHostCompletions offers concrete host aliases from ~/.ssh/config for the
-// single sandbox argument, so the sandbox is tab-completable as the README
-// advertises. Only the first positional argument is completed.
+// single remote argument, so the remote is tab-completable. Only the first
+// positional argument is completed.
 func sshHostCompletions(home func() (string, error)) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
 	return func(_ *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
 		if len(args) > 0 {
