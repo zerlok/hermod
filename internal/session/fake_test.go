@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -83,11 +84,18 @@ type fake struct {
 	queryFails   bool                 // the agent program's listing and lookup fail
 	queryGarbled bool                 // the agent program's listing and lookup print what cannot be read
 	workersFail  bool                 // tmux cannot list its sessions
+	streamWaits  bool                 // a joined line stream serves until it is stopped, rather than ending at once
+	adapterSays  string               // what a joined line stream's process wrote to its stderr
+	forms        map[string]string    // the form each worker was started in, by key
+	joins        []string             // the form of each join, in order
 	ran          []string
 }
 
 func newFake() *fake {
-	return &fake{syncs: map[string]*mutagenSession{}, sessions: map[string]*tmuxSession{}, dirs: map[string]map[string]string{}}
+	return &fake{
+		syncs: map[string]*mutagenSession{}, sessions: map[string]*tmuxSession{},
+		dirs: map[string]map[string]string{}, forms: map[string]string{},
+	}
 }
 
 func (f *fake) remote() workspace.Remote {
@@ -399,6 +407,7 @@ func (f *fake) keep(args []string) play {
 		f.sessions[name] = &tmuxSession{state: worker.Running, tags: tags}
 		f.dirs[wd] = f.dirs[staging]
 		delete(f.dirs, staging)
+		f.forms[name] = args[7]
 		f.record("start in", args[3], name)
 		return nil
 	}
@@ -407,8 +416,20 @@ func (f *fake) keep(args []string) play {
 // act plays one operation of act.sh.
 func (f *fake) act(op string, args []string) play {
 	return func(ctx context.Context, _ io.Reader, out, _ io.Writer) error {
-		if op == "attach" {
+		switch op {
+		case "attach":
+			f.mu.Lock()
+			f.joins = append(f.joins, worker.Terminal.String())
+			f.mu.Unlock()
 			return f.join(ctx)
+		case "feed", "log":
+			if op == "log" && len(args) > 1 && path.Base(args[1]) == "err.log" {
+				f.mu.Lock()
+				says := f.adapterSays
+				f.mu.Unlock()
+				_, _ = io.WriteString(out, says)
+			}
+			return f.stream(ctx, op)
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -483,6 +504,36 @@ func (f *fake) workspaceOf() string {
 		return "-"
 	}
 	return names[0]
+}
+
+// stream is one command of a joined line stream: the feed of its FIFO, which
+// marks the join, or the read of one of its logs. Each ends at once, as for a
+// process that ended, unless the fake serves the stream until it is stopped.
+func (f *fake) stream(ctx context.Context, op string) error {
+	f.mu.Lock()
+	if op == "feed" {
+		f.joins = append(f.joins, worker.LineStream.String())
+	}
+	waits := f.streamWaits
+	f.mu.Unlock()
+	if waits {
+		<-ctx.Done()
+	}
+	return nil
+}
+
+// joined is the form of each join, in order.
+func (f *fake) joined() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.joins...)
+}
+
+// startedForm is the form the worker of key was started in, "" for none.
+func (f *fake) startedForm(key string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.forms[key]
 }
 
 // join is a joined terminal, ending as the fake was told.

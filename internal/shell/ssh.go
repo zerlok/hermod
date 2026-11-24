@@ -14,6 +14,7 @@ type ssh struct {
 	host     string
 	tty      bool
 	noMaster bool
+	failFast bool
 	reverse  []string // extra flags for -R reverse forwards; empty for plain ssh
 }
 
@@ -38,11 +39,19 @@ func WithoutSharedMaster() SSHOption {
 	}
 }
 
+// WithExitOnForwardFailure makes ssh exit when a forward cannot be set up,
+// for a connection that exists only to carry its forwards: without it ssh warns
+// and goes on, and the connection would carry nothing.
+func WithExitOnForwardFailure() SSHOption {
+	return func(s *ssh) {
+		s.failFast = true
+	}
+}
+
 // WithReverseForward forwards remotePort on the remote's loopback to localPort
 // on this machine's loopback (`-R <remotePort>:127.0.0.1:<localPort>`); repeated
-// options accumulate. Deliberately no ExitOnForwardFailure: the forward rides an
-// interactive attach, and a port that cannot be bound must cost only what the
-// forward carries, not the session. ssh then warns on its stderr and goes on.
+// options accumulate. A forward that cannot be bound costs only what it carries:
+// ssh warns on its stderr and goes on, unless WithExitOnForwardFailure is given.
 func WithReverseForward(remotePort, localPort int) SSHOption {
 	return func(s *ssh) {
 		s.reverse = append(s.reverse, "-R", strconv.Itoa(remotePort)+":127.0.0.1:"+strconv.Itoa(localPort))
@@ -74,6 +83,9 @@ func (s ssh) Exec(ctx context.Context, cmd Command) Execution {
 	}
 	if s.noMaster {
 		args = append(args, "-o", "ControlPath=none")
+	}
+	if s.failFast {
+		args = append(args, "-o", "ExitOnForwardFailure=yes")
 	}
 	args = append(args, s.reverse...)
 	args = append(args, s.host, format(cmd))

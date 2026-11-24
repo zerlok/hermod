@@ -524,12 +524,24 @@ func (w *Workspace) Start(ctx context.Context, spec worker.Spec) (worker.Worker,
 // Detach. A line stream has one reader: while another lease holds its relay
 // the attach fails with relay.ErrInUse.
 func (w *Workspace) Attach(ctx context.Context, key worker.Key, form worker.Form, streams relay.Streams) error {
-	if err := w.connect(ctx); err != nil {
+	wait, err := w.Join(ctx, key, form, streams)
+	if err != nil {
 		return err
+	}
+	return wait()
+}
+
+// Join is Attach for a caller that goes on while the relays serve: it returns
+// once they are connected, and wait returns when Attach would. A refused or
+// failed connect is Join's own error, so the caller learns it before it
+// hands the streams to anyone.
+func (w *Workspace) Join(ctx context.Context, key worker.Key, form worker.Form, streams relay.Streams) (wait func() error, err error) {
+	if err := w.connect(ctx); err != nil {
+		return nil, err
 	}
 	stdio, err := worker.New(w.workerRemote(), key).Stdio(form)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	opts := []shell.SSHOption{shell.WithoutSharedMaster()}
 	var remote relay.Stdio
@@ -540,15 +552,15 @@ func (w *Workspace) Attach(ctx context.Context, key worker.Key, form worker.Form
 	case worker.Lines:
 		remote = relay.Lines{In: s.In, Out: s.Out, Err: s.Err}
 	default:
-		return fmt.Errorf("workspace: unhandled stdio %T", stdio)
+		return nil, fmt.Errorf("workspace: unhandled stdio %T", stdio)
 	}
 	name := ioName(w.remote.Host, key)
 	lease, err := relay.NewIO(shell.NewSSH(w.remote.Exec, w.remote.Host, opts...), w.local.Locks, name, remote, streams).Connect(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	w.hold(held{name: name, owner: w.name, lease: lease})
-	return w.serve(ctx, lease)
+	return func() error { return w.serve(ctx, lease) }, nil
 }
 
 // serve waits until io stops serving, or an FS relay the workspace holds is
@@ -670,6 +682,51 @@ func (w *Workspace) Detach(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// Look reads in one call the state of the worker under key, the named files of
+// its directory and the output of cmd run on the remote beside them, so a
+// decision on the worker's and an agent's states reads both at one moment.
+func (w *Workspace) Look(ctx context.Context, key worker.Key, cmd []string, files ...string) (worker.Look, error) {
+	return worker.New(w.workerRemote(), key).Look(ctx, cmd, files...)
+}
+
+// FreePort picks the first of candidates free on the remote and recorded in no
+// worker's file record, for a worker that listens on it.
+func (w *Workspace) FreePort(ctx context.Context, record string, candidates []int) (int, error) {
+	return worker.FreePort(ctx, w.workerRemote(), record, candidates)
+}
+
+// End ends the worker under key and keeps the leases this process holds, for
+// a caller that starts another worker under the same key next: a Running
+// worker is closed with SIGHUP, an Exited one removed, and an Absent one has
+// nothing to end.
+func (w *Workspace) End(ctx context.Context, key worker.Key) error {
+	wk := worker.New(w.workerRemote(), key)
+	state, err := wk.State(ctx)
+	if err != nil {
+		return err
+	}
+	return end(ctx, wk, state)
+}
+
+// end ends wk, read in state.
+func end(ctx context.Context, wk worker.Worker, state worker.State) error {
+	switch state {
+	case worker.Absent:
+		return nil
+	case worker.Running:
+		// The process may fail between the read of its state and the close,
+		// which then refuses it as Exited: it is removed, as an Exited one is.
+		err := wk.Close(ctx)
+		if errors.Is(err, worker.ErrExited) {
+			err = wk.Remove(ctx)
+		}
+		return err
+	case worker.Exited:
+		return wk.Remove(ctx)
+	}
+	return fmt.Errorf("workspace: unhandled worker state %s", state)
+}
+
 // Close ends the worker under key and detaches: a Running worker is closed
 // with SIGHUP, an Exited one removed. The relays are connected first, so the
 // detach that follows cannot race another session's, and with another worker
@@ -687,17 +744,5 @@ func (w *Workspace) Close(ctx context.Context, key worker.Key) error {
 	if err := w.connect(ctx); err != nil {
 		return errors.Join(err, w.Detach(ctx))
 	}
-	switch state {
-	case worker.Running:
-		// The process may fail between the read of its state and the close,
-		// which then refuses it as Exited: it is removed, as an Exited one is.
-		if err = wk.Close(ctx); errors.Is(err, worker.ErrExited) {
-			err = wk.Remove(ctx)
-		}
-	case worker.Exited:
-		err = wk.Remove(ctx)
-	default:
-		err = fmt.Errorf("workspace: unhandled worker state %s", state)
-	}
-	return errors.Join(err, w.Detach(ctx))
+	return errors.Join(end(ctx, wk, state), w.Detach(ctx))
 }

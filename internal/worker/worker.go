@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -102,14 +103,15 @@ func NewKey(name string) (Key, error) {
 		return Key{}, fmt.Errorf("worker: invalid key %q", name)
 	}
 	for _, r := range name {
-		if !isKeyRune(r) {
+		if !IsKeyRune(r) {
 			return Key{}, fmt.Errorf("worker: invalid key %q", name)
 		}
 	}
 	return Key{name: name}, nil
 }
 
-func isKeyRune(r rune) bool {
+// IsKeyRune reports whether a key may hold r.
+func IsKeyRune(r rune) bool {
 	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("-_@+", r)
 }
 
@@ -226,7 +228,7 @@ func checkFileName(name string) error {
 		return fmt.Errorf("worker: invalid file name %q", name)
 	}
 	for _, r := range name {
-		if !(isKeyRune(r) || r == '.') {
+		if !(IsKeyRune(r) || r == '.') {
 			return fmt.Errorf("worker: invalid file name %q", name)
 		}
 	}
@@ -509,6 +511,126 @@ func List(ctx context.Context, remote Remote, tag Tag) ([]Listed, error) {
 		found = append(found, Listed{Worker: New(remote, key), State: s.state})
 	}
 	return found, nil
+}
+
+// Look is what one read of a worker found: its state, the files asked for
+// that its directory holds, and what the command run beside it wrote.
+type Look struct {
+	State State
+	Files []File
+	Out   []byte
+}
+
+// File is the file under name the look found in the worker's directory; ok is
+// false when the directory holds none.
+func (l Look) File(name string) (File, bool) {
+	for _, f := range l.Files {
+		if f.Name == name {
+			return f, true
+		}
+	}
+	return File{}, false
+}
+
+// Look reads in one call on the remote the worker's state, the named files of
+// its directory and the output of cmd, run under the remote user's login
+// shell, where a program such as an agent is found; an empty cmd runs nothing.
+// A state and an answer read in one call cannot fall apart between two reads.
+// The files may hold a secret, so they travel on the command's output and
+// print masked. It only reads a state, so it runs in a dry run too.
+func (w Worker) Look(ctx context.Context, cmd []string, files ...string) (Look, error) {
+	for _, name := range files {
+		if err := checkFileName(name); err != nil {
+			return Look{}, err
+		}
+	}
+	line := ""
+	if len(cmd) > 0 {
+		words := make([]string, len(cmd))
+		for i, word := range cmd {
+			words[i] = shell.Quote(word)
+		}
+		line = strings.Join(words, " ")
+	}
+	out, err := shell.Run(ctx, w.remote.Read, act("look", append([]string{w.key.target(), w.key.underHome(), line}, files...)...))
+	if err != nil {
+		return Look{}, fmt.Errorf("look at worker %s: %w%s", w.key, err, detail(out.Stderr))
+	}
+	look, err := parseLook(out.Stdout)
+	if err != nil {
+		return Look{}, fmt.Errorf("look at worker %s: %w", w.key, err)
+	}
+	return look, nil
+}
+
+// parseLook reads look's output: the state line, each file's header and
+// bytes, then `out` and the command's output.
+func parseLook(out string) (Look, error) {
+	head, rest, _ := strings.Cut(out, "\n")
+	var look Look
+	switch head {
+	case "state 0":
+		look.State = Running
+	case "state 1":
+		look.State = Exited
+	case "state absent":
+		look.State = Absent
+	default:
+		return Look{}, fmt.Errorf("unreadable state %q", head)
+	}
+	for {
+		line, after, found := strings.Cut(rest, "\n")
+		if !found {
+			return Look{}, errors.New("incomplete output")
+		}
+		if line == "out" {
+			look.Out = []byte(after)
+			return look, nil
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 3 || fields[0] != "file" {
+			return Look{}, fmt.Errorf("unreadable line %q", line)
+		}
+		n, err := strconv.Atoi(fields[2])
+		if err != nil || n < 0 || n > len(after) {
+			return Look{}, fmt.Errorf("unreadable length of file %s", fields[1])
+		}
+		look.Files = append(look.Files, File{Name: fields[1], Content: []byte(after[:n])})
+		rest = after[n:]
+	}
+}
+
+// socketTables is where Linux lists the remote's TCP sockets, which FreePort
+// reads for the ports in use.
+const socketTables = "/proc/net"
+
+// ErrNoPort is a pick of a port in which every candidate is taken.
+var ErrNoPort = errors.New("worker: every candidate port is taken on the remote")
+
+// FreePort picks the first of candidates that no socket on the remote uses and
+// no worker's directory records in its file record, where a worker that
+// listens on a port keeps it while nothing is bound to it. It only reads a
+// state, so it runs in a dry run too.
+func FreePort(ctx context.Context, remote Remote, record string, candidates []int) (int, error) {
+	if err := checkFileName(record); err != nil {
+		return 0, err
+	}
+	args := []string{workersUnderHome, record, socketTables}
+	for _, p := range candidates {
+		args = append(args, strconv.Itoa(p))
+	}
+	out, err := shell.Run(ctx, remote.Read, act("port", args...))
+	if refused(err) {
+		return 0, ErrNoPort
+	}
+	if err != nil {
+		return 0, fmt.Errorf("pick a port: %w%s", err, detail(out.Stderr))
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(out.Stdout))
+	if err != nil || !slices.Contains(candidates, port) {
+		return 0, fmt.Errorf("pick a port: unreadable answer %q", out.Stdout)
+	}
+	return port, nil
 }
 
 // Close ends a Running worker with SIGHUP; for a line stream it waits for the

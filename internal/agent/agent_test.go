@@ -209,10 +209,12 @@ func TestNeeds(t *testing.T) {
 		declared     []func(string) bool
 		places       []pathmap.Place
 		settings     settingsCase
+		dropped      [][]string
 		wantFiles    map[string]secret.Token
 		wantVars     []string
 		wantSettings bool
 		wantHooks    bool
+		wantDropped  []string
 	}{
 		{
 			name:     "a command alone",
@@ -267,6 +269,15 @@ func TestNeeds(t *testing.T) {
 			wantHooks:    true,
 		},
 		{
+			name:         "dropped hooks recorded across calls, in order",
+			command:      []string{"claude"},
+			settings:     settingsCase{form: plainSettings, file: "settings.json", document: settings},
+			dropped:      [][]string{{"http://localhost:9000/mine"}, {"https://127.0.0.1:7/a", "http://[::1]:8/b"}},
+			wantVars:     []string{},
+			wantSettings: true,
+			wantDropped:  []string{"http://localhost:9000/mine", "https://127.0.0.1:7/a", "http://[::1]:8/b"},
+		},
+		{
 			name:    "a file given twice keeps the last",
 			command: []string{"claude"},
 			files: []file{
@@ -290,6 +301,9 @@ func TestNeeds(t *testing.T) {
 				n = n.WithPlace(p)
 			}
 			n = tc.settings.declare(n)
+			for _, d := range tc.dropped {
+				n = n.WithDroppedHooks(d...)
+			}
 
 			if got := n.Command(); !reflect.DeepEqual(got, tc.command) {
 				t.Errorf("Command() = %v, want %v", got, tc.command)
@@ -311,6 +325,9 @@ func TestNeeds(t *testing.T) {
 			if address != tc.settings.address || !reflect.DeepEqual(routes, tc.settings.routes) || !token.Equal(tc.settings.token) || ok != tc.wantHooks {
 				t.Errorf("Hooks() = %q, %v, %v, %v, want %q, %v, %v, %v", address, routes, token, ok,
 					tc.settings.address, tc.settings.routes, tc.settings.token, tc.wantHooks)
+			}
+			if got := n.DroppedHooks(); !reflect.DeepEqual(got, tc.wantDropped) {
+				t.Errorf("DroppedHooks() = %q, want %q", got, tc.wantDropped)
 			}
 		})
 	}

@@ -24,6 +24,30 @@ const (
 	envExecutable = "CLAUDE_CODE_EXECUTABLE"
 )
 
+// EnvConfigDir is the variable that names Claude's config directory, where
+// Claude keeps a workstation's transcripts.
+const EnvConfigDir = envConfigDir
+
+// configDirUnderHome is Claude's config directory when EnvConfigDir is unset.
+const configDirUnderHome = ".claude"
+
+// ConfigDir is the config directory Claude uses on a workstation, given the
+// value of EnvConfigDir there and the user's home: the value when it is set,
+// else the default under the home.
+func ConfigDir(value, home string) string {
+	if value != "" {
+		return value
+	}
+	return path.Join(home, configDirUnderHome)
+}
+
+// ConfigDirCommand prints the config directory Claude uses on the workstation
+// it runs on, as ConfigDir decides it in the environment it runs in, followed
+// by a newline.
+func ConfigDirCommand() []string {
+	return []string{"sh", "-c", `printf '%s\n' "${` + envConfigDir + `:-$HOME/` + configDirUnderHome + `}"`}
+}
+
 // localOnlyEnv are the variables of Claude's own that belong to this machine
 // or to one process on it, so on the remote they would point at nothing, or at
 // the wrong thing:

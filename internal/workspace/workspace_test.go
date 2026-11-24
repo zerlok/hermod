@@ -838,3 +838,141 @@ func TestAttach(t *testing.T) {
 		})
 	}
 }
+
+// TestJoin checks which failure Join reports itself, before anyone reads the
+// streams, and which one its wait reports once the relays served.
+func TestJoin(t *testing.T) {
+	cases := []struct {
+		name        string
+		taken       bool // another reader holds the worker's line stream
+		wantJoinErr error
+		wantWaitErr error
+	}{
+		{"a line stream whose process ends", false, nil, relay.ErrEnded},
+		{"a second reader of a line stream", true, relay.ErrInUse, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			ws := n(api, apiR)
+			f := newFake(syncsOf(rel{local: api, remote: apiR}), map[string]*tmuxSession{"hermod-a": tagged(ws, worker.Running)})
+			f.ioEnds = true
+			local := testLocal(t)
+			k := key(t, "hermod-a")
+			if tc.taken {
+				other := relay.NewIO(shell.NewSSH(f, testHost), local.Locks, ioName(testHost, k), relay.Lines{}, relay.Streams{})
+				lease, err := other.Connect(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = lease.Release(ctx) }()
+			}
+			w, err := Open(ctx, f.remote(), local, api, Worktree{})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer func() { _ = w.Detach(ctx) }()
+			wait, err := w.Join(ctx, k, worker.LineStream, relay.Streams{})
+			if !errors.Is(err, tc.wantJoinErr) {
+				t.Fatalf("Join: %v, want %v", err, tc.wantJoinErr)
+			}
+			if err != nil {
+				return
+			}
+			if err := wait(); !errors.Is(err, tc.wantWaitErr) {
+				t.Errorf("wait: %v, want %v", err, tc.wantWaitErr)
+			}
+		})
+	}
+}
+
+// TestEnd checks that ending a worker keeps the leases: nothing of the
+// workspace's relays changes, so the caller can start the worker again.
+func TestEnd(t *testing.T) {
+	ws := n(api, apiR)
+	cases := []struct {
+		name        string
+		state       worker.State
+		tmuxFails   bool
+		wantChanges []string
+		wantLeft    []string
+		wantErr     bool
+	}{
+		{"a running worker is closed", worker.Running, false, []string{"close hermod-a"}, nil, false},
+		{"an exited worker is removed", worker.Exited, false, []string{"remove hermod-a"}, nil, false},
+		{"an absent worker has nothing to end", worker.Absent, false, nil, nil, false},
+		{"the worker's state cannot be read", worker.Running, true, nil, []string{"hermod-a"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			sessions := map[string]*tmuxSession{}
+			if tc.state != worker.Absent {
+				sessions["hermod-a"] = tagged(ws, tc.state)
+			}
+			f := newFake(syncsOf(rel{local: api, remote: apiR}), sessions)
+			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer func() { _ = w.Detach(ctx) }()
+			f.changes()
+			f.tmuxFails = tc.tmuxFails
+			if err := w.End(ctx, key(t, "hermod-a")); (err != nil) != tc.wantErr {
+				t.Errorf("End: %v, want error %v", err, tc.wantErr)
+			}
+			if got := f.changes(); !reflect.DeepEqual(got, tc.wantChanges) {
+				t.Errorf("changes %q, want %q", got, tc.wantChanges)
+			}
+			var left []string
+			for name := range f.sessions {
+				left = append(left, name)
+			}
+			if !reflect.DeepEqual(left, tc.wantLeft) {
+				t.Errorf("sessions left %v, want %v", left, tc.wantLeft)
+			}
+		})
+	}
+}
+
+// TestLookAndFreePort checks that both reach the remote's workers and change
+// nothing.
+func TestLookAndFreePort(t *testing.T) {
+	ws := n(api, apiR)
+	cases := []struct {
+		name      string
+		state     worker.State
+		wantState worker.State
+		wantPort  int
+	}{
+		{"a running worker", worker.Running, worker.Running, 20001},
+		{"an absent worker", worker.Absent, worker.Absent, 20001},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			sessions := map[string]*tmuxSession{}
+			if tc.state != worker.Absent {
+				sessions["hermod-a"] = tagged(ws, tc.state)
+			}
+			f := newFake(syncsOf(rel{local: api, remote: apiR}), sessions)
+			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer func() { _ = w.Detach(ctx) }()
+			f.changes()
+			look, err := w.Look(ctx, key(t, "hermod-a"), nil)
+			if err != nil || look.State != tc.wantState {
+				t.Errorf("Look = %v, %v; want %v", look.State, err, tc.wantState)
+			}
+			port, err := w.FreePort(ctx, "port", []int{tc.wantPort})
+			if err != nil || port != tc.wantPort {
+				t.Errorf("FreePort = %d, %v; want %d", port, err, tc.wantPort)
+			}
+			if got := f.changes(); len(got) != 0 {
+				t.Errorf("changes %q, want none", got)
+			}
+		})
+	}
+}

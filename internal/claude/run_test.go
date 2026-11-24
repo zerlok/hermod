@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -345,6 +346,40 @@ func TestDeclaredVars(t *testing.T) {
 				if !reflect.DeepEqual(got, tc.want) {
 					t.Errorf("%s: Vars() = %q, want %q", name, got, tc.want)
 				}
+			}
+		})
+	}
+}
+
+// TestConfigDir checks that the config directory ConfigDir decides and the
+// one ConfigDirCommand prints agree, with the variable set and unset.
+func TestConfigDir(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string // "" is unset
+		home  string
+		want  string
+	}{
+		{"unset", "", "/home/u", "/home/u/.claude"},
+		{"set", "/srv/claude", "/home/u", "/srv/claude"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ConfigDir(tc.value, tc.home); got != tc.want {
+				t.Errorf("ConfigDir = %q, want %q", got, tc.want)
+			}
+			argv := ConfigDirCommand()
+			cmd := exec.Command(argv[0], argv[1:]...)
+			cmd.Env = []string{"HOME=" + tc.home}
+			if tc.value != "" {
+				cmd.Env = append(cmd.Env, EnvConfigDir+"="+tc.value)
+			}
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("run %q: %v", argv, err)
+			}
+			if got := string(out); got != tc.want+"\n" {
+				t.Errorf("ConfigDirCommand printed %q, want %q", got, tc.want+"\n")
 			}
 		})
 	}

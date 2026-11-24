@@ -13,6 +13,8 @@
 #   attach TARGET               join a terminal worker on the caller's tty
 #   feed FIFO                   copy stdin into a line stream's FIFO
 #   log TARGET LOG POS          deliver a line stream's log
+#   look TARGET WDIR LINE [FILE]...  read a worker's state and files, and run LINE
+#   port DIR RECORD [PORT]...   pick a port free on the remote
 #
 # TARGET names the session exactly, and WDIR, FIFO, LOG and POS are under
 # $HOME. A command it is sent with runs here unchanged, so it reads the same in
@@ -161,8 +163,46 @@ emit() {
 
 at() { cat "$pos" 2>/dev/null || echo 0; }
 
+# Reads in one call what a caller decides from: the worker's state, as
+# `state 0`, `state 1` for a dead pane or `state absent`; each FILE of its
+# directory that exists, as `file NAME LENGTH` and its bytes; then `out` and
+# what the command line LINE writes, run under the login shell, where a program
+# such as an agent is found. A LINE that fails fails the look, since its output
+# then answers nothing.
+look() {
+  t=$1 wd=$HOME/$2 line=$3
+  shift 3
+  if present "$t"; then printf 'state %s\n' "$dead"; else echo 'state absent'; fi
+  for f; do
+    if [ -f "$wd/$f" ]; then
+      printf 'file %s %s\n' "$f" "$(wc -c <"$wd/$f" | tr -d ' ')"
+      cat "$wd/$f"
+    fi
+  done
+  echo out
+  if [ -n "$line" ]; then exec "$SHELL" -lc "$line" </dev/null; fi
+}
+
+# Prints the first PORT that no worker's directory under DIR records in its
+# file RECORD and no socket uses, as the tcp and tcp6 tables under NET (Linux's
+# /proc/net) list them. A detached worker's port is bound by nothing, so only
+# its record keeps it from another worker. Exits REFUSED when every PORT is
+# taken. grep reads each record as its own input, since records joined by cat
+# run together when one lacks its final newline.
+port() {
+  d=$HOME/$1 r=$2 n=$3
+  shift 3
+  for p; do
+    if grep -qsxF -- "$p" "$d"/*/"$r"; then continue; fi
+    if cat "$n"/tcp "$n"/tcp6 2>/dev/null | grep -q ":$(printf '%04X' "$p") "; then continue; fi
+    echo "$p"
+    exit 0
+  done
+  exit "$refused"
+}
+
 case $op in
-list | close | remove | attach | feed | log) "$op" "$@" ;;
+list | close | remove | attach | feed | log | look | port) "$op" "$@" ;;
 *)
   printf 'unknown operation %s\n' "$op" >&2
   exit 2

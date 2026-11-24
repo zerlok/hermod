@@ -64,7 +64,7 @@ func refuseSecrets(wrapper string, cmd Command) error {
 // `A;B=1 ls` runs A, and `FOO.BAR=1 ls` runs a program of that name.
 func refuseBadKeys(wrapper string, cmd Command) error {
 	for _, key := range cmd.Env.Keys() {
-		if !isName(key) {
+		if !IsName(key) {
 			return fmt.Errorf("shell: %s cannot put the variable %q on a command line: %w", wrapper, key, errNotAName)
 		}
 	}
@@ -73,8 +73,10 @@ func refuseBadKeys(wrapper string, cmd Command) error {
 
 var errNotAName = errors.New("not a shell name")
 
-// isName reports whether key is a shell variable name, [A-Za-z_][A-Za-z0-9_]*.
-func isName(key string) bool {
+// IsName reports whether key is a shell variable name, [A-Za-z_][A-Za-z0-9_]*:
+// the only key a POSIX shell can set, on a command line or in a file it
+// sources.
+func IsName(key string) bool {
 	if key == "" {
 		return false
 	}

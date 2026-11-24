@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -836,6 +839,214 @@ func TestKeyDir(t *testing.T) {
 		t.Run(tc.key, func(t *testing.T) {
 			if got := mustKey(t, tc.key).Dir(tc.home); got != tc.want {
 				t.Errorf("Dir = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// canned is a remote that answers every command with one output, and records
+// the commands.
+type canned struct {
+	out   string
+	err   error
+	calls []call
+}
+
+func (c *canned) Exec(_ context.Context, cmd shell.Command) shell.Execution {
+	c.calls = append(c.calls, call{args: cmd.Args})
+	if cmd.Stdout != nil {
+		_, _ = io.WriteString(cmd.Stdout, c.out)
+	}
+	return shell.Finished(shell.Command{Stdin: cmd.Stdin, Stdout: cmd.Stdout, Stderr: cmd.Stderr}, c.err)
+}
+
+func TestLook(t *testing.T) {
+	cases := []struct {
+		name      string
+		cmd       []string
+		files     []string
+		out       string
+		err       error
+		wantArgs  []string
+		want      Look
+		wantErr   bool
+		wantCalls int
+	}{
+		{
+			"a running worker with its files and the command's output",
+			[]string{"claude", "agents", "--json"}, []string{"port", "token"},
+			"state 0\nfile port 6\n20001\nfile token 3\nabcout\n[{\"id\":1}]\n", nil,
+			actArgs("look", "=hermod-k:", ".hermod/s/hermod-k", "claude agents --json", "port", "token"),
+			Look{State: Running, Files: []File{{Name: "port", Content: []byte("20001\n")}, {Name: "token", Content: []byte("abc")}}, Out: []byte("[{\"id\":1}]\n")},
+			false, 1,
+		},
+		{
+			"an exited worker, no file and no command",
+			nil, []string{"port"},
+			"state 1\nout\n", nil,
+			actArgs("look", "=hermod-k:", ".hermod/s/hermod-k", "", "port"),
+			Look{State: Exited, Out: []byte{}},
+			false, 1,
+		},
+		{
+			"an absent worker, a command word quoted",
+			[]string{"probe", "a b"}, nil,
+			"state absent\nout\n", nil,
+			actArgs("look", "=hermod-k:", ".hermod/s/hermod-k", "probe 'a b'"),
+			Look{State: Absent, Out: []byte{}},
+			false, 1,
+		},
+		{"an unreadable state", nil, nil, "state x\nout\n", nil, nil, Look{}, true, 1},
+		{"a file longer than the output", nil, []string{"port"}, "state 0\nfile port 9\n1\nout\n", nil, nil, Look{}, true, 1},
+		{"an output cut short", nil, nil, "state 0\n", nil, nil, Look{}, true, 1},
+		{"a command that fails", []string{"false"}, nil, "state 0\nout\n", exitError(1), nil, Look{}, true, 1},
+		{"a reserved file name", nil, []string{"pid"}, "", nil, nil, Look{}, true, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			exec, read := &canned{}, &canned{out: tc.out, err: tc.err}
+			got, err := New(Remote{Exec: exec, Read: read}, mustKey(t, "hermod-k")).Look(context.Background(), tc.cmd, tc.files...)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, want error %v", err, tc.wantErr)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("Look = %+v, want %+v", got, tc.want)
+			}
+			if len(read.calls) != tc.wantCalls || len(exec.calls) != 0 {
+				t.Fatalf("reads %d, changes %d; want %d reads and no change", len(read.calls), len(exec.calls), tc.wantCalls)
+			}
+			if tc.wantArgs != nil && !reflect.DeepEqual(read.calls[0].args, tc.wantArgs) {
+				t.Errorf("args = %q, want %q", read.calls[0].args, tc.wantArgs)
+			}
+		})
+	}
+}
+
+func TestLookFile(t *testing.T) {
+	look := Look{Files: []File{{Name: "port", Content: []byte("1")}}}
+	cases := []struct {
+		name   string
+		file   string
+		want   File
+		wantOK bool
+	}{
+		{"a file the look found", "port", File{Name: "port", Content: []byte("1")}, true},
+		{"a file the directory lacks", "token", File{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := look.File(tc.file)
+			if ok != tc.wantOK || !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("File = %v %v, want %v %v", got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestFreePort(t *testing.T) {
+	cases := []struct {
+		name       string
+		record     string
+		candidates []int
+		out        string
+		err        error
+		wantArgs   []string
+		want       int
+		wantErr    error
+	}{
+		{"the first free candidate", "port", []int{20001, 20002}, "20002\n", nil,
+			actArgs("port", ".hermod/s", "port", "/proc/net", "20001", "20002"), 20002, nil},
+		{"every candidate taken", "port", []int{20001}, "", exitError(refusedStatus),
+			actArgs("port", ".hermod/s", "port", "/proc/net", "20001"), 0, ErrNoPort},
+		{"an answer that is no candidate", "port", []int{20001}, "22\n", nil,
+			actArgs("port", ".hermod/s", "port", "/proc/net", "20001"), 0, errUnreadable},
+		{"a connection that fails", "port", []int{20001}, "", exitError(255),
+			actArgs("port", ".hermod/s", "port", "/proc/net", "20001"), 0, errUnreadable},
+		{"a record outside the worker's directory", "../port", []int{20001}, "", nil, nil, 0, errUnreadable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			exec, read := &canned{}, &canned{out: tc.out, err: tc.err}
+			got, err := FreePort(context.Background(), Remote{Exec: exec, Read: read}, tc.record, tc.candidates)
+			switch {
+			case tc.wantErr == errUnreadable && err == nil, tc.wantErr != errUnreadable && !errors.Is(err, tc.wantErr):
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Errorf("port = %d, want %d", got, tc.want)
+			}
+			if len(exec.calls) != 0 {
+				t.Errorf("changes = %q, want none", exec.calls)
+			}
+			if tc.wantArgs != nil && (len(read.calls) != 1 || !reflect.DeepEqual(read.calls[0].args, tc.wantArgs)) {
+				t.Errorf("reads = %q, want %q", read.calls, tc.wantArgs)
+			}
+		})
+	}
+}
+
+// errUnreadable stands, in a table, for any error that is not one of the
+// package's own.
+var errUnreadable = errors.New("any error")
+
+// TestPortScript runs act.sh's port operation under a local sh against records
+// in a temporary home and socket tables in a temporary directory, since the
+// fakes above only replay its answer and the host's own sockets must not
+// decide a case.
+func TestPortScript(t *testing.T) {
+	const header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+	cases := []struct {
+		name       string
+		records    map[string]string
+		sockets    map[string]string // the socket tables by name
+		candidates []string
+		wantOut    string
+		wantStatus int
+	}{
+		{"records without a final newline", map[string]string{"a": "20001", "b": "20002"}, nil, []string{"20001", "20002"}, "", refusedStatus},
+		{"records with a final newline", map[string]string{"a": "20001\n", "b": "20002\n"}, nil, []string{"20001", "20002"}, "", refusedStatus},
+		{"a candidate that only prefixes a record", map[string]string{"a": "200011"}, nil, []string{"20001"}, "20001\n", 0},
+		{"no worker records a port", nil, nil, []string{"20001"}, "20001\n", 0},
+		{"a socket listening on a candidate", nil,
+			map[string]string{"tcp": header + "   0: 0100007F:4E21 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1\n"},
+			[]string{"20001", "20002"}, "20002\n", 0},
+		{"a socket connected to a candidate", nil,
+			map[string]string{"tcp6": header + "   0: 00000000000000000000000001000000:9C40 00000000000000000000000001000000:4E21 01 00000000:00000000 00:00000000 00000000  1000        0 1\n"},
+			[]string{"20001", "20002"}, "20002\n", 0},
+		{"every candidate in use", nil,
+			map[string]string{"tcp": header + "   0: 0100007F:4E21 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1\n"},
+			[]string{"20001"}, "", refusedStatus},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			for dir, content := range tc.records {
+				path := filepath.Join(home, ".hermod", "s", dir)
+				if err := os.MkdirAll(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(path, "port"), []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			net := t.TempDir()
+			for name, content := range tc.sockets {
+				if err := os.WriteFile(filepath.Join(net, name), []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command("sh", actArgs("port", append([]string{".hermod/s", "port", net}, tc.candidates...)...)[1:]...)
+			cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}
+			out, err := cmd.Output()
+			status := 0
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				status = exitErr.ExitCode()
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if string(out) != tc.wantOut || status != tc.wantStatus {
+				t.Errorf("port = %q status %d, want %q status %d", out, status, tc.wantOut, tc.wantStatus)
 			}
 		})
 	}

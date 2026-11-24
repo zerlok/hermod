@@ -20,6 +20,7 @@ type Needs struct {
 	declared []func(key string) bool
 	places   []pathmap.Place
 	settings settings
+	dropped  []string
 }
 
 // settings is the settings document Agent.Hooks aims at the worker's port
@@ -47,6 +48,12 @@ type Callback struct {
 func NewCallback(address string, routes []string, token secret.Token) Callback {
 	return Callback{address: address, routes: clone(routes), token: token}
 }
+
+// DirVar is the variable a worker's process is given with its directory, an
+// absolute path on the remote. A command is declared before anyone knows
+// where its worker's directory will be, so it names the files its Needs
+// declare under this variable.
+const DirVar = "HERMOD_WORKER_DIR"
 
 // NewNeeds is the needs of a command, given with its paths already mapped to
 // the remote.
@@ -93,6 +100,14 @@ func (n Needs) WithHookedSettings(file string, document secret.Token, callback C
 	return n
 }
 
+// WithDroppedHooks records hooks the agent left out of its settings because
+// no relay can carry them, each by scheme, host and path only, so the session
+// can log what the agent runs without and no credential reaches the log.
+func (n Needs) WithDroppedHooks(endpoints ...string) Needs {
+	n.dropped = append(clone(n.dropped), endpoints...)
+	return n
+}
+
 // Command is the command, its paths mapped to the remote.
 func (n Needs) Command() []string { return clone(n.command) }
 
@@ -123,6 +138,9 @@ func (n Needs) Hooks() (address string, routes []string, token secret.Token, ok 
 	c := n.settings.callback
 	return c.address, clone(c.routes), c.token, n.settings.hooked
 }
+
+// DroppedHooks are the endpoints of the hooks left out of the settings.
+func (n Needs) DroppedHooks() []string { return clone(n.dropped) }
 
 // String names what the command needs and masks every content, so a plan, a
 // log line or an error that shows a Needs shows no credential.

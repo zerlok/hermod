@@ -313,7 +313,11 @@ flowchart TD
     cli --> session
     cli --> air
     cli --> claude
+    cli --> workspace
+    cli --> worker
+    cli --> relay
     cli --> shell
+    cli --> env
     git --> shell
     acp --> session
     acp --> pathmap
@@ -321,14 +325,19 @@ flowchart TD
     air --> session
     session --> workspace
     session --> agent
+    session --> worker
+    session --> relay
+    session --> pathmap
     session --> shell
+    session --> env
+    session --> secret
     claude --> agent
     claude --> pathmap
-    claude --> env
     claude --> secret
     workspace --> relay
     workspace --> worker
     workspace --> pathmap
+    workspace --> shell
     relay --> shell
     worker --> shell
     worker --> env

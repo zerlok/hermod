@@ -190,6 +190,16 @@ func run(ctx context.Context, req Request, ws *workspace.Workspace, call agent.C
 			return err
 		}
 	}
+	if err := apply(ctx, req, ws, key, act, needs, seen, worker.Terminal); err != nil {
+		return err
+	}
+	return left(ctx, ws.Attach(ctx, key, worker.Terminal, req.Streams))
+}
+
+// apply carries out what was decided for the worker a look saw: it ends the
+// worker to replace and starts it again, or starts an absent one with its
+// stdio in form, then adds the session's Net relays.
+func apply(ctx context.Context, req Request, ws *workspace.Workspace, key worker.Key, act action, needs agent.Needs, seen worker.Look, form worker.Form) error {
 	hook, hooked := readHook(seen)
 	switch act {
 	case join:
@@ -199,14 +209,15 @@ func run(ctx context.Context, req Request, ws *workspace.Workspace, call agent.C
 		}
 		fallthrough
 	case start:
-		if hook, hooked, err = startWorker(ctx, req, ws, key, needs); err != nil {
+		var err error
+		if hook, hooked, err = startWorker(ctx, req, ws, key, needs, form); err != nil {
 			return err
 		}
 	default:
 		return fmt.Errorf("session: unhandled action %s", act)
 	}
 	addNets(ctx, req, ws, needs, hook, hooked)
-	return left(ctx, ws.Attach(ctx, key, worker.Terminal, req.Streams))
+	return nil
 }
 
 // left is nil for an attach that ended because the client left, the worker's
@@ -243,12 +254,12 @@ func readHook(seen worker.Look) (hook, bool) {
 	return hook{port: port, token: token}, true
 }
 
-// startWorker starts the worker: first the FS relays its agent requires,
-// connected and flushed so the agent finds their files, then the worker's
-// directory and the worker. A hooked agent's settings are aimed at a port
+// startWorker starts the worker in req.Dir with its stdio in form: first the
+// FS relays its agent requires, connected and flushed so the agent finds their
+// files, then the worker's directory and the worker. A hooked agent's settings are aimed at a port
 // picked free on the remote and carry a token generated for the worker, both
 // recorded in its directory.
-func startWorker(ctx context.Context, req Request, ws *workspace.Workspace, key worker.Key, needs agent.Needs) (hook, bool, error) {
+func startWorker(ctx context.Context, req Request, ws *workspace.Workspace, key worker.Key, needs agent.Needs, form worker.Form) (hook, bool, error) {
 	for _, place := range needs.Places() {
 		if err := ws.AddFS(ctx, place); err != nil {
 			return hook{}, false, err
@@ -289,7 +300,7 @@ func startWorker(ctx context.Context, req Request, ws *workspace.Workspace, key 
 		Vars: needs.Vars(req.Environ).
 			With(req.Identity.vars()...).
 			With(env.Pair{Key: agent.DirVar, Value: env.Plain(key.Dir(req.Remote.Home))}),
-		Form: worker.Terminal,
+		Form: form,
 	})
 	return h, hooked, err
 }

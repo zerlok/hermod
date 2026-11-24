@@ -374,6 +374,14 @@ func (f *fake) act(op string, args []string) play {
 			}
 			delete(f.sessions, name)
 			f.ran = append(f.ran, "close "+name)
+		case "look":
+			state := "absent"
+			if s, ok := f.sessions[sessionOf(args[0])]; ok {
+				state = map[worker.State]string{worker.Running: "0", worker.Exited: "1"}[s.state]
+			}
+			_, _ = fmt.Fprintf(out, "state %s\nout\n", state)
+		case "port":
+			_, _ = fmt.Fprintln(out, args[3])
 		case "remove":
 			name := sessionOf(args[0])
 			if s, ok := f.sessions[name]; ok && s.state == worker.Running {

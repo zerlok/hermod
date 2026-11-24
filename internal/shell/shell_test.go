@@ -67,6 +67,13 @@ func TestSSHRewrite(t *testing.T) {
 			[]string{"ssh", "-t", "-o", "ControlPath=none", "-R", "45001:127.0.0.1:38211", "prod", "tmux attach"},
 			false,
 		},
+		{
+			"forward connection that exits when its forward fails",
+			"prod", []SSHOption{WithReverseForward(45001, 38211), WithExitOnForwardFailure(), WithoutSharedMaster()},
+			Command{Args: []string{"cat"}},
+			[]string{"ssh", "-o", "ControlPath=none", "-o", "ExitOnForwardFailure=yes", "-R", "45001:127.0.0.1:38211", "prod", "cat"},
+			false,
+		},
 		{"own connection probe", "prod", []SSHOption{WithoutSharedMaster()}, Command{Args: []string{"true"}}, []string{"ssh", "-o", "ControlPath=none", "prod", "true"}, false},
 		{
 			"two reverse forwards accumulate",
@@ -309,6 +316,29 @@ func TestNesting(t *testing.T) {
 			}
 			if plan.String() != tc.plan {
 				t.Errorf("plan = %q, want %q", plan.String(), tc.plan)
+			}
+		})
+	}
+}
+
+func TestIsName(t *testing.T) {
+	cases := []struct {
+		key  string
+		want bool
+	}{
+		{"PATH", true},
+		{"_private", true},
+		{"a1_B2", true},
+		{"", false},
+		{"1A", false},
+		{"FOO.BAR", false},
+		{"A;B", false},
+		{"A-B", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			if got := IsName(tc.key); got != tc.want {
+				t.Errorf("IsName(%q) = %v, want %v", tc.key, got, tc.want)
 			}
 		})
 	}
