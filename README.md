@@ -226,19 +226,19 @@ main.go                  entrypoint
 internal/
   # adapters
   cli/                   the process's interface: arguments, environment and streams, resolved once and handed to the core
-  acp/                   the ACP wire format: one message per line, each turned into the message the core routes
-  air/                   JetBrains Air's own facts: acp.json, the stand-in link, Air's own ACP messages
-  claude/                Claude Code's contract as values: its arguments, files and ACP adapter program
+  acp/                   the ACP wire format: one message per line, each parsed into a type of its own or rejected
+  air/                   JetBrains Air's own facts: acp.json, the stand-in link, its hook endpoint, its own ACP messages
+  claude/                Claude Code: its arguments, files, settings format and ACP adapter, run through a shell it is given
   git/                   the developer's git facts, read-only
   # application
   session/               a session: decides from the agent's and the worker's states, and routes a chat client's messages
   # domain
   workspace/             the relays and workers of one project on one remote; names and tags them
   relay/                 a channel between the workstations (FS, IO, Net) and its leases
-  worker/                a process on the remote that outlives its caller: a tmux session
-  agent/                 the contract an agent program offers, as an interface and values
+  worker/                a process on the remote that outlives its caller: a tmux session's lifecycle
+  agent/                 the contract an agent program offers, and its optional ACP contract
   # foundation
-  shell/                 where a command runs (ssh, login, tmux) and how (real or dry-run)
+  shell/                 where a command runs (ssh, login, tmux) and how (real or dry-run); tmux's command language
   pathmap/               the map between local and remote paths, in strings and JSON
   env/                   variables as KEY=VALUE pairs
   secret/                a value that must not be printed

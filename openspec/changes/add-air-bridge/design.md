@@ -132,9 +132,10 @@ of the project's workspace, and `air acp` routes Air's one ACP connection betwee
   it.
 
 The adapter stays a separate program. It translates ACP into Claude's own protocol and carries Air's extensions,
-negotiated when Air declares itself at `initialize`. Hermod reads only the few messages it must route or act on
-([Air's messages](../../../docs/ARCHITECTURE.md#airs-messages)) and passes every other one on with its paths
-mapped.
+negotiated when Air declares itself at `initialize`. Hermod parses every message into a type of its own, routes
+by the few it must act on ([Air's messages](../../../docs/ARCHITECTURE.md#airs-messages)), passes the others on with
+their paths mapped, and rejects a message it does not know
+([Messages are typed](#messages-are-typed-an-unknown-one-is-rejected)).
 
 ## What Air expects
 
@@ -227,7 +228,7 @@ something only between two neighbours.
 
 ### Hermod answers what names no chat
 A client's connection start, its chat list and its cancels belong to no one chat, while every adapter serves one
-workspace. `air acp` answers the first two itself from what the agent declares, and sends a cancel to the
+workspace. `air acp` answers the first two itself from the agent, and sends a cancel to the
 workspace whose adapter holds the cancelled request
 ([The client's connection](../../../docs/ARCHITECTURE.md#the-clients-connection)). A connection start is then
 answered before any workspace is attached, and the chat list comes from the agent program on the remote, which
@@ -275,16 +276,43 @@ Naming the binary needs none of them, and a session typed by hand
 The cost is that the stand-in cannot take Hermod's flags, since all its arguments are Claude's. Its remote comes
 from the environment, and so would any other option it comes to need.
 
-### An agent declares, the entities act
-Claude's arguments, settings and state follow Claude's CLI and change together when it changes. `claude` answers
-the [agent interface](../../../docs/ARCHITECTURE.md#agentagent--an-agent-programs-contract)'s questions with
-values and performs nothing itself, so it needs no shell, no remote and no relay to be tested, and a new Claude
-version is one package and its table-driven tests.
+### An agent runs, the workspace hosts
+An agent performs its own operations through a `shell.Executor` it is handed
+([`agent.Agent`](../../../docs/ARCHITECTURE.md#agentagent-and-agentacp--an-agent-programs-contract)). `claude` runs
+Claude's commands through the executor `cli` builds it with, and starts a conversation through the one the session
+hands it, which the workspace hosts as a worker. So `claude` knows only Claude Code, never which workstation it
+runs on, and is tested through a fake executor; a new Claude version is one package and its table-driven tests.
+
+- **Alternative — an agent as values (the commands it needs, and how to read their output), run by the session:**
+  rejected. It requires every agent to be a set of shell commands, while another agent may need a database
+  connection, and it puts the agent's operations in the session.
 
 The same shape keeps the generic entities generic. A hook is, to `relay`, a remote port reaching a local address
-through a [filter](../../../docs/ARCHITECTURE.md#relayfilter--what-a-net-relay-lets-through); that the filter
-checks a token and an allowed route is Claude's declaration, not the relay's knowledge. A user's `-R` is the same
-relay with no filter.
+through a [filter](../../../docs/ARCHITECTURE.md#relayfilter--what-a-net-relay-lets-through). Claude's settings
+format is `claude`'s, which endpoint is Air's is `air`'s, and the port and the token are the session's filter's
+([Hooks](../../../docs/ARCHITECTURE.md#hooks)). A user's `-R` is the same relay with no filter.
+
+### ACP is an agent's optional capability
+Serving a chat client, starting the program's ACP adapter and answering a client's connection start, is a contract
+of its own (`agent.ACP`). An agent with no ACP adapter is still an agent for `hermod attach` and the stand-in, and
+`cli` hands the chat path an agent only when it implements the capability.
+
+### Messages are typed; an unknown one is rejected
+`air acp` routes by what a message means, so every message is parsed in full into a Go type of its own, with typed
+JSON-RPC IDs, or rejected; nothing is read partly or lazily from untyped JSON. A connection is built with a
+serializer: `acp` has ACP's standard one, and `air` extends it with Air's own messages
+([`acp.Serializer`](../../../docs/ARCHITECTURE.md#acpserializer--acps-messages-as-types)). Each type maps the
+paths of the fields it declares, and every type carries ACP's `_meta` with every string in it mapped, so Air's
+extensions reach the adapter and a path in them crosses mapped.
+
+A method neither serializer knows is rejected: a request is answered with JSON-RPC's `method not found`, and a
+notification is logged and dropped. Routing only what Hermod understands keeps every path that crosses a mapped
+one.
+
+- **Alternative — pass an unknown method on unparsed:** rejected. Hermod would carry paths it never maps, and the
+  routing would read untyped JSON beside its types.
+- **Alternative — a table of method names that the client gives, beside ACP's own reading:** rejected. Reading a
+  message is a serializer's work, and a table only classifies a message it has not parsed.
 
 ### Two sources say what a conversation is doing
 Whether a conversation runs is the agent program's to say, and whether a process exists under Hermod's name is
@@ -350,7 +378,8 @@ Keeping them apart is the worker's choice, and both ways need nothing new from H
 ### A terminal session's transcripts travel both ways
 In terminal mode Air reads Claude's local config directory itself, so a conversation that ran on the remote has to
 be there. Transcripts are files, so carrying them is an FS relay's work and no step of the flow copies one. The
-agent declares the relay, and it is an FS relay like any other, carrying both ways: a conversation that exists
+agent says where the program keeps them on each workstation, and the relay between the two is an FS relay like any
+other, carrying both ways: a conversation that exists
 only locally is on the remote before the agent resumes it, and the remote's conversations appear locally for Air
 to list.
 
@@ -430,12 +459,16 @@ The `add-notify-backchannel` and `add-remote-agent` changes are withdrawn with i
   adapter, which knows nothing of the first. → Unguarded in this change.
 - **The remote's adapter must suit the local Air.** Air pins the adapter version it ships; the remote has
   whichever was installed there. Air no longer sees the adapter's answer to `initialize`: it sees the `Handshake`
-  the agent declares, which may promise a protocol version, capabilities or Air extensions the installed adapter
+  of the agent's ACP capability, which may promise a protocol version, capabilities or Air extensions the installed adapter
   lacks. → `air acp` logs both sides' versions from `initialize` and where the adapter's dropped answer differs
-  from the declared `Handshake`; documentation says to install the version Air uses.
+  from the agent's `Handshake`; documentation says to install the version Air uses.
+- **A message no serializer has is rejected.** A method Air or the adapter adds, or one not yet observed, gets
+  `method not found` or is dropped, and a field no type declares, outside ACP's `_meta`, does not reach the other
+  side. → The log names
+  each rejected method; a new one is a type added to `acp` or `air`.
 - **Air's extension files may be expected locally.** The adapter writes plan files and reads the directories Air
   adds (`air-views`), which exist only locally. → Verify with Air; if Air needs them, they are FS relays
-  the agent declares.
+  of their own.
 - **Where Air's hook settings travel in ACP has not been observed.** → Verify on the ACP stream. If they are not
   in the messages `air acp` reads, chats run without Air's hooks.
 - **The adapter hands a chat's MCP servers and settings to Claude on its command line** when it is told which

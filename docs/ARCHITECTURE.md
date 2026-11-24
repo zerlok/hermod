@@ -56,9 +56,9 @@ Nothing records it, and it has no states: while it exists it is attached.
 
 - **It decides.** A session reads the worker's state and, when the worker runs an agent, the agent's, and chooses
   what to do from the pair: start, resume, join, or refuse.
-- **It uses an agent as values.** It asks the agent what a conversation needs, hands the answer to the workspace
-  as an ordinary worker to start, and runs the agent's queries through `shell` on the remote. Nothing below a
-  session knows what a conversation is.
+- **It delegates to an agent.** It asks the agent about conversations, and has the agent start one through an
+  executor the workspace hosts as a worker: the agent runs, the workspace hosts. Nothing below a session knows
+  what a conversation is.
 - **It leases what it uses.** A session takes a connect lease on every relay it uses, through the workspace, and
   those leases end with it.
 - **Leaving ends only the session.** A session ends when its client leaves (a closed terminal, a closed chat tab,
@@ -211,17 +211,18 @@ stateDiagram-v2
 A conversation's state does not depend on whether anyone reads its output. A Running conversation with no reader
 stays Running and waits.
 
-The contract is values only, and an agent performs nothing. Asked about a conversation, it answers with:
+The contract is behaviour. An agent performs its operations through a `shell.Executor` it is handed, and can:
 
-- the command that runs the conversation, with its paths mapped to the remote;
-- what that command requires: the files it must find, the variables it must be given, the directories that must
-  be the same on both workstations, and the port its hooks call back on;
-- the command that asks the agent program for the conversation's state, and how to read the answer;
-- the answer to a client's connection start: the protocol version and the program's capabilities;
-- the commands that ask the agent program for the conversations of a directory and for where one conversation
-  belongs and its state, and how to read the answers.
+- list the conversations of a directory and of the directories under it;
+- look up one conversation: its directory and state, or that the program does not have it;
+- start or resume a conversation through an executor it is handed for that start;
+- say where the program keeps the state of a directory's conversations;
+- rewrite the hooks of its settings through a function it is handed.
 
-An agent is handed a path map and never learns where the other workstation is or how it is reached.
+Serving a chat client is a separate, optional contract: start the program's ACP adapter through an executor it is
+handed, and answer a client's connection start.
+
+An agent is handed a path map and executors, and never learns which workstation an executor reaches or how.
 
 ### Workstation
 
@@ -261,14 +262,14 @@ Two of these stores are files Hermod writes itself:
 | Package     | Represents                                           | Constraints                                                                                                                                                                                                      | Declares                                                                     |
 |-------------|------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------|
 | `cli`       | the process's interface | The only package that reads the arguments, the environment and the process's streams, and the one place every variable Hermod reads is named. Builds everything a command needs from the other adapters and hands it into the core: the agent implementation, the shells, the developer's git facts, the ACP connection and Air's own messages. Decides nothing from a state. | the commands |
-| `session`   | [Session](#session) | The only package that decides from states: what to do for a pair of agent and worker states, and where a chat's message goes. Reaches relays and workers only through `workspace`, and an agent only through `agent.Agent`. Declares the messages it routes by what they mean to it (start the connection, list the chats, cancel a request, open, suspend or close a chat, a remote's question and the client's answer, or pass through) and the channel they arrive on, and never a wire format or a client's own method names. Keeps nothing past the process. | `Attach`, `Chat`, `ExitStatus`, `Channel`, `Message`, `Kind` |
+| `session`   | [Session](#session) | The only package that decides from states: what to do for a pair of agent and worker states, and where a chat's message goes. Reaches relays and workers only through `workspace` (`relay.Filter` excepted), and an agent only through `agent.Agent` and `agent.ACP`. Declares the messages it routes by what they mean to it (start the connection, list the chats, cancel a request, open, suspend or close a chat, a remote's question and the client's answer, or pass through) and the channel they arrive on, and never a wire format or a client's own method names. Keeps nothing past the process. | `Attach`, `Chat`, `ExitStatus`, `Channel`, `Message`, `Kind`, `Result` |
 | `workspace` | [Workspace](#workspace) | The only package that imports both `relay` and `worker`, and the one that names and tags them. Its state is computed on every call. | `Workspace`, `State`, `Members` |
 | `relay`     | [Relay](#relay), [Leases](#leases) | The only package that takes a lock. FS runs the `mutagen` command; Net runs `ssh -R` and a listener in this process; IO copies between local streams and a remote stdio it is handed. | `Relay`, `State`, `Lease`, `Filter`, `Ends`; a constructor for each kind |
-| `worker`    | [Worker](#worker)                                    | Mechanism only: builds tmux commands and runs them through a `shell` on the remote. Does not know what its process is. Holds the [scripts](#remote-scripts) a worker starts with.                                 | `Worker`, `State`, `Spec`, `Form`, `Stdio`, `List`                           |
-| `agent`     | [Agent](#agent), the contract                        | An interface and values. No behaviour, and no dependency but the shared packages.                                                                                                                                | `Agent`, `State`, `Call`, `Probe`, `Needs`, `Handshake`, `Listing`, `Lookup`, `Conversation` |
-| `claude`    | [Agent](#agent), for Claude Code | Pure functions: runs no command and reads no file. The only package that knows Claude Code's arguments, files and ACP adapter program. | `Agent` (implements `agent.Agent`) |
-| `acp`       | the ACP wire format | Reads and writes one message per line, and turns each into the `session.Message` it is routed by: the standard methods by itself, a client's own methods by the table it is given. Writes the answers `session` gives in ACP's terms. Routes nothing itself. | `Conn` (implements `session.Channel`) |
-| `air`       | JetBrains Air's own facts | The only package that knows the `acp.json` document, the stand-in link and Air's own ACP messages. Says what each of those messages means as a `session.Kind`. Writing `acp.json` keeps every entry and key it does not own. | `Configure`, `Config`, `Entry`, `Methods` |
+| `worker`    | [Worker](#worker)                                    | Lifecycle only: key, tags, state, start, close and remove, through `shell`'s tmux on the remote; builds no tmux command. Does not know what its process is. Holds the [scripts](#remote-scripts) a worker starts with. | `Worker`, `State`, `Spec`, `Form`, `Stdio`, `List`                           |
+| `agent`     | [Agent](#agent), the contract                        | Interfaces of behaviour, performed through a `shell.Executor` an agent is handed; ACP is a separate, optional one. No dependency but the foundation. | `Agent`, `ACP`, `State`, `Conversation`, `Invocation`, `Launch`, `Handshake`, `Hook`, `ErrUnknown` |
+| `claude`    | [Agent](#agent), for Claude Code | The only package that knows Claude Code's arguments, files, settings format and ACP adapter program. Runs its commands through the `shell.Executor` it is built with, and knows nothing of which workstation that reaches, of Air, ports or tokens. | `Agent` (implements `agent.Agent` and `agent.ACP`) |
+| `acp`       | the ACP wire format | Reads and writes one message per line through the `Serializer` it is built with, which parses a message fully into its own type or rejects it. Its standard serializer has one type for each of ACP's messages. Routes nothing itself. | `Conn` (implements `session.Channel`), `Serializer`, `Standard` |
+| `air`       | JetBrains Air's own facts | The only package that knows the `acp.json` document, the stand-in link, Air's hook endpoint and Air's own ACP messages, which its serializer adds to `acp`'s standard one. Writing `acp.json` keeps every entry and key it does not own. | `Configure`, `Config`, `Entry`, `Serializer`, `IsHook` |
 | `git`       | the developer's git facts | Read-only `git` commands on the local workstation. Called by `cli`, which passes the results on as values. | `Identity`, `Read`, `MainWorktree` |
 | `shell`     | [Workstation](#workstation)                          | The only package that starts a process. Each wrapper rewrites the command and hands it inward, and dry-run is chosen once at the innermost one.                                                                  | `Executor`, `Command`, `Execution`; a constructor for each implementation |
 | `pathmap`   | the map between local and remote paths               | Pure. Applies to a string or a JSON value, longest root first.                                                                                                                                                   | `Map`, `Place`                                                               |
@@ -279,7 +280,8 @@ Two of these stores are files Hermod writes itself:
 
 Diagram below shows direct package imports. An **Adapter** imports the **Core** and the **Core** imports no **Adapter**; inside the **Core**, a
 package imports only its own layer or a lower one.  The **domain** layer holds the key components. The **application**
-layer drives them for one command, and the **foundation** layer is what they are built on.
+layer drives them for one command, and the **foundation** layer is what they are built on. `session` imports
+`relay` only to implement `relay.Filter`.
 
 
 ```mermaid
@@ -320,19 +322,20 @@ flowchart TD
     cli --> env
     git --> shell
     acp --> session
-    acp --> pathmap
     acp --> agent
+    air --> acp
     air --> session
     session --> workspace
     session --> agent
-    session --> worker
-    session --> relay
+    session -->|Filter| relay
     session --> pathmap
     session --> shell
     session --> env
     session --> secret
     claude --> agent
+    claude --> shell
     claude --> pathmap
+    claude --> env
     claude --> secret
     workspace --> relay
     workspace --> worker
@@ -341,6 +344,7 @@ flowchart TD
     relay --> shell
     worker --> shell
     worker --> env
+    agent --> shell
     agent --> pathmap
     agent --> env
     agent --> secret
@@ -370,15 +374,17 @@ tested through a fake `shell.Executor`.
 
 | Interface          | Declared in | Implemented by                                    | Reason     | Handed in by |
 |--------------------|-------------|---------------------------------------------------|------------|--------------|
-| `shell.Executor`   | foundation  | `shell`: local, dry-run, ssh, login, tmux         | kinds      | `cli`        |
+| `shell.Executor`   | foundation  | `shell`: local, dry-run, ssh, login, tmux; `workspace`: a worker's host | kinds      | `cli`; `session`, a worker's host to an agent |
 | `relay.Relay`      | domain      | `relay`: fs, io, net                              | kinds      | —            |
 | `relay.Lease`      | domain      | `relay`, one for each kind of relay               | kinds      | —            |
-| `relay.Filter`     | domain      | `session`, from what an agent declares            | looking up | `session`    |
-| `agent.Agent`      | domain      | `claude`                                          | inversion  | `cli`        |
+| `relay.Filter`     | domain      | `session`, for the hooks it aims at the client    | looking up | `session`    |
+| `agent.Agent`      | domain      | `claude`                                          | inversion  | `cli`: one built with the remote's executor and one with the local's |
+| `agent.ACP`        | domain      | `claude`                                          | inversion  | `cli`, when the agent implements it |
+| `acp.Serializer`   | adapter     | `acp`: standard; `air`: Air's, extending it        | kinds      | `cli`        |
 | `session.Channel`  | application | `acp`                                             | inversion  | `cli`        |
 | `session.Receiver` | application | `acp`, as half of a `Channel`                     | inversion  | `cli`        |
 | `session.Sender`   | application | `acp`, as half of a `Channel`; a function; a conversion in front of another `Sender` | kinds      | `session`    |
-| `session.Message`  | application | `acp`                                             | inversion  | —            |
+| `session.Message`  | application | `acp`, a type for each ACP message; `air`, one for each of Air's own | inversion  | —            |
 | `session.PathMap`  | application | `pathmap.Map`, through a conversion between `Path` and a string | inversion | `cli`, in what `attach` returns; `workspace.Map`, for the remote's whole map |
 | `session.StateMachine[S]` | application | `session`: `StateMachineImpl`, the machine of a session and of a chat; a state may only switch it | narrowing | `session` |
 | `session.SessionState` | application | `session`: attached, detached                | kinds      | —            |
@@ -398,6 +404,9 @@ classDiagram
         class ssh
         class login
         class tmux
+    }
+    namespace workspace {
+        class host
     }
     namespace relay {
         class Relay {
@@ -422,14 +431,16 @@ classDiagram
     namespace agent {
         class Agent {
             <<interface>>
-            +Parse(args) Call
-            +Run(Call, Map) Needs
-            +Adapter() Needs
-            +Probe(id) Probe
+            +Classify(args) Invocation, id
+            +List(ctx, directory) Conversations
+            +Lookup(ctx, id) Conversation
+            +Start(ctx, Executor, Launch) error
+            +StateDir(ctx, directory) directory
+        }
+        class ACP {
+            <<interface>>
+            +Adapter(ctx, Executor, Launch) error
             +Connect() Handshake
-            +List(directory) Listing
-            +Locate(id) Lookup
-            +Hooks(document, port, Token) document
         }
     }
     namespace claude {
@@ -456,7 +467,8 @@ classDiagram
             +Dir() Path
             +WithID(MessageID) Message
             +Mapped(pathFunc) Message
-            +Reply(answer) Message
+            +Reply(Result) Message
+            +Result() Result
             +Fail(error) Message
         }
         class PathMap {
@@ -492,7 +504,17 @@ classDiagram
     }
     namespace acp {
         class Conn
-        class acpMessage["message"]
+        class Serializer {
+            <<interface>>
+            +Decode(line) Message
+            +Encode(Message) line
+        }
+        class standard["Standard"]
+        class acpMessages["a type for each message"]
+    }
+    namespace air {
+        class airSerializer["Serializer"]
+        class airMessages["a type for each of Air's messages"]
     }
     namespace pathmap {
         class Map
@@ -505,6 +527,7 @@ classDiagram
     Executor <|.. ssh
     Executor <|.. login
     Executor <|.. tmux
+    Executor <|.. host
     Relay <|.. fsRelay
     Relay <|.. ioRelay
     Relay <|.. netRelay
@@ -512,12 +535,20 @@ classDiagram
     netRelay --> Filter
     Filter <|.. hookFilter
     Agent <|.. claudeAgent
+    ACP <|.. claudeAgent
+    Agent ..> Executor
+    ACP ..> Executor
     Receiver <|-- Channel
     Sender <|-- Channel
     Sender <|.. funcSender
     Sender <|.. transformSender
     Channel <|.. Conn
-    Message <|.. acpMessage
+    Conn --> Serializer
+    Serializer <|.. standard
+    Serializer <|.. airSerializer
+    airSerializer --> standard
+    Message <|.. acpMessages
+    Message <|.. airMessages
     Channel ..> Message
     PathMap <|.. Map
     StateMachine <|.. stateMachineImpl
@@ -540,10 +571,15 @@ its result.
 | ssh            | Wraps an inner `Executor`: the command runs on a host.                    |
 | login          | Wraps an inner `Executor`: the command runs under the user's login shell. |
 | tmux           | Wraps an inner `Executor`: the command runs in a tmux session.            |
+| host           | `workspace`'s: the command runs as a worker ([Concrete types](#concrete-types)). |
 
-The first two say **how** a command runs and the other three **where**. A caller nests the ones it needs, and the
+The first two say **how** a command runs and the others **where**. A caller nests the ones it needs, and the
 choice between local and dry-run is made once, at the innermost one, so nothing above it knows about dry-run.
 Commands that only read a state always run on a local one.
+
+tmux's command language is `shell`'s alone: the tmux wrapper makes a session with its options, quotes what it puts
+on tmux's command line, and `shell` lists the sessions with their options. `worker` uses them and builds no tmux
+command.
 
 ### `relay.Relay` and `relay.Lease` — one channel, and a claim on it
 
@@ -563,7 +599,7 @@ given up, as [Leases](#leases) describes.
 
 | Implementation | Constructed from                                                   | Adds                                                                                   |
 |----------------|--------------------------------------------------------------------|----------------------------------------------------------------------------------------|
-| fs             | `Ends` (a local root and a remote root), a name, labels            | `Flush`; `List`, which reads the relays under a label with their ends and states       |
+| fs             | `Roots` (a local root and a root on a remote, named by its ssh alias), a name, labels, a writer for Mutagen's output | `Flush`; `List`, which reads the relays under a label with their ends and states from Mutagen's structured listing (`--template`) |
 | io             | a remote stdio (a command that reaches it), local streams          | —                                                                                      |
 | net            | a remote port, a local address, an optional `Filter`               | —                                                                                      |
 
@@ -572,23 +608,35 @@ Reading a relay's state can fail. That is an error, not a fourth state.
 ### `relay.Filter` — what a Net relay lets through
 
 One method: given a call that arrived on the remote port, return the call to make locally, or refuse it.
-`session` implements it for an agent's hooks, from the token and the address the agent declared
+`session` implements it for the hooks it aimed at the client, from the worker's token and the client's endpoint
 ([Hooks](#hooks)). A user's own Net relay has none.
 
-### `agent.Agent` — an agent program's contract
+### `agent.Agent` and `agent.ACP` — an agent program's contract
 
-Every method is a question answered with a value; an agent performs nothing.
+An agent performs its operations through the `shell.Executor` it is built with, and starts a conversation through
+the one it is handed for that start. It never learns which workstation an executor reaches: `claude` built with a
+local executor answers for the local workstation, and with a remote one for the remote.
 
-| Method    | The question                                 | The answer                                                                                                                                             |
-|-----------|----------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `Parse`   | What do these arguments ask for?             | a `Call`: a conversation and its ID, or a one-shot call                                                                                                |
-| `Run`     | What does running this call need?            | a `Needs`: the command with paths mapped, the files it must find, the names of the variables it must be given, the directories and the port it requires |
-| `Adapter` | What does the program's ACP adapter need?    | a `Needs` of the same shape                                                                                                                            |
-| `Probe`   | Is this conversation running?                | a `Probe`: the command that asks the agent program, and how to read its output into a `State`                                                          |
-| `Connect` | How is a client's connection start answered? | a `Handshake`: the protocol version and the program's capabilities                                                                                     |
-| `List`    | Which conversations do this directory and the directories under it have? | a `Listing`: the command that asks the agent program, and how to read its output into `Conversation`s: each one's ID, directory, `State`, title and last update |
-| `Locate`  | Where does this conversation belong?         | a `Lookup`: the command that asks the agent program, and how to read its output into the `Conversation`, or into none when the program does not have it |
-| `Hooks`   | How do the program's hooks call back?        | the settings document with its hooks aimed at a port and carrying a token                                                                              |
+| Method     | What it does                                                                                                                           |
+|------------|----------------------------------------------------------------------------------------------------------------------------------------|
+| `Classify` | Says what arguments ask for, as an `Invocation`: a conversation, with its ID; a one-shot call; or a command the agent does not run     |
+| `List`     | The `Conversation`s of a directory and of the directories under it: each one's ID, directory, `State`, title and last update           |
+| `Lookup`   | One `Conversation`: its directory and `State`; `ErrUnknown` when the program does not have it                                          |
+| `Start`    | Starts or resumes the conversation of a `Launch` through the executor it is handed                                                    |
+| `StateDir` | The directory where the program keeps the state of a directory's conversations, such as their transcripts                              |
+
+A `Launch` is what a start is given: the caller's arguments, the path map, the caller's variables, from which the
+agent takes only those it declares, and a function that rewrites one `Hook`, a URL with its headers, or leaves it
+out. The agent applies the function to every hook of its settings, and knows nothing of where the hooks go.
+
+`agent.ACP` is the optional contract of an agent that serves a chat client:
+
+| Method    | What it does                                                                     |
+|-----------|----------------------------------------------------------------------------------|
+| `Adapter` | Starts the program's ACP adapter for a `Launch`, through the executor it is handed |
+| `Connect` | The answer to a client's connection start: a `Handshake`, the protocol version and the program's capabilities |
+
+`cli` hands `agent.ACP` to the chat path only when the agent implements it.
 
 ### `session.Channel` and `session.Message` — a chat client's connection
 
@@ -616,7 +664,8 @@ A `Message` says what `session` needs to route it:
 | `Dir`    | The directory it names, if any                                   |
 | `WithID` | The same message under another request ID                        |
 | `Mapped` | The same message with every path in it taken through a function  |
-| `Reply`  | The answer to a request `session` answers itself: empty, an `agent.Handshake`, or the `agent.Conversation`s of a list |
+| `Reply`  | The answer to a request `session` answers itself, with a `Result`: `EmptyResult`, a `HandshakeResult` or a `ListResult` |
+| `Result` | The `Result` an answer carries, when it is one of those          |
 | `Fail`   | An error answer to this request                                  |
 
 | Kind       | Meaning                                                                                            |
@@ -631,17 +680,39 @@ A `Message` says what `session` needs to route it:
 | `Question` | A remote asks the client and expects an answer.                                                    |
 | `Answer`   | The client answers a remote's question.                                                            |
 
-`acp.Conn` implements `Channel` over a pair of streams, one message per line. It gives a message its `Kind`
-itself where ACP's shape and standard methods say it, and a client's own methods by the table it is given, which
-`air` provides for Air ([Air's messages](#airs-messages)).
+A `Result` is a plain value of the core; the channel's serializer writes it in the protocol's terms.
+
+`acp.Conn` implements `Channel` over a pair of streams, one message per line, through the `acp.Serializer` it is
+built with ([`acp.Serializer`](#acpserializer--acps-messages-as-types)). `Send` takes any `Message`.
+
+### `acp.Serializer` — ACP's messages as types
+
+| Method   | What it does                                                                                       |
+|----------|----------------------------------------------------------------------------------------------------|
+| `Decode` | Parses one line fully into the type of its message, a `session.Message`, or rejects it              |
+| `Encode` | Writes any `session.Message` as one line, a `Result` in the protocol's terms                        |
+
+- **One type per message.** The standard serializer, `acp.Standard`, has a Go type for each of ACP's requests,
+  answers and notifications, with typed JSON-RPC IDs, a number or a string. An answer is parsed by the type of the
+  request it answers, which the connection recorded when the request passed. Each type gives its own `Kind`,
+  `Chat` and `Dir`, and maps the fields it declares as paths. Every type declares ACP's `_meta` and carries it
+  with every string in it mapped by the path map, so `initialize`'s `_meta.jetbrains.air` reaches each adapter
+  and a path in Air's extensions crosses mapped.
+- **An adapter is Hermod's client.** A `Conn` built for an adapter writes `initialize` without the client's `fs`
+  and `terminal` capabilities ([The client's connection](#the-clients-connection)).
+- **Air extends it.** `air.Serializer` adds Air's own messages to the standard ones
+  ([Air's messages](#airs-messages)).
+- **Only parsed messages are received.** A request the serializer rejects is answered with a JSON-RPC error,
+  `method not found` when neither serializer knows its method and `invalid params` when its message does not
+  parse; any other rejected line is logged and dropped. Nothing reaches `Receive` unparsed.
 
 ### Concrete types
 
 | Type                  | Operations                                                                                           | Notes                                                                                                                         |
 |-----------------------|------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
-| `workspace.Workspace` | `Open` (the workspace of a remote and a directory), `Map` (the path map of every workspace on a remote, read from the FS relays Mutagen lists under `hermod-remote`; a directory under none of their roots is mapped as a new workspace would join it, [rule 3](#which-workspace-a-directory-belongs-to), in either direction), `State`, `PathMap`, `AddFS`, `AddNet`, `Start`, `Attach`, `Detach`, `Close` | `Attach` connects its relays, the IO relay to one worker's stdio on the caller's streams among them, and returns when that relay or an FS relay stops serving. `Detach` gives up every lease this process holds ([Detach](#detach)). `Close` ends one worker, or removes it when it is Exited ([Close](#close)). |
+| `workspace.Workspace` | `Open` (the workspace of a remote and a directory), `Map` (the path map of every workspace on a remote, read from the FS relays Mutagen lists under `hermod-remote`; a directory under none of their roots is mapped as a new workspace would join it, [rule 3](#which-workspace-a-directory-belongs-to), in either direction), `State`, `Look`, `FreePort`, `PathMap`, `AddFS`, `AddNet`, `Host`, `Attach`, `Detach`, `Close` | `Host` is a `shell.Executor` for one worker key, stdio `Form` and record: each command executed on it starts that worker in the command's directory, its variables and the record's files written to the [worker's directory](#a-workers-directory) and never on a command line, and its `Execution` ends once the worker runs. The record is read when the command executes, after the agent has rewritten its hooks. `Look` reads a worker's state with the files its directory records, in one call; `FreePort` picks a port free on the remote and recorded by no worker. `Attach` connects its relays, the IO relay to one worker's stdio on the caller's streams among them, and returns when that relay or an FS relay stops serving. `Detach` gives up every lease this process holds ([Detach](#detach)). `Close` ends one worker, or removes it when it is Exited ([Close](#close)). `workspace` declares what `session` passes to and reads from these: the worker key, the stdio `Form`, a worker's record, a worker's state, the attach streams, and the errors an attach or a connect lease ends with. |
 | `workspace.Members`   | —                                                                                                    | What a workspace holds, as one read returns it: its FS relays with their ends and states, read from Mutagen, and its workers with their states, read from tmux. `State` is computed from it. |
-| `worker.Worker`       | `State`, `Start`, `Close`, `Remove`, `Stdio`; `List` by tag                                          | `Spec` says what to start: key, directory, command, files, variables, tags and the stdio `Form` (terminal or line stream).    |
+| `worker.Worker`       | `State`, `Start`, `Close`, `Remove`, `Stdio`; `List` by tag                                          | `Spec` says what to start: key, directory, command, variables, tags and the stdio `Form` (terminal or line stream). `workspace` builds it from a command executed on its `Host`. |
 | `air.Config`          | `Load`, `Merge`, `Save`                                                                              | Merging keeps every entry and key it does not own.                                                                            |
 | `pathmap.Map`         | `ToRemote`, `ToLocal`                                                                                | Built from pairs of a local and a remote root, longest root first, on strings. `session` takes it as a `session.PathMap`, through a conversion between `session.Path` and a string; that interface's methods are the functions a `Message` is `Mapped` with. |
 | `session.SessionControl` | `HandleClientMessage`, `HandleAdapterMessage`, `Detach`                                          | One session: its machine and its context. The first two report whether the session ended ([Router, sessions and chats](#router-sessions-and-chats)). |
@@ -657,8 +728,8 @@ Every session, whoever starts it, runs these steps.
 
 1. **Open the workspace.** Find [the workspace the directory belongs to](#which-workspace-a-directory-belongs-to),
    or make it. Connect the FS relay that covers the directory, and flush it. The path map is now fixed for the run.
-2. **Read the states.** One call on the remote reads the worker's state and, for a worker that runs one agent,
-   whether its conversation runs.
+2. **Read the states.** The workspace reads the worker's state and, for a worker that runs one agent, the agent
+   looks up its conversation's.
 3. **Decide.**
 
    | Agent   | Worker            | Action |
@@ -671,9 +742,12 @@ Every session, whoever starts it, runs these steps.
    A worker that does not run one agent has only the worker column: Absent starts it, Running attaches, and an
    Exited one is removed first. Whether a Stopped conversation can be resumed is not a state Hermod reads: the
    caller's arguments say whether to resume, and the agent program refuses when there is nothing to resume.
-4. **Start**, when the table says so. The workspace first adds, connects and flushes the FS relays the agent
-   requires, so its transcripts are on the remote before it reads them. Then the
-   [worker's directory](#a-workers-directory) is written, and the worker starts in the directory's remote path.
+4. **Start**, when the table says so. `session` is handed two agents: one built with the remote's executor, which
+   answers `Classify`, `Lookup` and `Start`, and one built with the local's, used only for its `StateDir`. For an
+   agent, the workspace first adds, connects and flushes the FS relay
+   between the local and the remote agent's `StateDir`, so its transcripts are on the remote before it reads them,
+   and the agent then starts the conversation through the workspace's `Host` for the worker. Any other command is
+   executed on the `Host` by the session. The worker starts in the directory's remote path.
 5. **Attach the workspace.** The workspace adds the session's remaining relays, the IO relay to the worker among
    them, and connects them. The client is now connected to the worker.
 6. **Detach the workspace.** Stdin EOF, a signal or a dropped connection ends the attach, and the session
@@ -695,8 +769,8 @@ sequenceDiagram
     participant worker
     cli ->> session: Attach(request)
     opt the command is an agent's
-        session ->> agent: Parse(args)
-        agent -->> session: Call (a conversation and its key)
+        session ->> agent: Classify(args)
+        agent -->> session: a conversation and its ID
     end
     session ->> workspace: Open(remote, directory)
     workspace ->> relay: List the FS relays, then Connect and Flush the one that covers the directory
@@ -704,15 +778,16 @@ sequenceDiagram
     session ->> workspace: State of the worker (key)
     workspace ->> worker: State
     opt the worker runs an agent
-        session ->> agent: Probe(key)
-        Note over session: runs the probe's command on the remote
+        session ->> agent: Lookup(ID)
+        Note over agent: asks the agent program through its executor
     end
     Note over session: decides from the two states
     opt start
-        session ->> agent: Run(Call, PathMap)
-        agent -->> session: Needs
-        session ->> workspace: AddFS for each FS relay the agent requires
-        session ->> workspace: Start(Spec)
+        session ->> agent: StateDir, of the local and of the remote agent
+        session ->> workspace: AddFS for the two
+        session ->> workspace: Host(key, form, the hook record)
+        session ->> agent: Start(Host, Launch)
+        agent ->> workspace: executes its command on the Host
         workspace ->> worker: Start
     end
     session ->> workspace: AddNet, then Attach(key, streams)
@@ -741,8 +816,8 @@ releases them.
 ### One-shot call
 
 Arguments that name no conversation (a subcommand such as `auth`, `--version`, `--help`, `-p` without a session)
-are not a session. `session` runs the command on the remote with the caller's stdio and exits with its code. It
-runs in the project's remote directory when that exists, else in the remote user's home.
+are not a session. `session` runs the command, as given, on the remote with the caller's stdio and exits with its
+code. It runs in the project's remote directory when that exists, else in the remote user's home.
 
 ```mermaid
 sequenceDiagram
@@ -751,8 +826,8 @@ sequenceDiagram
     participant agent as agent (claude)
     participant shell
     cli ->> session: Attach(request)
-    session ->> agent: Parse(args)
-    agent -->> session: Call (one-shot)
+    session ->> agent: Classify(args)
+    agent -->> session: a one-shot call
     session ->> shell: Run the command on the remote with the caller's streams
     shell -->> session: Result
     session -->> cli: ExitStatus
@@ -764,13 +839,13 @@ No workspace, no worker and no relay take part.
 
 A chat client holds one connection for every chat of every project, while each project's chats run in its
 workspace's own adapter, a line-stream worker on the remote. `session.Chat` serves that connection. `cli` builds
-it from the client's `Channel` (an `acp.Conn` over stdin and stdout, with Air's table), the agent, the remote (its
-shell and its name) and an `attach` function, which attaches the workspace a directory belongs to, starting its
+it from the client's `Channel` (an `acp.Conn` over stdin and stdout, with Air's serializer), the agent built with
+the remote's executor and its `agent.ACP`, the remote (its shell and its name) and an `attach` function, which attaches the workspace a directory belongs to, starting its
 adapter when none runs, and returns the workspace, its root, its path map, the adapter's `Channel` and whether it
 started the adapter.
 
-A chat's agent runs inside the adapter, which starts, resumes and ends it. `session` asks the agent program only
-where a chat it does not hold belongs, which chats a directory has, and whether any of them still runs.
+A chat's agent runs inside the adapter, which starts, resumes and ends it. `session` asks the agent only where a
+chat it does not hold belongs, which chats a directory has, and whether any of them still runs.
 
 #### Router, sessions and chats
 
@@ -855,7 +930,7 @@ A session detaches its workspace first and switches to Detached only when that s
 could not be detached still holds it, and the error ends `Chat`. After a Close that left no chat waited on, the
 session records its ID and waits for the adapter's answer to it, so the adapter has ended the chat. At that answer
 it checks again: an `Open` that came meanwhile has it waiting on a chat, and it stays Attached. Still waiting on
-none, it runs the agent's `List` for its workspace's root, mapped to the remote: the adapter runs every
+none, it asks the agent's `List` for its workspace's root, mapped to the remote: the adapter runs every
 conversation of the workspace, a subdirectory's included, and the listing covers the directories under the root.
 With no conversation running, it closes the adapter worker instead of detaching:
 `Workspace.Close` ends the worker and, with no other worker left, releases the relays ([Close](#close)). With one
@@ -924,19 +999,19 @@ adapter receives IDs that are unique.
 
 | Event | What happens |
 |-------|--------------|
-| `Connect` from the client | The router answers it with the message's `Reply` and the agent's `Handshake`, and keeps the message without the `fs` and `terminal` client capabilities ([The client's connection](#the-clients-connection)). |
-| `List` from the client | The router maps the directory to the remote by the remote's path map (`workspace.Map`), runs the agent's `List` for it on the remote, and answers with the conversations of that directory, leaving out
-those of the directories under it, their directories mapped back; a directory no relay covers is mapped as a new workspace would join it, so a project never attached here gets the remote's list too, often empty. A command or a reading that fails is answered with `Fail`. |
+| `Connect` from the client | The router answers it with the message's `Reply` and the `Handshake` of the agent's `Connect`, and keeps the message, which an adapter's `Conn` writes without the `fs` and `terminal` client capabilities ([The client's connection](#the-clients-connection)). |
+| `List` from the client | The router maps the directory to the remote by the remote's path map (`workspace.Map`), asks the agent's `List` for it, and answers with the conversations of that directory, leaving out
+those of the directories under it, their directories mapped back; a directory no relay covers is mapped as a new workspace would join it, so a project never attached here gets the remote's list too, often empty. A `List` that fails is answered with `Fail`. |
 | `Cancel` from the client | Routed by the pending request it cancels to that session, and passed to its adapter. A `Cancel` of a request no session holds is dropped. |
 | `Open` | The router finds the session by the owner of the chat the message names, or for a new chat by the directory, attaching a new session when none holds the directory and starting its forwarder; a workspace that cannot be attached ends `Chat` with that error. The session takes the chat it knows by that ID, or a new one, opens it and records it under the request; it waits on one chat more. The message goes to the adapter. |
 | The adapter answers an `Open` | Only an adapter message that is not a `Question` is matched against the opening map: the adapter numbers its own requests apart from the client's ([Request IDs](#request-ids)), so a question can carry the ID of an `Open` still waiting. The chat is Open; the session records it under the ID the answer names, in its chats and in the owners. When the chat was suspended meanwhile, the answer is dropped and the chat stays Suspended. |
 | `Suspend` | The chat is Suspended, or stays Unopened when it was never opened. The session answers the client with the message's `Reply` and passes nothing on: an adapter that received it would end the chat. When the client waited on it, the session waits on one chat fewer. Waiting on none, it detaches. |
 | `Close` | The chat is Closed and leaves the chats and the owners. The message goes to the adapter, which ends the chat; what the adapter still sends of that chat goes to the client as a message of no chat. When the client waited on it, the session waits on one chat fewer. Waiting on none, it records the `Close`'s ID and ends at the adapter's answer, unless a chat is waited on again by then: it closes the adapter worker when no conversation of its workspace runs, and detaches otherwise ([Session states](#session-states)). |
-| The adapter answers the kept `Connect` | Matched by the `Connect`'s ID, which the session records when it sends it, first of all, to an adapter that `attach` reports it started; a difference from the agent's `Handshake` in protocol version or capabilities is logged, and the answer is dropped. |
+| The adapter answers the kept `Connect` | Matched by the `Connect`'s ID, which the session records when it sends it, first of all, to an adapter that `attach` reports it started; a difference between the answer's `Result` and the agent's `Handshake` in protocol version or capabilities is logged, and the answer is dropped. |
 | `Question` from an adapter | Renumbered on its way to the client; held while its chat is Suspended. |
 | `Answer` from the client | Routed by its ID to the session that asked, and passed on under the adapter's own ID. |
 | A `Pass` | Goes to the other side: to the adapter of the chat's session, or, from an adapter, to the chat, or straight to the client when it names no chat the session holds. |
-| A `Suspend`, a `Close`, or an `Open` that names a chat, for a chat that no session holds | The router runs the agent's `Locate` for the chat on the remote. With the conversation found, it maps its directory to the local one by the remote's path map, finds or attaches the session for that directory as for an `Open`, and the session takes the chat in the state the conversation's state maps to ([Chat states](#chat-states)) and records it in its chats and the owners; then the event is handed on as for a chat the session holds. A chat the agent program does not have, or a lookup that fails, is answered with the message's `Fail`, and `Chat` goes on. A located chat whose directory is another directory of a workspace that a session already holds, such as a subdirectory, makes a second session as an `Open` there does, and its refused attach ends `Chat`. |
+| A `Suspend`, a `Close`, or an `Open` that names a chat, for a chat that no session holds | The router asks the agent's `Lookup` for the chat. With the conversation found, it maps its directory to the local one by the remote's path map, finds or attaches the session for that directory as for an `Open`, and the session takes the chat in the state the conversation's state maps to ([Chat states](#chat-states)) and records it in its chats and the owners; then the event is handed on as for a chat the session holds. A chat the agent program does not have (`ErrUnknown`), or a lookup that fails, is answered with the message's `Fail`, and `Chat` goes on. A located chat whose directory is another directory of a workspace that a session already holds, such as a subdirectory, makes a second session as an `Open` there does, and its refused attach ends `Chat`. |
 | A `Pass` from the client for a chat that no session holds, or that names no chat | Answered with the message's `Fail` when it is a request, and dropped otherwise; `Chat` goes on. |
 | The adapter's connection ends | The session detaches and is forgotten; the adapter's chats go with it. |
 | The client's connection ends, or `Chat`'s context | The router detaches every session it holds, stops the forwarders and returns. The workers keep running. |
@@ -956,27 +1031,30 @@ router's one loop, so the output of that chat is handled as for its state, a que
 
 #### Air's messages
 
-| Air's message                                   | Kind       | Given by |
+Each message's type gives its `Kind`; the serializer that has the type is in the last column.
+
+| Air's message                                   | Kind       | Typed by |
 |-------------------------------------------------|------------|----------|
 | `session/new`, `session/load`, `session/resume` | `Open`     | `acp`    |
 | `session/close`, sent on every closed tab and at an IDE quit | `Suspend` | `air` |
 | `_session/archive`, "mark done"                 | `Close`    | `air`    |
-| `_session/unarchive`, sent before reopening a chat marked done | `Pass` | `acp` |
+| `_session/unarchive`, sent before reopening a chat marked done; `_session/rename` | `Pass` | `air` |
 | `initialize`                                    | `Connect`  | `acp`    |
 | `session/list`                                  | `List`     | `acp`    |
 | `$/cancel_request`                              | `Cancel`   | `acp`    |
 | a request from the adapter, such as `session/request_permission` | `Question` | `acp` |
 | the client's answer to it                       | `Answer`   | `acp`    |
-| anything else                                   | `Pass`     | `acp`    |
+| every other message of ACP's                    | `Pass`     | `acp`    |
+| a method neither serializer has                 | rejected: `method not found` to a request, logged and dropped otherwise | — |
 
 #### The client's connection
 
-`session` answers what names no chat itself, from the agent. It answers the client's `Connect` with the agent's
-`Handshake`, and keeps the `Connect` without the `fs` and `terminal` client capabilities, so the agent acts on the
-remote only. Every adapter that `attach` reports it started is sent the kept `Connect` before anything else, and the session
+`session` answers what names no chat itself, from the agent. It answers the client's `Connect` with the
+`Handshake` of the agent's `Connect`, and keeps the `Connect`. An adapter's `acp.Conn` writes it without the `fs` and
+`terminal` client capabilities, so the agent acts on the remote only. Every adapter that `attach` reports it started is sent the kept `Connect` before anything else, and the session
 records its ID and drops the adapter's answer to it, logging where it differs from the `Handshake`; an adapter that already runs has had it, and ACP allows it only as a
 connection's first request. The chats of a directory, and where a chat belongs, are the agent program's to say
-([Storage](#storage)): `session` runs the agent's `List` and `Locate` on the remote and stores nothing of a chat.
+([Storage](#storage)): `session` asks the agent's `List` and `Lookup` and stores nothing of a chat.
 
 ```mermaid
 sequenceDiagram
@@ -989,18 +1067,20 @@ sequenceDiagram
     Air ->> cli: starts hermod air acp
     cli ->> session: Chat(client, agent, remote, attach)
     Air ->> session: initialize (Connect)
-    session ->> agent: Connect()
-    session -->> Air: the Handshake; the Connect is kept without fs and terminal
+    session ->> agent: Connect() (agent.ACP)
+    session -->> Air: the Handshake; the Connect is kept
     Air ->> session: session/list (List, a directory)
     session ->> agent: List(the directory, mapped to the remote)
-    Note over session: runs the listing's command on the remote
     session -->> Air: the conversations, paths mapped back
     Air ->> session: session/new (Open, a directory)
     session ->> workspace: attach: Open(remote, directory), State of the adapter worker
     opt Absent
-        session ->> agent: Adapter()
-        session ->> workspace: Start(Spec for the adapter), AddNet for its hooks
+        session ->> workspace: Host(the adapter's key, a line stream, its hook record)
+        session ->> agent: Adapter(Host, Launch) (agent.ACP)
+        agent ->> workspace: executes the adapter's command on the Host
+        session ->> workspace: AddNet for its hooks
         session ->> adapter: the kept Connect; its answer is dropped
+        Note over adapter: the adapter's Conn writes initialize without fs and terminal
     end
     session ->> workspace: Attach(adapter, a line stream)
     session ->> adapter: session/new, paths mapped to the remote
@@ -1013,8 +1093,7 @@ sequenceDiagram
     end
     Air ->> session: _session/archive (Close)
     opt no session holds the chat
-        session ->> agent: Locate(chat)
-        Note over session: runs the lookup's command on the remote
+        session ->> agent: Lookup(chat)
         session ->> workspace: attach the directory it reports
     end
     session ->> adapter: the archive: the adapter ends the chat
@@ -1088,8 +1167,8 @@ one already joined leases that relay instead of making a second.
 | Relay | Added for | Shared by the workspace's sessions |
 |-------|-----------|------------------------------------|
 | FS, the project | the workspace itself | yes |
-| FS, another directory | a session whose directory lies outside the project relay, or an agent that declares one (its transcripts) | yes, by every session that needs the same two ends |
-| Net | an agent that declares one (its hooks), or the user's `-R` | no: its local end is a listener inside one session's process |
+| FS, another directory | a session whose directory lies outside the project relay, or an agent's `StateDir` (its transcripts) | yes, by every session that needs the same two ends |
+| Net | an agent's hooks aimed at the client, or the user's `-R` | no: its local end is a listener inside one session's process |
 | IO | each worker | no: one per worker |
 
 - **The path map.** An FS relay is configured with its two ends, a (local root, remote root) pair. The pairs of a
@@ -1118,7 +1197,7 @@ Everything a session uses is found from its workspace or from the `hermod` prefi
 | Workspace | the name of its project FS relay | — | the two rows below |
 | Worker (remote) | tmux session `hermod-<key>`, or `hermod-acp-<workspace>` for an adapter; a plain `attach` keeps its name | options `@hermod-workspace`, `@hermod-origin` | `tmux ls -F '#{session_name} #{@hermod-workspace} #{@hermod-origin}'` |
 | Worker's directory (remote) | `~/.hermod/s/<tmux session>/` | — | — |
-| FS relay (local) | `hermod-<remote>-<slug>-<local>`: `<remote>` the alias reduced to the letters, digits and dashes Mutagen accepts, `<slug>` from its remote end, `<local>` a hash of its local end | labels `hermod-remote=<remote>`, `hermod-workspace=<workspace>` | `mutagen sync list --label-selector hermod-workspace=<workspace>` |
+| FS relay (local) | `hermod-<remote>-<slug>-<local>`: `<remote>` the alias reduced to the letters, digits and dashes Mutagen accepts, `<slug>` from its remote end, `<local>` a hash of its local end | labels `hermod-remote=<remote>`, `hermod-workspace=<workspace>` | `mutagen sync list --label-selector hermod-workspace=<workspace> --template '{{json .}}'` |
 | Log (local) | `~/.cache/hermod/air/<key>.log` | — | — |
 
 - **`@hermod-workspace`** is the workspace a worker belongs to. A workspace reads its workers by it, so no file on
@@ -1139,16 +1218,20 @@ The worker's directory on the remote, mode `0700`, holds what the running proces
 
 | File | Holds |
 |------|-------|
-| `env` | the variables the agent declared it needs, and the git identity |
-| the Net relay's port and token | for the hooks' [filter](#hooks) |
+| `env` | the variables of the command the worker was started with: those the agent declares, the git identity, and the contents of the files below |
+| `hook-port`, `hook-token`, `hook-routes` | for a worker whose agent's hooks reach the client: the Net relay's remote port, the worker's token and the routes aimed at the client, for the hooks' [filter](#hooks) |
 | `settings.json` | for a worker that runs Claude itself: the caller's hook settings as the agent rewrote them |
 | the MCP configuration | for a worker that runs Claude itself: every `--mcp-config` value, inline or a file, as given with its paths mapped, so a server's credentials stay off the command line |
 | the FIFO, the logs, the process ID | for a line-stream worker; a close waits on the process ID |
 
-- **Only declared variables reach the remote.** `cli` reads the process environment once, and the worker is given
-  only the variables the agent declared, so a local credential or setting never travels by default.
-- **Secrets never sit on a command line.** The files are written over ssh stdin, and secrets reach the remote only
-  inside this directory or the worker's own stdin.
+- **Only declared variables reach the remote.** `cli` reads the process environment once, and the agent takes from
+  it only the variables it declares, so a local credential or setting never travels by default.
+- **A command's inputs are its variables.** A command executed on a workspace's `Host` carries everything it needs
+  as variables, which reach the worker through `env`. Claude's start command writes the files it reads from them
+  into the worker's directory, named by `HERMOD_WORKER_DIR`, and unsets those variables before Claude starts.
+  The `env` package declares that variable's name, which `worker` sets and an agent's start command reads.
+- **Secrets never sit on a command line.** `env` is written over ssh stdin, the start command writes the other
+  files from its variables, and secrets reach the remote only inside this directory or the worker's own stdin.
 - **Setup leaves stdin for the worker.** Every setup command runs with stdin from `/dev/null`: a program such as
   Claude's SDK writes its first message the moment the process starts, and a setup command that inherits stdin
   would consume it.
@@ -1161,13 +1244,22 @@ one complete line at a time, so a connection dropped mid-line never hands the pr
 
 ### Hooks
 
-An agent's hooks reach the local client through a Net relay and its filter. The hook settings that reach the
-remote carry a port and a token generated for the worker; the filter accepts only that token and only the routes
-the settings named, maps the paths in the bodies, and substitutes the client's current token. The worker's token
+An agent's hooks reach the local client through a Net relay and its filter. The agent rewrites each hook of its
+settings, a URL and its headers, with a function `session` gives it in the `Launch`. `air` says which hook is
+Air's (`air.IsHook`), and `cli` hands that to `session`: the first such hook is the client's endpoint, and every
+hook to it is aimed at a port on the remote and carries a token generated for the worker; a hook to another
+loopback endpoint is left out and logged by scheme, host and path; any other hook is kept. The filter accepts only
+the worker's token and only the routes the function aimed, maps the paths in the bodies, and substitutes the
+client's current token. The worker's token
 is needed because a loopback port on a shared remote is reachable by every user there, and it keeps a running
 agent's settings valid across restarts of the client, whose own token changes with every run. The port is picked
 free on the remote; when it is taken before `ssh -R` binds it, the session runs without its Net relay and logs it,
 and the next one tries the same port again.
+
+`session` picks the port through `workspace`'s `FreePort`, and records the port, the worker's token and the aimed
+routes in the worker's directory through the `Host` the worker starts on. A session that attaches to a running
+worker reads them back through `workspace`'s `Look` and builds the same filter; a worker whose directory records
+none runs without the hooks' Net relay, and the session logs it.
 
 ### Data between the client and the agent
 

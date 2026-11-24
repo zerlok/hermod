@@ -100,8 +100,8 @@ with the caller's arguments, and Claude refuses a resume that has nothing to res
 - **THEN** Hermod starts Claude with the caller's arguments, and Claude's refusal reaches the caller
 
 ### Requirement: A conversation's transcripts are on the remote before it starts
-Before starting a conversation Hermod SHALL connect and flush the file relays the agent declares for its
-transcripts, so that a conversation that exists only locally is on the remote before Claude resumes it, and the
+Before starting a conversation Hermod SHALL connect and flush the file relay between the directories where the agent
+program keeps the conversations' transcripts on each workstation, so that a conversation that exists only locally is on the remote before Claude resumes it, and the
 remote's conversations appear in the local config directory.
 
 #### Scenario: Local-only transcript resumed
@@ -246,8 +246,35 @@ with that error, and the first SHALL keep its adapter.
 - **WHEN** a second IDE's `hermod air acp` opens a chat in a project whose adapter the first one is attached to
 - **THEN** the second `hermod air acp` exits with the error, and the first keeps its adapter
 
+### Requirement: Messages are parsed in full or rejected
+`hermod air acp` SHALL parse every ACP message, on the client's connection and on each adapter's, in full into the
+type of its method, keeping ACP's `_meta` with its paths mapped, and SHALL route, map or pass on only a message it has parsed. A request whose method neither
+ACP's standard messages nor Air's own include SHALL be answered with the JSON-RPC error `method not found`, and a
+request whose message does not parse with `invalid params`; neither SHALL reach the other side. Any other message
+that is rejected SHALL be logged and dropped.
+
+#### Scenario: Unknown request
+- **WHEN** Air sends a request whose method is neither ACP's nor Air's own
+- **THEN** Air receives a `method not found` error for it, and no adapter receives it
+
+#### Scenario: Unknown notification
+- **WHEN** an adapter sends a notification whose method is neither ACP's nor Air's own
+- **THEN** it is logged and Air does not receive it
+
+#### Scenario: Malformed request
+- **WHEN** Air sends `session/new` whose `cwd` is not a string
+- **THEN** Air receives an `invalid params` error for it, and no adapter is started for it
+
+#### Scenario: Air's own message carried
+- **WHEN** Air sends `_session/rename` for a chat
+- **THEN** the chat's adapter receives it
+
+#### Scenario: Air's extensions carried
+- **WHEN** Air's `initialize` declares `_meta.jetbrains.air`
+- **THEN** every adapter started for it receives `initialize` with `_meta.jetbrains.air` as Air sent it
+
 ### Requirement: Hermod answers what names no chat
-`hermod air acp` SHALL answer `initialize` itself, from what the agent declares, and `session/list` from the agent
+`hermod air acp` SHALL answer `initialize` itself, from the agent, and `session/list` from the agent
 program on the remote, with no adapter. It SHALL remove the `fs` and `terminal` client capabilities from
 `initialize`, so the agent reads, writes and runs everything on the remote, and SHALL send that `initialize` first
 to every adapter it starts. A `$/cancel_request` SHALL reach the adapter that holds the cancelled request.

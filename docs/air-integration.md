@@ -391,7 +391,7 @@ bridge does not order them.
 - **Terminal mode.** Not observed yet: switching the agent to terminal mode in Air's agent settings still opened
   the chat UI.
 - **Returning to a running adapter.** Whether Air accepts the `initialize` answered by `air acp` from the agent's
-  declaration, and the adapter's replay of a chat it still runs (see
+  ACP `Handshake`, and the adapter's replay of a chat it still runs (see
   [above](#returning-to-a-running-chat-goes-through-its-adapter)).
 - **Remote Control in chat mode.** Whether a Claude started headless by the SDK can be driven through Remote Control
   while detached.

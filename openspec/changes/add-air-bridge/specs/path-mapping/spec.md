@@ -56,7 +56,8 @@ that covers the session's directory is connected, the map SHALL stay fixed for t
 ### Requirement: One map for every path that crosses
 Paths SHALL cross between the local and the remote workstation in a worker's arguments, ACP messages, hook bodies
 and the files themselves, and the first three SHALL be mapped by the one map the files' relays define. Every ACP
-message to an adapter SHALL be mapped to the remote's paths, and every ACP message to Air to the local ones.
+message to an adapter SHALL be mapped to the remote's paths, and every ACP message to Air to the local ones, at the
+fields its message's type declares as paths and every string in its `_meta`.
 
 #### Scenario: A chat opened in a local directory
 - **WHEN** Air sends `session/new` with `cwd` `/home/me/dev/api` and the map holds `/home/me/dev/api → /home/u/dev/api`
