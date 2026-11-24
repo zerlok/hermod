@@ -76,8 +76,8 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 ## 9. Adapter: `acp`
 
-- [ ] 9.1 Create `internal/acp` with `Conn`, implementing `session.Channel` over a pair of streams, one message per line, and its `message` implementing `session.Message`: `Kind` from ACP's shape and standard methods (`initialize` as `Connect`, `session/list` as `List`, `$/cancel_request` as `Cancel`, with `ID` the cancelled request), and a client's own methods from the table it is given ([Air's messages](../../../docs/ARCHITECTURE.md#airs-messages)); `Dir` from `session/new`, `session/load`, `session/resume` and `session/list`; `WithID`, `Mapped` through `pathmap`, `Reply` with an empty result, an `agent.Handshake` or `agent.Conversation`s written in ACP's terms, and `Fail`
-- [ ] 9.2 Tests: the `Kind` of every row of Air's messages with Air's table and without it; every form of `Reply` and `Fail`; IDs as numbers and strings; `Mapped` on every path-carrying field; a partial final line; the connection ending closes `Receive` and sets `Err`
+- [x] 9.1 Create `internal/acp` with `Conn`, implementing `session.Channel` over a pair of streams, one message per line, and its `message` implementing `session.Message`: `Kind` from ACP's shape and standard methods (`initialize` as `Connect`, `session/list` as `List`, `$/cancel_request` as `Cancel`, with `ID` the cancelled request), and a client's own methods from the table it is given ([Air's messages](../../../docs/ARCHITECTURE.md#airs-messages)); `Dir` from `session/new`, `session/load`, `session/resume` and `session/list`; `WithID`, `Mapped` through `pathmap`, `Reply` with an empty result, an `agent.Handshake` or `agent.Conversation`s written in ACP's terms, and `Fail`
+- [x] 9.2 Tests: the `Kind` of every row of Air's messages with Air's table and without it; every form of `Reply` and `Fail`; IDs as numbers and strings; `Mapped` on every path-carrying field; a partial final line; the connection ending closes `Receive` and sets `Err`
 
 ## 10. Adapter: `air`
 
