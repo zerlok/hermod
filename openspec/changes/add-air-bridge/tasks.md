@@ -101,9 +101,9 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 ## 13. Removal
 
-- [ ] 13.1 Delete `internal/control`, `internal/sandbox`, `internal/mirror` and `internal/hook` with their tests
-- [ ] 13.2 Delete what of `internal/air`, `internal/claude` and `internal/cli` the groups above did not keep
-- [ ] 13.3 Delete `draft/` and `air-probe/`
+- [x] 13.1 Delete `internal/control`, `internal/sandbox`, `internal/mirror` and `internal/hook` with their tests
+- [x] 13.2 Delete what of `internal/air`, `internal/claude` and `internal/cli` the groups above did not keep
+- [x] 13.3 Delete `draft/` and `air-probe/`
 - [ ] 13.4 Run `gofmt -l .`, `go vet ./...`, `go test ./...` and `go build ./...` on the whole module, and check that the imports match [Package dependencies](../../../docs/ARCHITECTURE.md#package-dependencies)
 
 ## 14. Documentation
