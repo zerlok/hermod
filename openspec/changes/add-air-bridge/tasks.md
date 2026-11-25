@@ -115,11 +115,11 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 ## 16. `relay`
 
-- [ ] 16.1 Rename `Ends` to `Roots` and move it into the FS relay's file ([`relay.Relay` and `relay.Lease`](../../../docs/ARCHITECTURE.md#relayrelay-and-relaylease--one-channel-and-a-claim-on-it))
-- [ ] 16.2 FS `List` reads the relays under a label, with their ends and states, from Mutagen's structured listing (`--template`) instead of its text ([Names and tags](../../../docs/ARCHITECTURE.md#names-and-tags))
-- [ ] 16.3 The FS relay takes a writer for Mutagen's output; move `cli`'s Mutagen output display into it
-- [ ] 16.4 Start the Net relay's goroutines with `sync.WaitGroup.Go`
-- [ ] 16.5 Tests: `List` from structured output with no relay, several, a paused one and labels; Mutagen's output reaching the writer
+- [x] 16.1 Rename `Ends` to `Roots` and move it into the FS relay's file ([`relay.Relay` and `relay.Lease`](../../../docs/ARCHITECTURE.md#relayrelay-and-relaylease--one-channel-and-a-claim-on-it))
+- [x] 16.2 FS `List` reads the relays under a label, with their ends and states, from Mutagen's structured listing (`--template`) instead of its text ([Names and tags](../../../docs/ARCHITECTURE.md#names-and-tags))
+- [x] 16.3 The FS relay takes a writer for Mutagen's output; move `cli`'s Mutagen output display into it
+- [x] 16.4 Start the Net relay's goroutines with `sync.WaitGroup.Go`
+- [x] 16.5 Tests: `List` from structured output with no relay, several, a paused one and labels; Mutagen's output reaching the writer
 
 ## 17. `agent` contract, `claude`, `session` delegation, hooks
 

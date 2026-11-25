@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/zerlok/hermod/internal/relay/relaytest"
 )
 
 // fakeSession is one Mutagen session as fakeMutagen keeps it.
@@ -19,7 +21,7 @@ type fakeSession struct {
 }
 
 // fakeMutagen plays the mutagen commands an FS relay runs against sessions it
-// keeps, and records every command that changes a state; failing names a
+// keeps by name, "" for one made with no name, and records every command that changes a state; failing names a
 // command whose every run fails.
 type fakeMutagen struct {
 	mu       sync.Mutex
@@ -88,51 +90,30 @@ func (m *fakeMutagen) answer(args []string) script {
 }
 
 func (m *fakeMutagen) list(rest []string, out, errOut io.Writer) error {
-	var names []string
-	switch {
-	case len(rest) == 0:
-		for name := range m.sessions {
-			names = append(names, name)
-		}
-	case len(rest) == 2 && rest[0] == "--label-selector":
-		k, v, _ := strings.Cut(rest[1], "=")
-		for name, s := range m.sessions {
-			for _, l := range s.labels {
-				if l.Key == k && l.Value == v {
-					names = append(names, name)
-				}
-			}
-		}
-	case len(rest) == 1:
-		if _, ok := m.sessions[rest[0]]; !ok {
-			_, _ = fmt.Fprintf(errOut, "Error: %s\n", notFoundMarker)
-			return errFake
-		}
-		names = []string{rest[0]}
+	l, ok := relaytest.ReadList(rest)
+	if !ok {
+		_, _ = fmt.Fprintf(errOut, "Error: unexpected listing %q\n", rest)
+		return errFake
 	}
-	for _, name := range names {
-		s := m.sessions[name]
-		_, _ = fmt.Fprintf(out, "--------\nName: %s\nIdentifier: sync_1\n", name)
-		if len(s.labels) > 0 {
-			_, _ = fmt.Fprintln(out, "Labels:")
-			for _, l := range s.labels {
-				_, _ = fmt.Fprintf(out, "\t%s: %s\n", l.Key, l.Value)
+	var kept []relaytest.Session
+	for key, s := range m.sessions {
+		var labels map[string]string
+		for _, label := range s.labels {
+			if labels == nil {
+				labels = map[string]string{}
 			}
-		} else {
-			_, _ = fmt.Fprintln(out, "Labels: None")
+			labels[label.Key] = label.Value
 		}
-		_, _ = fmt.Fprintf(out, "Alpha:\n\tURL: %s\n\tConnected: Yes\nBeta:\n\tURL: %s\n\tConnected: Yes\n", s.local, s.beta)
-		status := "Watching for changes"
-		if s.paused {
-			status = "[Paused]"
-		}
-		_, _ = fmt.Fprintf(out, "Status: %s\n--------\n", status)
+		kept = append(kept, relaytest.Session{Name: key, Local: s.local, Beta: s.beta, Paused: s.paused, Labels: labels})
+	}
+	if err := relaytest.Answer(l, kept, out, errOut); err != nil {
+		return errFake
 	}
 	return nil
 }
 
 var (
-	testEnds   = Ends{Local: "/home/me/dev/api", Host: "prod-box", Remote: "/home/u/dev/api"}
+	testRoots  = Roots{Local: "/home/me/dev/api", Host: "prod-box", Remote: "/home/u/dev/api"}
 	testName   = "hermod-prod-box-home-u-dev-api-1a2b3c4d"
 	testLabels = []Label{{"hermod-remote", "prod-box"}, {"hermod-workspace", testName}}
 )
@@ -199,7 +180,7 @@ func TestFSConnect(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newFakeMutagen(tc.sessions, tc.failing)
 			locks := t.TempDir()
-			l, err := NewFS(m.exec, m.exec, locks, testEnds, testName, testLabels...).Connect(context.Background())
+			l, err := NewFS(m.exec, m.exec, locks, testRoots, testName, nil, testLabels...).Connect(context.Background())
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("Connect() error = %v, want an error: %v", err, tc.wantErr)
 			}
@@ -237,16 +218,12 @@ func TestFSConcurrentConnect(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newFakeMutagen(nil, "")
-			relay := NewFS(m.exec, m.exec, t.TempDir(), testEnds, testName, testLabels...)
+			relay := NewFS(m.exec, m.exec, t.TempDir(), testRoots, testName, nil, testLabels...)
 			leases := make([]Lease, tc.holders)
 			errs := make([]error, tc.holders)
 			var wg sync.WaitGroup
 			for i := range leases {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					leases[i], errs[i] = relay.Connect(context.Background())
-				}()
+				wg.Go(func() { leases[i], errs[i] = relay.Connect(context.Background()) })
 			}
 			wg.Wait()
 			for i, err := range errs {
@@ -283,7 +260,7 @@ func TestFSFlush(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newFakeMutagen(nil, tc.failing)
-			err := NewFS(m.exec, m.exec, t.TempDir(), testEnds, testName).Flush(context.Background())
+			err := NewFS(m.exec, m.exec, t.TempDir(), testRoots, testName, nil).Flush(context.Background())
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("Flush() error = %v, want an error: %v", err, tc.wantErr)
 			}
@@ -302,6 +279,8 @@ func TestList(t *testing.T) {
 			other: {local: "/home/me/dev/web", beta: "prod-box:/home/u/dev/web", paused: true,
 				labels: []Label{{"hermod-remote", "prod-box"}, {"hermod-workspace", other}}},
 			"by-hand": {local: "/home/me/dev/api", beta: "prod-box:dev/api"},
+			"": {local: "/home/me/dev/cli", beta: "box-u:/home/u/dev/cli",
+				labels: []Label{{"hermod-remote", "box-u"}}},
 		}
 	}
 	cases := []struct {
@@ -317,9 +296,9 @@ func TestList(t *testing.T) {
 			label:  Label{"hermod-remote", "prod-box"},
 			leased: []string{testName},
 			want: []Listed{
-				{Name: testName, Ends: testEnds, State: Connected,
+				{Name: testName, Roots: testRoots, State: Connected,
 					Labels: map[string]string{"hermod-remote": "prod-box", "hermod-workspace": testName}},
-				{Name: other, Ends: Ends{Local: "/home/me/dev/web", Host: "prod-box", Remote: "/home/u/dev/web"}, State: Disconnected,
+				{Name: other, Roots: Roots{Local: "/home/me/dev/web", Host: "prod-box", Remote: "/home/u/dev/web"}, State: Disconnected,
 					Labels: map[string]string{"hermod-remote": "prod-box", "hermod-workspace": other}},
 			},
 		},
@@ -327,13 +306,17 @@ func TestList(t *testing.T) {
 			name:  "a running session with no lease is Disconnected",
 			label: Label{"hermod-workspace", testName},
 			want: []Listed{
-				{Name: testName, Ends: testEnds, State: Disconnected,
+				{Name: testName, Roots: testRoots, State: Disconnected,
 					Labels: map[string]string{"hermod-remote": "prod-box", "hermod-workspace": testName}},
 			},
 		},
 		{
 			name:  "a label nothing carries",
 			label: Label{"hermod-remote", "box-b"},
+		},
+		{
+			name:  "a session with no name is no relay, whatever its labels",
+			label: Label{"hermod-remote", "box-u"},
 		},
 		{
 			name:    "a listing that fails",
@@ -364,50 +347,147 @@ func TestList(t *testing.T) {
 	}
 }
 
-func TestUnlabeled(t *testing.T) {
-	sessions := func() map[string]*fakeSession {
-		return map[string]*fakeSession{
-			testName:  {local: "/home/me/dev/api", beta: "prod-box:/home/u/dev/api", labels: testLabels},
-			"dev-api": {local: "/home/me/dev/api", beta: "box-a:/home/u/dev/api", paused: true},
-			"by-hand": {local: "/home/me/dev/api", beta: "prod-box:dev/api", labels: []Label{{"owner", "me"}}},
-			"dev-web": {local: "/home/me/dev/web", beta: "box-a:/home/u/dev/web"},
-		}
-	}
+func TestFSOutput(t *testing.T) {
 	cases := []struct {
-		name    string
-		local   string
-		failing string
-		want    []string
-		wantErr bool
+		name       string
+		op         string // "connect" with no session, or "flush"
+		noWriter   bool
+		failing    bool // every Mutagen command that changes a state fails
+		wantOutput string
+		wantErrMsg string // a part of the error; "" for none
 	}{
 		{
-			name:  "sessions under earlier names are listed and left alone",
-			local: "/home/me/dev/api",
-			want:  []string{"by-hand", "dev-api"},
+			name:       "a create: only Mutagen's command reaches the writer",
+			op:         "connect",
+			wantOutput: "mutagen sync create: out\nmutagen sync create: err\n",
 		},
 		{
-			name:  "a root no session syncs",
-			local: "/home/me/dev/cli",
+			name:       "a flush",
+			op:         "flush",
+			wantOutput: "mutagen sync flush: out\nmutagen sync flush: err\n",
 		},
 		{
-			name:    "a listing that fails",
-			local:   "/home/me/dev/api",
-			failing: "mutagen sync list",
-			wantErr: true,
+			name:       "a failing flush: its message reaches the writer and the error",
+			op:         "flush",
+			failing:    true,
+			wantOutput: "mutagen sync flush: out\nmutagen sync flush: err\n",
+			wantErrMsg: "mutagen sync flush: err",
+		},
+		{
+			name:       "no writer: the message still reaches the error",
+			op:         "flush",
+			noWriter:   true,
+			failing:    true,
+			wantErrMsg: "mutagen sync flush: err",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := newFakeMutagen(sessions(), tc.failing)
-			got, err := Unlabeled(context.Background(), m.exec, tc.local, "hermod-remote")
+			exec := &fakeExec{answer: func(args []string) script {
+				return func(_ context.Context, _ io.Reader, out, errOut io.Writer) error {
+					if args[0] == "mutagen" && args[2] == "list" {
+						relaytest.NotFound(errOut)
+						return errFake
+					}
+					say := strings.Join(args[:min(3, len(args))], " ")
+					_, _ = fmt.Fprintf(out, "%s: out\n", say)
+					_, _ = fmt.Fprintf(errOut, "%s: err\n", say)
+					if tc.failing && args[0] == "mutagen" {
+						return errFake
+					}
+					return nil
+				}
+			}}
+			var output strings.Builder
+			var w io.Writer = &output
+			if tc.noWriter {
+				w = nil
+			}
+			fs := NewFS(exec, exec, t.TempDir(), testRoots, testName, w)
+			var err error
+			switch tc.op {
+			case "connect":
+				_, err = fs.Connect(context.Background())
+			case "flush":
+				err = fs.Flush(context.Background())
+			}
+			if got := output.String(); got != tc.wantOutput {
+				t.Errorf("output %q, want %q", got, tc.wantOutput)
+			}
+			if (err != nil) != (tc.wantErrMsg != "") || err != nil && !strings.Contains(err.Error(), tc.wantErrMsg) {
+				t.Errorf("error %v, want one holding %q", err, tc.wantErrMsg)
+			}
+		})
+	}
+}
+
+func TestParseList(t *testing.T) {
+	type read struct {
+		Name   string
+		Roots  Roots
+		Paused bool
+		Labels map[string]string
+	}
+	cases := []struct {
+		name    string
+		out     string
+		want    []read
+		wantErr bool
+	}{
+		{name: "no session", out: "[]\n"},
+		{name: "no session, as null", out: "null\n"},
+		{
+			name: "several, a paused one and labels",
+			out: `[{"identifier":"sync_a","name":"a","alpha":{"protocol":"local","path":"/home/me/dev/api","connected":true},` +
+				`"beta":{"protocol":"ssh","host":"prod-box","path":"/home/u/dev/api","connected":true},` +
+				`"labels":{"hermod-remote":"prod-box"},"paused":false,"status":"watching","successfulCycles":3},` +
+				`{"identifier":"sync_b","name":"b","alpha":{"protocol":"local","path":"/home/me/dev/web"},` +
+				`"beta":{"protocol":"ssh","host":"prod-box","path":"/home/u/dev/web"},"paused":true,"status":"disconnected"}]`,
+			want: []read{
+				{Name: "a", Roots: Roots{Local: "/home/me/dev/api", Host: "prod-box", Remote: "/home/u/dev/api"},
+					Labels: map[string]string{"hermod-remote": "prod-box"}},
+				{Name: "b", Roots: Roots{Local: "/home/me/dev/web", Host: "prod-box", Remote: "/home/u/dev/web"}, Paused: true},
+			},
+		},
+		{
+			name: "an ssh end with a user and a port",
+			out: `[{"name":"a","alpha":{"protocol":"local","path":"/l"},` +
+				`"beta":{"protocol":"ssh","user":"u","host":"box","port":2222,"path":"/r"}}]`,
+			want: []read{{Name: "a", Roots: Roots{Local: "/l", Host: "u@box:2222", Remote: "/r"}}},
+		},
+		{
+			name: "a local beta end has no host",
+			out:  `[{"name":"a","alpha":{"protocol":"local","path":"/l"},"beta":{"protocol":"local","path":"/r"}}]`,
+			want: []read{{Name: "a", Roots: Roots{Local: "/l", Remote: "/r"}}},
+		},
+		{
+			name: "ends of other protocols keep their host",
+			out: `[{"name":"a","alpha":{"protocol":"ssh","host":"box","path":"/l"},` +
+				`"beta":{"protocol":"docker","host":"c1","path":"/r"}}]`,
+			want: []read{{Name: "a", Roots: Roots{Local: "box:/l", Host: "docker://c1", Remote: "/r"}}},
+		},
+		{
+			name: "a session with no name",
+			out: `[{"identifier":"sync_x","alpha":{"protocol":"local","path":"/l"},` +
+				`"beta":{"protocol":"ssh","host":"box","path":"/r"}}]`,
+			want: []read{{Roots: Roots{Local: "/l", Host: "box", Remote: "/r"}}},
+		},
+		{name: "Mutagen's text listing", out: "--------\nName: a\n", wantErr: true},
+		{name: "a session that is not an object", out: `["a"]`, wantErr: true},
+		{name: "nothing", out: "", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sessions, err := parseList([]byte(tc.out))
 			if (err != nil) != tc.wantErr {
-				t.Fatalf("Unlabeled() error = %v, want an error: %v", err, tc.wantErr)
+				t.Fatalf("parseList() error = %v, want an error: %v", err, tc.wantErr)
+			}
+			var got []read
+			for _, s := range sessions {
+				got = append(got, read{Name: s.Name, Roots: s.roots(), Paused: s.Paused, Labels: s.Labels})
 			}
 			if !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("Unlabeled() = %q, want %q", got, tc.want)
-			}
-			if ran := m.changes(); len(ran) != 0 {
-				t.Errorf("ran %q, want no change to any session", ran)
+				t.Errorf("parseList() = %+v, want %+v", got, tc.want)
 			}
 		})
 	}

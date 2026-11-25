@@ -43,17 +43,6 @@ func (s State) String() string {
 	return fmt.Sprintf("State(%d)", int(s))
 }
 
-// Ends are an FS relay's two ends: a root on this workstation and a root on a
-// remote, the remote named by its ssh alias.
-type Ends struct {
-	Local  string
-	Host   string
-	Remote string
-}
-
-// endpoint is the remote end as Mutagen writes it in a URL.
-func (e Ends) endpoint() string { return e.Host + ":" + e.Remote }
-
 // Relay is one channel between the workstations.
 type Relay interface {
 	// Connect takes a connect lease, makes the relay when it is Absent, takes it
@@ -259,11 +248,7 @@ func (s *serving) finish(why error) {
 // it returns, ends the serving. Something that may block where cancelling
 // cannot reach it, such as a read of a local stream, is not run here.
 func (s *serving) run(f func() error) {
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.finish(f())
-	}()
+	s.wg.Go(func() { s.finish(f()) })
 }
 
 // stop ends the serving and waits for what it ran.

@@ -303,11 +303,7 @@ func (r *router) session(ctx context.Context, dir Path) (*SessionControl, error)
 		return nil, errors.Join(err, att.Workspace.Detach(ctx))
 	}
 	r.sessions[dir] = s
-	r.forwarders.Add(1)
-	go func() {
-		defer r.forwarders.Done()
-		r.forward(dir, s, att.Adapter)
-	}()
+	r.forwarders.Go(func() { r.forward(dir, s, att.Adapter) })
 	return s, nil
 }
 

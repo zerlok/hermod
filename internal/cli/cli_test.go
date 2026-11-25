@@ -429,32 +429,25 @@ func TestStandInOutput(t *testing.T) {
 	}
 }
 
-// TestMutagenOutput checks that the stand-in also writes what its Mutagen
-// commands print to stderr and the log, and nothing of it to stdout; that it
-// copies no other command's output; and that attach leaves Mutagen's output
-// to the core.
+// TestMutagenOutput checks where each command has the FS relays write
+// Mutagen's output: the stand-in to stderr and its log, and never to stdout,
+// which may be its caller's to read; attach leaves it to the core.
 func TestMutagenOutput(t *testing.T) {
-	const (
-		mutagen = "mutagen sync flush hermod-api"
-		other   = "tmux ls"
-		printed = "Flushed the session"
-	)
-	answers := map[string]string{mutagen: printed + "\n", other: printed + "\n"}
+	const printed = "Flushed the session"
 	logName := testHome + "/.cache/hermod/air/dev-api.log"
 	cases := []struct {
 		name       string
 		argv       string
-		run        string
 		wantStderr bool
 		wantLog    bool
 	}{
-		{"the stand-in's Mutagen command", "claude", mutagen, true, true},
-		{"the stand-in's other command", "claude", other, false, false},
-		{"attach's Mutagen command", "hermod attach prod-box", mutagen, false, false},
+		{"the stand-in", "claude", true, true},
+		{"attach", "hermod attach prod-box", false, false},
+		{"attach's dry run", "hermod attach -n prod-box", false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			a, r := newApp(t, setup{env: vars{envRemote: "prod-box"}, terminal: true, answers: answers, run: []string{tc.run}})
+			a, r := newApp(t, setup{env: vars{envRemote: "prod-box"}, terminal: true, mutagenSays: printed})
 			if err := execute(context.Background(), a, strings.Fields(tc.argv)); err != nil {
 				t.Fatalf("execute: %v", err)
 			}

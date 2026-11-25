@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -461,6 +462,71 @@ func TestAddFS(t *testing.T) {
 			}
 			if got := f.syncs[relayName(testHost, tc.place)].labels[labelWorkspace]; got != tc.wantLabel {
 				t.Errorf("workspace label %s, want %s", got, tc.wantLabel)
+			}
+		})
+	}
+}
+
+// TestFSOutput checks that what the FS relays' Mutagen commands print reaches
+// Local.Output, through each path that builds an FS relay.
+func TestFSOutput(t *testing.T) {
+	transcripts := pathmap.Place{Local: "/home/me/.claude/projects/-home-me-dev-api", Remote: "/home/u/.claude/projects/-home-u-dev-api"}
+	cases := []struct {
+		name       string
+		existing   []rel
+		op         string // after Open: "" for none, "connect" or "addfs"
+		noOutput   bool
+		wantOutput string // what Output holds after op, or after Open for none
+	}{
+		{
+			name:       "an Open that makes its relay",
+			wantOutput: "create " + n(api, apiR) + "\nflush " + n(api, apiR) + "\n",
+		},
+		{
+			name:       "a connect resumes a listed relay of the workspace",
+			existing:   []rel{{local: api, remote: apiR}, {local: web, remote: webR, workspace: n(api, apiR)}},
+			op:         "connect",
+			wantOutput: "resume " + n(web, webR) + "\nflush " + n(web, webR) + "\n",
+		},
+		{
+			name:       "an added relay",
+			existing:   []rel{{local: api, remote: apiR}},
+			op:         "addfs",
+			wantOutput: "create " + n(transcripts.Local, transcripts.Remote) + "\nflush " + n(transcripts.Local, transcripts.Remote) + "\n",
+		},
+		{
+			name:     "no Output",
+			noOutput: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := newFake(syncsOf(tc.existing...), nil)
+			var output strings.Builder
+			local := testLocal(t)
+			if !tc.noOutput {
+				local.Output = &output
+			}
+			w, err := Open(ctx, f.remote(), local, api, Worktree{})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer func() { _ = w.Detach(ctx) }()
+			if tc.op != "" {
+				output.Reset()
+			}
+			switch tc.op {
+			case "connect":
+				err = w.connect(ctx)
+			case "addfs":
+				err = w.AddFS(ctx, transcripts)
+			}
+			if err != nil {
+				t.Fatalf("%s: %v", tc.op, err)
+			}
+			if got := output.String(); got != tc.wantOutput {
+				t.Errorf("output %q, want %q", got, tc.wantOutput)
 			}
 		})
 	}

@@ -49,7 +49,7 @@ func droppable(text string, drop <-chan struct{}) script {
 func fsSubject(t *testing.T, locks string) subject {
 	m := newFakeMutagen(nil, "")
 	return subject{
-		relay:   NewFS(m.exec, m.exec, locks, testEnds, testName, testLabels...),
+		relay:   NewFS(m.exec, m.exec, locks, testRoots, testName, nil, testLabels...),
 		changes: m.changes,
 		state: func(t *testing.T) State {
 			listed, err := List(context.Background(), m.exec, locks, testLabels[1])
@@ -247,7 +247,7 @@ func TestLeaseGivenUpTwice(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newFakeMutagen(nil, "")
-			l, err := NewFS(m.exec, m.exec, t.TempDir(), testEnds, testName).Connect(context.Background())
+			l, err := NewFS(m.exec, m.exec, t.TempDir(), testRoots, testName, nil).Connect(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}

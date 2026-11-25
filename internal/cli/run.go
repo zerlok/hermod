@@ -75,12 +75,9 @@ func (a app) runAttach(ctx context.Context, in attachIntent, out attachOutput) e
 	if name == "" {
 		name = workerName(dir, l.home)
 	}
-	exec := a.local
-	switch {
-	case in.dryRun:
-		exec = a.dryRun(out.plan)
-	case out.setup != nil:
-		exec = mutagenOutput{ex: exec, w: out.setup}
+	exec, setup := a.local, out.setup
+	if in.dryRun {
+		exec, setup = a.dryRun(out.plan), nil
 	}
 	remote, configDir, err := a.readRemote(ctx, in.remote, exec)
 	if err != nil {
@@ -93,7 +90,7 @@ func (a app) runAttach(ctx context.Context, in attachIntent, out attachOutput) e
 	}
 	return a.attach(ctx, session.Request{
 		Remote:   remote,
-		Local:    a.workspaceLocal(l.home),
+		Local:    a.workspaceLocal(l.home, setup),
 		Dir:      dir,
 		Tree:     tree,
 		Agent:    a.agent(dir, l.home, configDir),
@@ -122,7 +119,7 @@ func (a app) runChat(ctx context.Context, host string) error {
 	ag := a.agent(l.cwd, l.home, configDir)
 	adapters := session.Adapters{
 		Remote:  remote,
-		Local:   a.workspaceLocal(l.home),
+		Local:   a.workspaceLocal(l.home, nil),
 		Agent:   ag,
 		Environ: env.Environ(a.environ()),
 		Identity: func(ctx context.Context, dir string) session.Identity {
@@ -222,32 +219,6 @@ func (a app) runConfigure(in configureIntent, out io.Writer) error {
 	return nil
 }
 
-// mutagenOutput hands what each Mutagen command prints to w as well as to
-// its reader, which keeps it only for a failure's message. Only Mutagen's
-// commands are copied: every other command's streams are either read for an
-// answer or, for the worker's stdio, the caller's own.
-type mutagenOutput struct {
-	ex shell.Executor
-	w  io.Writer
-}
-
-func (m mutagenOutput) Exec(ctx context.Context, cmd shell.Command) shell.Execution {
-	if len(cmd.Args) > 0 && cmd.Args[0] == "mutagen" {
-		cmd.Stdout = alsoTo(cmd.Stdout, m.w)
-		cmd.Stderr = alsoTo(cmd.Stderr, m.w)
-	}
-	return m.ex.Exec(ctx, cmd)
-}
-
-// alsoTo is reader followed by w; a nil reader, which reads the stream from
-// the execution's pipe, is left so.
-func alsoTo(reader, w io.Writer) io.Writer {
-	if reader == nil {
-		return nil
-	}
-	return io.MultiWriter(reader, w)
-}
-
 // agent is Claude's contract for a session in dir.
 func (a app) agent(dir, home, remoteConfigDir string) claude.Agent {
 	value, _ := a.lookupEnv(envClaudeConfigDir)
@@ -259,12 +230,14 @@ func (a app) agent(dir, home, remoteConfigDir string) claude.Agent {
 	})
 }
 
-// workspaceLocal is this workstation as a workspace needs it.
-func (a app) workspaceLocal(home string) workspace.Local {
+// workspaceLocal is this workstation as a workspace needs it, its FS relays
+// writing Mutagen's output to setup as well when it is not nil.
+func (a app) workspaceLocal(home string, setup io.Writer) workspace.Local {
 	return workspace.Local{
 		Home:   home,
 		Locks:  lockDir(home, a.lookupEnv),
 		Origin: resolveOrigin(a.lookupEnv, a.hostname),
+		Output: setup,
 	}
 }
 

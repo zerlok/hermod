@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/zerlok/hermod/internal/relay/relaytest"
 	"github.com/zerlok/hermod/internal/shell"
 	"github.com/zerlok/hermod/internal/worker"
 	"github.com/zerlok/hermod/internal/worker/workertest"
@@ -26,9 +27,6 @@ type exitError int
 
 func (e exitError) Error() string { return "exit status " + strconv.Itoa(int(e)) }
 func (e exitError) ExitCode() int { return int(e) }
-
-// mutagenNotFound is what Mutagen says of a name it has no session under.
-const mutagenNotFound = "unable to locate requested sessions"
 
 // mutagenSession is one Mutagen session the fake keeps.
 type mutagenSession struct {
@@ -157,18 +155,21 @@ func (f *fake) onLocal(args []string) play {
 		return ok
 	}
 	verb, rest := args[2], args[3:]
+	var said string // what the command prints on success, as Mutagen does
 	switch verb {
 	case "list":
 	case "create":
+		said = verb + " " + rest[1]
 		f.record(verb, rest[1])
 	default:
+		said = verb + " " + rest[0]
 		f.record(verb, rest[0])
 	}
 	return func(_ context.Context, _ io.Reader, out, errOut io.Writer) error {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		if _, exists := f.syncs[rest[0]]; verb != "list" && verb != "create" && !exists {
-			_, _ = fmt.Fprintf(errOut, "Error: %s\n", mutagenNotFound)
+			relaytest.NotFound(errOut)
 			return exitError(1)
 		}
 		switch verb {
@@ -190,39 +191,23 @@ func (f *fake) onLocal(args []string) play {
 		case "terminate":
 			delete(f.syncs, rest[0])
 		}
+		_, _ = fmt.Fprintln(out, said)
 		return nil
 	}
 }
 
 func (f *fake) list(rest []string, out, errOut io.Writer) error {
-	var names []string
-	switch {
-	case len(rest) == 2 && rest[0] == "--label-selector":
-		k, v, _ := strings.Cut(rest[1], "=")
-		for name, s := range f.syncs {
-			if s.labels[k] == v {
-				names = append(names, name)
-			}
-		}
-	case len(rest) == 1:
-		if _, ok := f.syncs[rest[0]]; !ok {
-			_, _ = fmt.Fprintf(errOut, "Error: %s\n", mutagenNotFound)
-			return exitError(1)
-		}
-		names = []string{rest[0]}
+	l, ok := relaytest.ReadList(rest)
+	if !ok {
+		_, _ = fmt.Fprintf(errOut, "Error: unexpected listing %q\n", rest)
+		return exitError(1)
 	}
-	sort.Strings(names)
-	for _, name := range names {
-		s := f.syncs[name]
-		_, _ = fmt.Fprintf(out, "--------\nName: %s\nLabels:\n", name)
-		for k, v := range s.labels {
-			_, _ = fmt.Fprintf(out, "\t%s: %s\n", k, v)
-		}
-		status := "Watching for changes"
-		if s.paused {
-			status = "[Paused]"
-		}
-		_, _ = fmt.Fprintf(out, "Alpha:\n\tURL: %s\nBeta:\n\tURL: %s\nStatus: %s\n", s.local, s.beta, status)
+	var kept []relaytest.Session
+	for name, s := range f.syncs {
+		kept = append(kept, relaytest.Session{Name: name, Local: s.local, Beta: s.beta, Paused: s.paused, Labels: s.labels})
+	}
+	if err := relaytest.Answer(l, kept, out, errOut); err != nil {
+		return exitError(1)
 	}
 	return nil
 }

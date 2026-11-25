@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"path"
 	"sync"
 	"time"
@@ -117,6 +118,9 @@ type Local struct {
 	Home   string // the local user's home, absolute
 	Locks  string // the directory of the relays' lock files
 	Origin string // the machine sessions are started from; "" leaves its tag out
+	// Output also gets what the FS relays' Mutagen commands that change a
+	// state print; nil keeps it only for a failure's message.
+	Output io.Writer
 }
 
 // Workspace is one project on one remote, as this process holds it: the
@@ -152,7 +156,7 @@ type found struct {
 	name      string
 	workspace string
 	place     pathmap.Place
-	ends      relay.Ends
+	roots     relay.Roots
 }
 
 func (f found) project() bool { return f.name == f.workspace }
@@ -170,7 +174,7 @@ func joining(remote Remote, local Local, dir, workspace string) found {
 		name:      name,
 		workspace: workspace,
 		place:     place,
-		ends:      relay.Ends{Local: place.Local, Host: remote.Host, Remote: place.Remote},
+		roots:     relay.Roots{Local: place.Local, Host: remote.Host, Remote: place.Remote},
 	}
 }
 
@@ -203,10 +207,10 @@ func list(ctx context.Context, remote Remote, local Local) ([]found, error) {
 	}
 	var all []found
 	for _, l := range listed {
-		if l.Ends.Host != remote.Host {
+		if l.Roots.Host != remote.Host {
 			continue
 		}
-		place := pathmap.Place{Local: path.Clean(l.Ends.Local), Remote: pathmap.Absolute(remote.Home, l.Ends.Remote)}
+		place := pathmap.Place{Local: path.Clean(l.Roots.Local), Remote: pathmap.Absolute(remote.Home, l.Roots.Remote)}
 		// A session made or relabelled by hand may have an alpha that is no
 		// local path; it cannot be a root of the path map, so it is no relay
 		// of a workspace.
@@ -217,7 +221,7 @@ func list(ctx context.Context, remote Remote, local Local) ([]found, error) {
 			name:      l.Name,
 			workspace: l.Labels[labelWorkspace],
 			place:     place,
-			ends:      l.Ends,
+			roots:     l.Roots,
 		})
 	}
 	return all, nil
@@ -336,7 +340,7 @@ func Open(ctx context.Context, remote Remote, local Local, dir string, tree Work
 			}
 		}
 	}
-	if err := w.addFS(ctx, holder.name, holder.workspace, holder.ends); err != nil {
+	if err := w.addFS(ctx, holder.name, holder.workspace, holder.roots); err != nil {
 		return nil, errors.Join(err, w.Detach(ctx))
 	}
 	places := []pathmap.Place{w.root, holder.place}
@@ -473,16 +477,16 @@ func (w *Workspace) AddFS(ctx context.Context, place pathmap.Place) error {
 	if f, ok := named(all, name); ok {
 		owner = f.workspace
 	}
-	return w.addFS(ctx, name, owner, relay.Ends{Local: place.Local, Host: w.remote.Host, Remote: place.Remote})
+	return w.addFS(ctx, name, owner, relay.Roots{Local: place.Local, Host: w.remote.Host, Remote: place.Remote})
 }
 
 // addFS leases the FS relay name of the workspace owner, making it in this
 // workspace when it is Absent.
-func (w *Workspace) addFS(ctx context.Context, name, owner string, ends relay.Ends) error {
+func (w *Workspace) addFS(ctx context.Context, name, owner string, roots relay.Roots) error {
 	if w.holds(name) {
 		return nil
 	}
-	fs := relay.NewFS(w.remote.Exec, w.remote.Read, w.local.Locks, ends, name, fsLabels(w.remote.Host, w.name)...)
+	fs := relay.NewFS(w.remote.Exec, w.remote.Read, w.local.Locks, roots, name, w.local.Output, fsLabels(w.remote.Host, w.name)...)
 	lease, err := fs.Connect(ctx)
 	if err != nil {
 		return err
@@ -611,7 +615,7 @@ func (w *Workspace) connect(ctx context.Context) error {
 		if w.holds(r.Name) {
 			continue
 		}
-		lease, err := relay.NewFS(w.remote.Exec, w.remote.Read, w.local.Locks, r.Ends, r.Name, fsLabels(w.remote.Host, w.name)...).Connect(ctx)
+		lease, err := relay.NewFS(w.remote.Exec, w.remote.Read, w.local.Locks, r.Roots, r.Name, w.local.Output, fsLabels(w.remote.Host, w.name)...).Connect(ctx)
 		if err != nil {
 			return err
 		}

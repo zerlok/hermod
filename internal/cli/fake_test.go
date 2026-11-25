@@ -150,9 +150,9 @@ type setup struct {
 	stderrGone bool
 	// answers is what the workstation prints for a command line.
 	answers map[string]string
-	// run are the commands the core runs on the request's executor that
-	// changes a state, each a command line split on spaces.
-	run []string
+	// mutagenSays is written by the core, as an FS relay's Mutagen output,
+	// to the request's Output when it has one.
+	mutagenSays string
 }
 
 func newApp(t *testing.T, s setup) (app, *recorder) {
@@ -168,10 +168,8 @@ func newApp(t *testing.T, s setup) (app, *recorder) {
 			if s.say != "" {
 				req.Log.Print(s.say)
 			}
-			for _, line := range s.run {
-				if _, err := shell.Run(ctx, req.Remote.Exec, shell.Command{Args: strings.Fields(line)}); err != nil {
-					return err
-				}
+			if req.Local.Output != nil {
+				_, _ = io.WriteString(req.Local.Output, s.mutagenSays)
 			}
 			return nil
 		},

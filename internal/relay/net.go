@@ -175,11 +175,7 @@ func (r *Net) proxy(ctx context.Context, ln net.Listener) error {
 			}
 			return err
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			r.pipe(ctx, conn)
-		}()
+		wg.Go(func() { r.pipe(ctx, conn) })
 	}
 }
 

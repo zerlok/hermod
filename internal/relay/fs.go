@@ -1,9 +1,11 @@
 package relay
 
 import (
-	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
@@ -19,21 +21,38 @@ type Label struct {
 
 func (l Label) String() string { return l.Key + "=" + l.Value }
 
+// Roots are an FS relay's two ends: a root on this workstation and a root on a
+// remote, the remote named by its ssh alias.
+type Roots struct {
+	Local  string
+	Host   string
+	Remote string
+}
+
+// endpoint is the remote end as Mutagen writes it in a URL.
+func (r Roots) endpoint() string { return r.Host + ":" + r.Remote }
+
 // FS is an FS relay: a Mutagen two-way-safe session between its two ends.
 type FS struct {
 	exec   shell.Executor // changes a state; the dry-run leaf in a dry run
 	probe  shell.Executor // only reads a state; always a real leaf
-	ends   Ends
+	roots  Roots
 	name   string
+	output io.Writer // nil when Mutagen's output is kept only for a failure's message
 	labels []Label
 	leases leases
 }
 
-// NewFS is the FS relay named name between ends, carrying labels. Commands
+// NewFS is the FS relay named name between roots, carrying labels. Commands
 // that change a state run on exec and commands that read one on probe; the
-// lock files of its leases are in locks.
-func NewFS(exec, probe shell.Executor, locks string, ends Ends, name string, labels ...Label) *FS {
-	f := &FS{exec: exec, probe: probe, ends: ends, name: name, labels: labels}
+// lock files of its leases are in locks. What the Mutagen commands that
+// change a state print goes to output as well, which may be nil.
+func NewFS(exec, probe shell.Executor, locks string, roots Roots, name string, output io.Writer, labels ...Label) *FS {
+	if output != nil {
+		// Mutagen writes stdout and stderr at once, and output receives both.
+		output = &lockedWriter{w: output}
+	}
+	f := &FS{exec: exec, probe: probe, roots: roots, name: name, output: output, labels: labels}
 	f.leases = leases{name: name, locks: locks, mech: f}
 	return f
 }
@@ -72,10 +91,10 @@ func (f *FS) make(ctx context.Context) error {
 	if found == nil {
 		return f.create(ctx)
 	}
-	if found.ends.endpoint() != f.ends.endpoint() {
-		return &EndpointMismatchError{Name: f.name, Want: f.ends.endpoint(), Got: found.ends.endpoint()}
+	if found.roots().endpoint() != f.roots.endpoint() {
+		return &EndpointMismatchError{Name: f.name, Want: f.roots.endpoint(), Got: found.roots().endpoint()}
 	}
-	if !found.paused {
+	if !found.Paused {
 		return nil
 	}
 	if err := f.verb(ctx, "resume"); err != nil {
@@ -105,22 +124,22 @@ func (f *FS) settle(ctx context.Context, how giveUp) error {
 func (f *FS) create(ctx context.Context) error {
 	// Through shell's ssh, which quotes the path for the remote's shell: ssh
 	// joins its arguments for that shell to parse again.
-	if err := f.run(ctx, shell.NewSSH(f.exec, f.ends.Host), "mkdir", "-p", "--", f.ends.Remote); err != nil {
+	if err := f.run(ctx, shell.NewSSH(f.exec, f.roots.Host), "mkdir", "-p", "--", f.roots.Remote); err != nil {
 		return err
 	}
-	if err := f.run(ctx, f.exec, "mkdir", "-p", "--", f.ends.Local); err != nil {
+	if err := f.run(ctx, f.exec, "mkdir", "-p", "--", f.roots.Local); err != nil {
 		return err
 	}
 	args := []string{"mutagen", "sync", "create", "--name", f.name}
 	for _, l := range f.labels {
 		args = append(args, "--label", l.String())
 	}
-	args = append(args, "--mode", "two-way-safe", f.ends.Local, f.ends.endpoint())
-	return f.run(ctx, f.exec, args...)
+	args = append(args, "--mode", "two-way-safe", f.roots.Local, f.roots.endpoint())
+	return f.mutagen(ctx, args...)
 }
 
 func (f *FS) verb(ctx context.Context, verb string) error {
-	return f.run(ctx, f.exec, "mutagen", "sync", verb, f.name)
+	return f.mutagen(ctx, "mutagen", "sync", verb, f.name)
 }
 
 // run runs one command to its end. It reads no input: this process's stdin
@@ -128,6 +147,18 @@ func (f *FS) verb(ctx context.Context, verb string) error {
 func (f *FS) run(ctx context.Context, ex shell.Executor, args ...string) error {
 	out, err := shell.Run(ctx, ex, shell.Command{Args: args})
 	return failed(args, out, err)
+}
+
+// mutagen runs a Mutagen command that changes a state, as run does, and
+// hands what it prints to the relay's output too.
+func (f *FS) mutagen(ctx context.Context, args ...string) error {
+	if f.output == nil {
+		return f.run(ctx, f.exec, args...)
+	}
+	var stderr bytes.Buffer
+	cmd := shell.Command{Args: args, Stdout: f.output, Stderr: io.MultiWriter(&stderr, f.output)}
+	_, err := shell.Run(ctx, f.exec, cmd)
+	return failed(args, shell.Output{Stderr: stderr.String()}, err)
 }
 
 // failed is a command's error with what it wrote to stderr, nil when it
@@ -150,44 +181,47 @@ const notFoundMarker = "unable to locate requested sessions"
 // find is the session under the relay's name, nil when Mutagen reports none.
 // Any other failure is returned, so an ambiguous reading stops the connect
 // rather than creating a second session over an existing one.
-func (f *FS) find(ctx context.Context) (*listed, error) {
-	args := []string{"mutagen", "sync", "list", f.name}
-	out, err := shell.Run(ctx, f.probe, shell.Command{Args: args})
+func (f *FS) find(ctx context.Context) (*session, error) {
+	sessions, out, err := list(ctx, f.probe, f.name)
 	if strings.Contains(out.Stdout, notFoundMarker) || strings.Contains(out.Stderr, notFoundMarker) {
 		return nil, nil
 	}
-	if err := failed(args, out, err); err != nil {
+	if err != nil {
 		return nil, err
 	}
-	for _, s := range parseList(out.Stdout) {
-		if s.name == f.name {
+	for _, s := range sessions {
+		if s.Name == f.name {
 			return &s, nil
 		}
 	}
 	// A listing of the name always holds that session; one that does not is
-	// output this parser does not understand, which is no proof of absence.
-	return nil, fmt.Errorf("%s: the session is not in its output", strings.Join(args, " "))
+	// no proof of absence.
+	return nil, fmt.Errorf("mutagen sync list %s: the session is not in its output", f.name)
 }
 
 // Listed is one FS relay as Mutagen lists it.
 type Listed struct {
 	Name   string
-	Ends   Ends
+	Roots  Roots
 	Labels map[string]string
 	State  State // Disconnected or Connected: a listed relay exists
 }
 
-// List reads the FS relays that carry label, with their ends and states, from
-// Mutagen on probe and the lock files in locks.
+// List reads the FS relays that carry label, with their roots and states,
+// from Mutagen on probe and the lock files in locks.
 func List(ctx context.Context, probe shell.Executor, locks string, label Label) ([]Listed, error) {
-	args := []string{"mutagen", "sync", "list", "--label-selector", label.String()}
-	out, err := shell.Run(ctx, probe, shell.Command{Args: args})
-	if err := failed(args, out, err); err != nil {
+	sessions, _, err := list(ctx, probe, "--label-selector", label.String())
+	if err != nil {
 		return nil, err
 	}
 	var relays []Listed
-	for _, s := range parseList(out.Stdout) {
-		held, err := leased(locks, s.name)
+	for _, s := range sessions {
+		if s.Name == "" {
+			// Hermod names every session it makes, so an unnamed one is
+			// no relay of its own, whatever labels it was given by hand.
+			continue
+		}
+		held, err := leased(locks, s.Name)
 		if err != nil {
 			return nil, err
 		}
@@ -195,91 +229,94 @@ func List(ctx context.Context, probe shell.Executor, locks string, label Label) 
 		if held {
 			state = Connected
 		}
-		relays = append(relays, Listed{Name: s.name, Ends: s.ends, Labels: s.labels, State: state})
+		relays = append(relays, Listed{Name: s.Name, Roots: s.roots(), Labels: s.Labels, State: state})
 	}
 	sort.Slice(relays, func(i, j int) bool { return relays[i].Name < relays[j].Name })
 	return relays, nil
 }
 
-// Unlabeled is the names of the Mutagen sessions on probe that sync the local
-// root local and carry no label key: sessions made under earlier names, or by
-// hand, which no listing by label finds. Resuming one could send the files to
-// a remote other than the caller's, and terminating one could drop changes it
-// still holds, so they are only named, for the user to remove.
-func Unlabeled(ctx context.Context, probe shell.Executor, local, key string) ([]string, error) {
-	args := []string{"mutagen", "sync", "list"}
+// listTemplate has Mutagen print its sessions as one JSON array of its own
+// session model; the session type declares the part of it Hermod reads.
+const listTemplate = "{{json .}}"
+
+// list runs `mutagen sync list` for selection on probe and reads its
+// sessions. The output is returned beside them for a caller that reads a
+// failure's message.
+func list(ctx context.Context, probe shell.Executor, selection ...string) ([]session, shell.Output, error) {
+	args := append(append([]string{"mutagen", "sync", "list"}, selection...), "--template", listTemplate)
 	out, err := shell.Run(ctx, probe, shell.Command{Args: args})
 	if err := failed(args, out, err); err != nil {
-		return nil, err
+		return nil, out, err
 	}
-	var names []string
-	for _, s := range parseList(out.Stdout) {
-		if _, labelled := s.labels[key]; s.ends.Local == local && !labelled {
-			names = append(names, s.name)
-		}
+	sessions, err := parseList([]byte(out.Stdout))
+	if err != nil {
+		return nil, out, fmt.Errorf("%s: %w", strings.Join(args, " "), err)
 	}
-	sort.Strings(names)
-	return names, nil
+	return sessions, out, nil
 }
 
-// listed is one session as `mutagen sync list` prints it.
-type listed struct {
-	name   string
-	ends   Ends
-	paused bool
-	labels map[string]string // nil when it has none
+// session is one Mutagen session, the fields of Mutagen's model that Hermod
+// reads.
+type session struct {
+	Name   string            `json:"name"` // "" when it was made with no name
+	Alpha  endpoint          `json:"alpha"`
+	Beta   endpoint          `json:"beta"`
+	Labels map[string]string `json:"labels"` // nil when it has none
+	Paused bool              `json:"paused"`
 }
 
-// parseList reads the sessions from `mutagen sync list` output. Each session
-// starts at a top-level `Name:` line; its ends are the indented `URL:` lines
-// under the top-level `Alpha:` (local) and `Beta:` (remote) headers, its
-// labels the indented `key: value` lines under a `Labels:` header, and a
-// paused session says so in its status.
-func parseList(out string) []listed {
-	var (
-		sessions []listed
-		section  string
-	)
-	sc := bufio.NewScanner(strings.NewReader(out))
-	for sc.Scan() {
-		line := sc.Text()
-		trimmed := strings.TrimSpace(line)
-		if line != "" && line[0] != ' ' && line[0] != '\t' {
-			section = ""
-			switch {
-			case strings.HasPrefix(trimmed, "Name:"):
-				sessions = append(sessions, listed{name: strings.TrimSpace(strings.TrimPrefix(trimmed, "Name:"))})
-				continue
-			case trimmed == "Alpha:" || trimmed == "Beta:" || trimmed == "Labels:":
-				section = trimmed
-				continue
-			}
+// endpoint is one end of a Mutagen session, as Mutagen's model splits its
+// URL.
+type endpoint struct {
+	Protocol string `json:"protocol"`
+	User     string `json:"user"`
+	Host     string `json:"host"`
+	Port     uint16 `json:"port"`
+	Path     string `json:"path"`
+}
+
+const (
+	protocolLocal = "local"
+	protocolSSH   = "ssh"
+)
+
+// host is the part of the end's URL before its path, as Mutagen writes it:
+// "" for a local end and `[user@]host[:port]` for an ssh one. Any other
+// protocol keeps its scheme, so its end matches no root of Hermod's.
+func (e endpoint) host() string {
+	switch e.Protocol {
+	case protocolLocal:
+		return ""
+	case protocolSSH:
+		h := e.Host
+		if e.User != "" {
+			h = e.User + "@" + h
 		}
-		if len(sessions) == 0 {
-			continue
+		if e.Port != 0 {
+			h = fmt.Sprintf("%s:%d", h, e.Port)
 		}
-		cur := &sessions[len(sessions)-1]
-		if section == "Labels:" {
-			if key, value, ok := strings.Cut(trimmed, ": "); ok {
-				if cur.labels == nil {
-					cur.labels = map[string]string{}
-				}
-				cur.labels[key] = value
-			}
-			continue
-		}
-		url, isURL := strings.CutPrefix(trimmed, "URL:")
-		url = strings.TrimSpace(url)
-		switch {
-		case isURL && section == "Alpha:":
-			cur.ends.Local = url
-		case isURL && section == "Beta:":
-			// A beta end with no host is no relay of Hermod's: read as a host
-			// with an empty remote root, it matches no relay's remote end.
-			cur.ends.Host, cur.ends.Remote, _ = strings.Cut(url, ":")
-		case !isURL && strings.Contains(trimmed, "Paused"):
-			cur.paused = true
-		}
+		return h
 	}
-	return sessions
+	return e.Protocol + "://" + e.Host
+}
+
+// roots are the session's ends as an FS relay's roots. An alpha end that is
+// not local keeps its host in its root, so it matches no local root; a beta
+// end with no host matches no relay's remote end.
+func (s session) roots() Roots {
+	local := s.Alpha.Path
+	if h := s.Alpha.host(); h != "" {
+		local = h + ":" + local
+	}
+	return Roots{Local: local, Host: s.Beta.host(), Remote: s.Beta.Path}
+}
+
+// parseList reads the sessions of a templated `mutagen sync list`; output
+// that is not its JSON array is an error, not an empty listing.
+func parseList(out []byte) ([]session, error) {
+	var sessions []session
+	if err := json.Unmarshal(out, &sessions); err != nil {
+		return nil, fmt.Errorf("read the listing: %w", err)
+	}
+	return sessions, nil
 }
