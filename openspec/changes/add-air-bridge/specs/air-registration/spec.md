@@ -69,7 +69,8 @@ of every project Air holds on its one ACP connection as the `agent-session` capa
 
 ### Requirement: Air ends the agent, not the chats
 `hermod air acp` SHALL run until Air closes its stdin or sends SIGTERM. It SHALL then detach every workspace it
-holds and exit, leaving every adapter and chat on the remote running.
+holds and exit, leaving every adapter and chat on the remote running. The detach SHALL be bounded as the `cli`
+capability's graceful shutdown specifies.
 
 #### Scenario: IDE quits
 - **WHEN** Air closes `air acp`'s stdin

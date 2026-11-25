@@ -110,7 +110,7 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 ## 15. `shell` and `worker`: tmux in `shell`
 
 - [x] 15.1 In `internal/shell`, give the tmux wrapper all of tmux's command language: making a session with its options, quoting what goes on tmux's command line, and listing the sessions with their options in one format ([`shell.Executor`](../../../docs/ARCHITECTURE.md#shellexecutor--a-workstation)). Move `tmuxWord`, the session creation and the `ls` format out of `internal/worker`
-- [ ] 15.2 Reduce `internal/worker` to lifecycle: key, tags, state, start, close, remove and its [scripts](../../../docs/ARCHITECTURE.md#remote-scripts), through `shell`'s tmux, building no tmux command; `Spec` is key, directory, command, variables, tags and `Form`, its variables written to the worker's `env`; the worker's directory is given to its process as the variable whose name the `env` package declares, `HERMOD_WORKER_DIR` ([Worker](../../../docs/ARCHITECTURE.md#worker), [A worker's directory](../../../docs/ARCHITECTURE.md#a-workers-directory))
+- [ ] 15.2 Reduce `internal/worker` to lifecycle: key, tags, state, start, close, remove and its [scripts](../../../docs/ARCHITECTURE.md#remote-scripts), through `shell`'s tmux, building no tmux command; `Spec` is key, directory, command, variables, tags, `Form` and the `Files` written into the worker's directory, its variables written to the worker's `env`; the worker's directory is given to its process as the variable whose name the `env` package declares, `HERMOD_WORKER_DIR` ([Worker](../../../docs/ARCHITECTURE.md#worker), [A worker's directory](../../../docs/ARCHITECTURE.md#a-workers-directory))
 - [x] 15.3 Tests: tmux argv for a session with options, quoting, and the listing; `worker` start, close, remove and list through a fake `shell.Executor`; no secret in any argv
 
 ## 16. `relay`
@@ -134,7 +134,7 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 ## 18. `acp` and `air` serializers, `session.Message`
 
 - [x] 18.1 `session.Message` loses `Handshake` and agent-typed replies: `Reply` takes a `Result` (`EmptyResult`, `HandshakeResult`, `ListResult`) and `Result` reads one back; remove `WithoutClientCapabilities`, and keep the client's `Connect` as given ([`session.Channel` and `session.Message`](../../../docs/ARCHITECTURE.md#sessionchannel-and-sessionmessage--a-chat-clients-connection))
-- [x] 18.2 Declare `acp.Serializer` (`Decode`, `Encode`) and build `acp.Conn` with one; `Send` takes any `session.Message`; only parsed messages reach `Receive`; a rejected request is answered with `method not found` or `invalid params`, and any other rejected line is logged and dropped ([`acp.Serializer`](../../../docs/ARCHITECTURE.md#acpserializer--acps-messages-as-types))
+- [x] 18.2 Declare `acp.Serializer` (`Decode`, `Encode`) and build `acp.Conn` with one; `Send` takes any `session.Message`; only parsed messages reach `Receive`; a rejected request is answered with `method not found` or `invalid params`, and any other rejected line is logged and dropped ([`acp.Serializer`](../../../docs/ARCHITECTURE.md#acpconn-and-acpregistry--acps-messages-as-types))
 - [x] 18.3 `acp.Standard`: a Go type for each of ACP's messages with typed JSON-RPC IDs, an answer parsed by the type of the request it answers, each type's `Kind`, `Chat`, `Dir` and path mapping over the fields it declares, and ACP's `_meta` declared on every type and carried with every string in it mapped by the path map; a `Conn` built for an adapter writes `initialize` without the client's `fs` and `terminal` capabilities ([The client's connection](../../../docs/ARCHITECTURE.md#the-clients-connection)). Delete `id.go`, the `silent` flag and the method table
 - [x] 18.4 `air.Serializer`, extending `acp.Standard` with Air's own messages: `session/close` as `Suspend`, `_session/archive` as `Close`, `_session/unarchive` and `_session/rename` as `Pass` ([Air's messages](../../../docs/ARCHITECTURE.md#airs-messages)). Delete `air.Methods`
 - [x] 18.5 Tests: each message type read and written; IDs as numbers and strings; an unknown request, an unknown notification and a malformed request; the `Kind` of every row of Air's messages with Air's serializer and with the standard one; `Mapped` on every declared path field and on a path inside `_meta`; `initialize`'s `_meta.jetbrains.air` reaching an adapter, and its `fs` and `terminal` client capabilities not; every `Reply` and `Fail`, and the `Result` of an answer to `initialize`
@@ -150,3 +150,51 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 - [ ] 20.1 Check README.md, docs/ARCHITECTURE.md and docs/air-integration.md against the code, each package against its [Packages](../../../docs/ARCHITECTURE.md#packages) row
 - [x] 20.2 Run `openspec validate add-air-bridge --strict`
+
+## 21. `acp`, `air` and `session.Message`: requests as calls
+
+- [ ] 21.1 In `internal/acp`, write a JSON-RPC 2.0 connection that knows no method, on the standard library only: one message per line, requests numbered from the connection's own counter and matched to their answers by ID, notifications, an inbound `$/cancel_request` ending the named request's context, an outbound `$/cancel_request` when a call's context ends first, `-32601` for a method with no handler and `-32602` for params that do not decode or validate ([`acp.Conn` and `acp.Registry`](../../../docs/ARCHITECTURE.md#acpconn-and-acpregistry--acps-messages-as-types))
+- [ ] 21.2 Replace `acp.Serializer` and `air.Serializer` with `acp.Registry`: a typed handler per method, `acp.Standard` registering ACP's methods, `session/close` among them as `Suspend`, and `air.Register` adding Air's `_session/*` methods ([Air's messages](../../../docs/ARCHITECTURE.md#airs-messages))
+- [ ] 21.3 Give each message type a `Validate` that checks its required fields plainly; delete the reflection-based decoder of `json.go`
+- [ ] 21.4 In `internal/session`, declare `Caller` (`Call`, `Notify`), `Inbound` and `Answer` (`Return`, `Reply`, `Fail`), with `Channel` a `Receiver[Inbound]` and a `Caller`; remove `Sender`, `FuncSender` and `TransformSender` for a path-mapping `Caller`; remove `MessageID`, and `ID`, `WithID`, `Reply` and `Fail` from `Message`; remove the `Cancel`, `Question` and `Answer` kinds ([`session.Channel` and `session.Message`](../../../docs/ARCHITECTURE.md#sessionchannel-and-sessionmessage--a-chat-clients-connection))
+- [ ] 21.5 The router passes a request on as a call in a goroutine with the request's context and returns its answer; the returns of an `Open`, a `Close` and the kept `Connect` come back into the one loop as events. Delete the opening, closing, requests and pending maps and the `hermod-<n>` renumbering; a Suspended chat holds its questions as unanswered requests. `SessionControl`'s `HandleClientMessage` and `HandleAdapterMessage`, and the session states, take an `Inbound` ([Request IDs](../../../docs/ARCHITECTURE.md#request-ids), [Events](../../../docs/ARCHITECTURE.md#events), [Chat states](../../../docs/ARCHITECTURE.md#chat-states))
+- [ ] 21.6 Tests: each message type decoded, validated and encoded; IDs as numbers and strings; answers matched per connection; a cancel in each direction; an unknown request and notification, and a request whose params fail `Validate`; two adapters' questions under the same ID; a question held while Suspended and called after the answer that opens the chat; every row of [Events](../../../docs/ARCHITECTURE.md#events) through fake `Channel`s
+- [ ] 21.7 Check that `internal/acp` and `internal/air` together have substantially fewer lines than before this group, with no new module in `go.mod`
+
+## 22. `pathmap` over decoded values
+
+- [ ] 22.1 Replace the raw-byte scanner of `internal/pathmap` (`JSON`, `stringEnd`, `isKey`, `mapLiteral`, `ToRemoteJSON`, `ToLocalJSON`) with a mapping over a decoded JSON value (`map[string]any`, `[]any`, a string) ([Concrete types](../../../docs/ARCHITECTURE.md#concrete-types))
+- [ ] 22.2 Its callers decode with `encoding/json`, map and encode again: the hook bodies in `session`'s filter, Claude's settings and MCP configuration in `claude`, and the free-form fields and `_meta` of `acp`'s types through `pathmap.Value`
+- [ ] 22.3 Tests: nested strings mapped, keys and numbers untouched, both directions
+
+## 23. Graceful shutdown; contexts from `cli`
+
+- [ ] 23.1 In `cli`, build the run context, ended by the first SIGINT or SIGTERM, and a function that starts the teardown context, ended by its deadline, counted from that call or the first signal, whichever is first, or by a second signal; name `--teardown-timeout` and `HERMOD_TEARDOWN_TIMEOUT`, 10 s by default, the stand-in reading the variable only ([Shutdown](../../../docs/ARCHITECTURE.md#shutdown))
+- [ ] 23.2 Hand the teardown context into the core: `Workspace.Detach`, the chat's detach of every session, the leases' `Suspend` and `Release`, and the run context into `acp.Conn`; remove `context.WithoutCancel` and `context.Background` from `workspace`, `session`, `relay` (the Net relay's shutdown takes its bound from the context), `worker` and `acp`
+- [ ] 23.3 Tests: a teardown within the deadline, one cut by the deadline, one started without a signal and bounded, a second signal, and the deadline from the flag, the variable and the default
+
+## 24. Relays end their own leases; workspace leases
+
+- [ ] 24.1 The FS relay watches its Mutagen session with `mutagen sync monitor <name>` while the lease is held, its end closing the lease's `Done` with Mutagen's error as `Err` ([`relay.Relay` and `relay.Lease`](../../../docs/ARCHITECTURE.md#relayrelay-and-relaylease--one-channel-and-a-claim-on-it))
+- [ ] 24.2 `Workspace.Attach` waits on every lease's `Done` alike and returns its `Err` wrapped with the relay's name; delete the ticker, `fsGone` and `ErrRelayGone`
+- [ ] 24.3 Replace `holds` and `hold` with a `leases` collection in `workspace`: `has(name)`, `add(lease)`, `drain()` ([Detach](../../../docs/ARCHITECTURE.md#detach))
+- [ ] 24.4 Tests: an FS lease whose monitor ends; an attach ended by an FS relay's `Done`; the collection's `has`, `add` and `drain`
+
+## 25. `claude` without shell scripts
+
+- [ ] 25.1 `Adapter` resolves the `claude` path through the executor `claude` is built with (the remote environment's `CLAUDE_CODE_EXECUTABLE`, else `command -v claude`) and runs `claude-agent-acp` as plain argv with `CLAUDE_CODE_EXECUTABLE` in its variables ([`agent.Agent` and `agent.ACP`](../../../docs/ARCHITECTURE.md#agentagent-and-agentacp--an-agent-programs-contract))
+- [ ] 25.2 Add to `agent.Launch` the function that places a file in the worker's directory and returns its path there; `session` builds it so the files reach `worker.Spec`'s `Files` through the `Host`. `Start` places the settings and the MCP configuration through it and runs Claude as plain argv; delete the start script and its file variables ([A worker's directory](../../../docs/ARCHITECTURE.md#a-workers-directory))
+- [ ] 25.3 Tests: the adapter's argv and variables with and without the remote's own `CLAUDE_CODE_EXECUTABLE`; Claude's argv naming the placed files, with no `sh` and no secret in any argv
+
+## 26. `agent.Hooks`; worker `Files`
+
+- [ ] 26.1 Add `Hooks` to `agent.Agent`, returning the `Hook`s of a `Launch`'s settings without starting anything, or why they cannot be read, and implement it in `claude`; `session` reads the client's endpoint through it and drops `clientOf` from `session/hooks.go` ([Hooks](../../../docs/ARCHITECTURE.md#hooks))
+- [ ] 26.2 Keep `Files` in `worker.Spec`, as the [Concrete types](../../../docs/ARCHITECTURE.md#concrete-types) row says
+- [ ] 26.3 Tests: `Hooks` for settings with Air's hooks, another endpoint's and none; re-attaching to a hooked worker finds the client's current endpoint
+- [ ] 26.4 Tick 15.2 and 17.4
+
+## 27. Documentation
+
+- [ ] 27.1 Check README.md, docs/ARCHITECTURE.md and docs/air-integration.md against the code, each package against its [Packages](../../../docs/ARCHITECTURE.md#packages) row and the imports against [Package dependencies](../../../docs/ARCHITECTURE.md#package-dependencies); list `HERMOD_TEARDOWN_TIMEOUT` among README's variables; then tick 20.1
+- [ ] 27.2 Run `gofmt -l .`, `go vet ./...`, `go test ./...` and `go build ./...` on the whole module
+- [ ] 27.3 Run `openspec validate add-air-bridge --strict`

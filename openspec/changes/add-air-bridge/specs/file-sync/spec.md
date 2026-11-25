@@ -124,3 +124,11 @@ only. A chat SHALL get no transcript relay, because its adapter reads the remote
 #### Scenario: A chat has no transcript relay
 - **WHEN** Air opens a chat in a project on the remote
 - **THEN** no transcript relay is made for it
+
+### Requirement: A run ends when its file relay disappears
+While a run is attached, Hermod SHALL watch the Mutagen session of every file relay it leases, and SHALL end the
+attach with an error naming the relay when that session disappears, such as when it is terminated by hand.
+
+#### Scenario: Session terminated by hand
+- **WHEN** the user terminates the Mutagen session of an attached run's file relay
+- **THEN** the attach ends with an error naming the relay, and the workspace is detached

@@ -49,9 +49,9 @@ chat UI speaks the Agent Client Protocol (ACP) to an agent it starts from `acp.j
 ## Command line
 
 ```
-hermod attach         [REMOTE] [-s NAME] [-C DIR] [-R PORT:ADDRESS]… [-n] [-- COMMAND…]
-hermod air configure  {claude} [REMOTE] [--name=NAME] [--origin=NAME] [-n]
-hermod air acp        {claude} [REMOTE]
+hermod attach         [REMOTE] [-s NAME] [-C DIR] [-R PORT:ADDRESS]… [-n] [--teardown-timeout=DURATION] [-- COMMAND…]
+hermod air configure  {claude} [REMOTE] [--name=NAME] [--origin=NAME] [-n] [--teardown-timeout=DURATION]
+hermod air acp        {claude} [REMOTE] [--teardown-timeout=DURATION]
 claude ARGS…          (a link to hermod)  ≡  hermod attach -- claude ARGS…
 ```
 
@@ -60,6 +60,7 @@ claude ARGS…          (a link to hermod)  ≡  hermod attach -- claude ARGS…
 | `HERMOD_REMOTE`     | The remote when `REMOTE` is not given. A command with neither fails before doing anything.   |
 | `HERMOD_REMOTE_CMD` | `attach`'s command when no `-- COMMAND` is given: a command line run by the remote's shell.  |
 | `HERMOD_ORIGIN`     | The name this machine is given on the remote; the local hostname when unset. Set to empty, nothing on the remote names the machine ([Names and tags](../../../docs/ARCHITECTURE.md#names-and-tags)). |
+| `HERMOD_TEARDOWN_TIMEOUT` | How long a command may take to give up what it holds, from the first SIGINT or SIGTERM or the start of its teardown, whichever is first; `--teardown-timeout` on every command, 10 s by default ([Shutdown](../../../docs/ARCHITECTURE.md#shutdown)). |
 
 An argument always wins over the environment. Each flag's default is its variable's value, so a command reads one
 resolved value and never looks at the environment again.
@@ -129,12 +130,12 @@ of the project's workspace, and `air acp` routes Air's one ACP connection betwee
   once per chat.
 - **It ends** when Air ends it: at an IDE quit Air closes its stdin and sends SIGTERM, and a vanished IDE leaves
   it with a closed stdin. Either way it detaches every session it holds and exits; nothing on the remote ends with
-  it.
+  it. A detach still running at the teardown deadline, or at a second signal, is abandoned.
 
 The adapter stays a separate program. It translates ACP into Claude's own protocol and carries Air's extensions,
 negotiated when Air declares itself at `initialize`. Hermod parses every message into a type of its own, routes
 by the few it must act on ([Air's messages](../../../docs/ARCHITECTURE.md#airs-messages)), passes the others on with
-their paths mapped, and rejects a message it does not know
+their paths mapped, and rejects a method it has no handler for
 ([Messages are typed](#messages-are-typed-an-unknown-one-is-rejected)).
 
 ## What Air expects
@@ -210,18 +211,19 @@ also have one more program, `claude-agent-acp`, which ships as a standalone exec
 ### `air acp` routes, the adapters translate
 Air holds all its chats on one ACP connection, and each project is a workspace with an adapter of its own. So
 `air acp` cannot be a pipe: it sends each message to its chat's workspace. It understands only what that takes
-(the connection start, the chat list, a cancel, which directory a new chat names, which chat a message belongs
-to, and the lifecycle messages) and never the content of a conversation. Each message is given one of a few
-meanings (start the connection, list the chats, cancel a request, open, suspend or close a chat, a remote's
-question, the client's answer, or pass through), so the routing knows neither ACP's wire format nor Air's own
+(the connection start, the chat list, which directory a new chat names, which chat a message belongs to, and the
+lifecycle messages) and never the content of a conversation. Each message is given one of a few meanings (start
+the connection, list the chats, open, suspend or close a chat, or pass through), and a request becomes a call
+([Requests are calls](#requests-are-calls)), so the routing knows neither ACP's wire format nor Air's own
 method names ([Air's messages](../../../docs/ARCHITECTURE.md#airs-messages)).
 
 Answering `session/close` itself is what lets a chat outlive its tab and the IDE. ACP defines that request as
 cancelling the session's work and freeing it, so an adapter that received it would stop the agent. It is a
 suspend, and only "mark done", a close, ends a chat.
 
-Renumbering the adapters' requests is within ACP's rules: each side numbers its own requests, and an ID means
-something only between two neighbours.
+A request passed on is a call of `air acp`'s own on the next connection, under that connection's ID: ACP lets
+each side number its own requests, and an ID means something only between two neighbours
+([Request IDs](../../../docs/ARCHITECTURE.md#request-ids)).
 
 - **Alternative — ACP's proxy chains:** not used. They are a draft that the client has to take part in, and Air
   is not known to.
@@ -298,21 +300,71 @@ of its own (`agent.ACP`). An agent with no ACP adapter is still an agent for `he
 `cli` hands the chat path an agent only when it implements the capability.
 
 ### Messages are typed; an unknown one is rejected
-`air acp` routes by what a message means, so every message is parsed in full into a Go type of its own, with typed
-JSON-RPC IDs, or rejected; nothing is read partly or lazily from untyped JSON. A connection is built with a
-serializer: `acp` has ACP's standard one, and `air` extends it with Air's own messages
-([`acp.Serializer`](../../../docs/ARCHITECTURE.md#acpserializer--acps-messages-as-types)). Each type maps the
-paths of the fields it declares, and every type carries ACP's `_meta` with every string in it mapped, so Air's
-extensions reach the adapter and a path in them crosses mapped.
+`air acp` routes by what a message means, so every message is decoded in full into a Go type of its own and
+checked by that type's `Validate`, or rejected; nothing is read partly or lazily from untyped JSON. Each method has
+a typed handler in one registry: `acp` registers ACP's methods, and `air` adds Air's own `_session/*` methods to
+the same registry ([`acp.Conn` and `acp.Registry`](../../../docs/ARCHITECTURE.md#acpconn-and-acpregistry--acps-messages-as-types)).
+Each type maps the paths of the fields it declares, and every type carries ACP's `_meta` with every string in it
+mapped, so Air's extensions reach the adapter and a path in them crosses mapped.
 
-A method neither serializer knows is rejected: a request is answered with JSON-RPC's `method not found`, and a
+A method with no handler is rejected: a request is answered with JSON-RPC's `-32601`, method not found, and a
 notification is logged and dropped. Routing only what Hermod understands keeps every path that crosses a mapped
 one.
 
 - **Alternative — pass an unknown method on unparsed:** rejected. Hermod would carry paths it never maps, and the
   routing would read untyped JSON beside its types.
 - **Alternative — a table of method names that the client gives, beside ACP's own reading:** rejected. Reading a
-  message is a serializer's work, and a table only classifies a message it has not parsed.
+  message is its handler's work, and a table only classifies a message it has not decoded.
+- **Alternative — required fields found by reflection over struct tags:** rejected. An explicit `Validate` per
+  type says what the type requires where the type is declared, and needs no decoder of Hermod's own.
+
+### Hermod's ACP code is its own
+`acp` is a small JSON-RPC 2.0 connection and ACP's message types, on the standard library alone.
+
+- **Alternative — a third-party ACP SDK (`github.com/coder/acp-go-sdk`):** rejected. Its trustworthiness cannot be
+  established, and Hermod's routing would be locked to its types and its release pace.
+
+### Requests are calls
+A request is a call that returns its answer, and its cancellation is the call's context
+([`session.Channel`](../../../docs/ARCHITECTURE.md#sessionchannel-and-sessionmessage--a-chat-clients-connection)).
+Each connection numbers its own requests and matches their answers, so `session` holds no map from IDs to
+requests, renumbers nothing, and a question held while its chat is suspended is a call not yet answered.
+
+- **Alternative — requests and answers as messages matched by ID in the core:** rejected. The core would
+  renumber the adapters' requests, record which session asked under which ID, and route cancels and answers by
+  those records: a second copy of what each connection already knows.
+
+### `cli` owns the contexts; teardown is bounded
+Every context comes from `cli`, and the core never ignores or replaces the one it is handed
+([Shutdown](../../../docs/ARCHITECTURE.md#shutdown)). A first signal ends the run; giving up the leases then has
+a deadline of its own, counted from that signal or the teardown's start, whichever is first, so the relays are settled when the network allows, and a second signal or the deadline
+exits at once.
+
+- **Alternative — a teardown context detached from the caller's inside the core:** rejected. The core would then
+  outlive what its caller decided, and nothing could bound or interrupt a teardown that hangs.
+
+### A relay says when it stops serving
+Every lease has one `Done`, closed when its relay stops serving on its own; an FS relay watches its Mutagen session
+for that ([`relay.Relay` and `relay.Lease`](../../../docs/ARCHITECTURE.md#relayrelay-and-relaylease--one-channel-and-a-claim-on-it)).
+A workspace's attach waits on every lease's `Done` alike, and knows no relay kind.
+
+- **Alternative — the workspace polls Mutagen for its FS relays:** rejected. It is the relay's own state, read by
+  a second package with a check of its own beside the leases'.
+
+### An agent's command runs without a shell
+`claude` starts Claude and its adapter as plain argv and variables, every path resolved before the command is
+built ([A worker's directory](../../../docs/ARCHITECTURE.md#a-workers-directory)). Files reach the worker's
+directory with the worker, over ssh stdin.
+
+- **Alternative — a script that writes the files and `exec`s the program:** rejected. A second program in front of
+  the agent, quoting to get right, and the files carried in variables first.
+
+### Paths are mapped on decoded JSON
+A JSON document is decoded with `encoding/json`, its strings mapped, and encoded again
+([`pathmap.Map`](../../../docs/ARCHITECTURE.md#concrete-types)).
+
+- **Alternative — a scanner over the raw bytes:** rejected. The document is decoded to be validated anyway, and
+  editing its serialized form beside that is a second, weaker reading of it.
 
 ### Two sources say what a conversation is doing
 Whether a conversation runs is the agent program's to say, and whether a process exists under Hermod's name is
@@ -462,7 +514,7 @@ The `add-notify-backchannel` and `add-remote-agent` changes are withdrawn with i
   of the agent's ACP capability, which may promise a protocol version, capabilities or Air extensions the installed adapter
   lacks. → `air acp` logs both sides' versions from `initialize` and where the adapter's dropped answer differs
   from the agent's `Handshake`; documentation says to install the version Air uses.
-- **A message no serializer has is rejected.** A method Air or the adapter adds, or one not yet observed, gets
+- **A method with no handler is rejected.** A method Air or the adapter adds, or one not yet observed, gets
   `method not found` or is dropped, and a field no type declares, outside ACP's `_meta`, does not reach the other
   side. → The log names
   each rejected method; a new one is a type added to `acp` or `air`.

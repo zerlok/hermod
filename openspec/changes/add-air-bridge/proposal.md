@@ -19,7 +19,8 @@ hand.
 - `hermod air acp` is Air's chat agent for one remote. Each project's chats run in one ACP adapter on the remote,
   and `air acp` routes Air's one connection between them. It answers the connection start and the chat list
   itself, from the agent, and finds a chat it does not hold in the agent program on the remote. It parses every
-  message in full into a type of its own, and rejects a method that neither ACP nor Air defines. A closed tab or a
+  message in full into a type of its own, and rejects a method that neither ACP nor Air defines. Each connection
+  numbers its own requests, and a request passed on is a call that returns its answer. A closed tab or a
   quit IDE leaves a chat running; "mark done" ends it, and ending a project's last running chat ends its adapter.
 - Hermod is rebuilt around workspaces: the relays (files, stdio, calls) and the workers (tmux sessions) of one
   project on one remote. Sessions lease relays through file locks, and a workspace suspends them while a worker
@@ -27,6 +28,8 @@ hand.
   worker's own.
 - **BREAKING** File relays are named after the remote and their two ends, and carry edits both ways without
   picking a winner; mirrors under path-only names are no longer found.
+- Every command ends in two steps: the first SIGINT or SIGTERM ends its work, and giving up what it holds then has
+  a deadline (`--teardown-timeout`, `HERMOD_TEARDOWN_TIMEOUT`, 10 s), cut short by a second signal.
 - **BREAKING** The notification back-channel (`hermod notify`, `-N`, `HERMOD_NOTIFY_SOCK`) is removed, and the
   `add-notify-backchannel` and `add-remote-agent` changes are withdrawn.
 
@@ -60,7 +63,7 @@ and flows are in [ARCHITECTURE](../../../docs/ARCHITECTURE.md).
   `hook` are replaced by them, and `notify` is removed.
 - Files: `~/.jetbrains/acp.json` locally; the rest are in
   [Storage](../../../docs/ARCHITECTURE.md#storage) and [Names and tags](../../../docs/ARCHITECTURE.md#names-and-tags).
-- Dependencies: the remote needs what
+- Dependencies: no new Go module; ACP and JSON-RPC are Hermod's own code on the standard library. The remote needs what
   [docs/air-integration.md](../../../docs/air-integration.md#nothing-of-hermods-runs-on-the-remote) lists, and
   `claude-agent-acp` for chat mode. Nothing of Hermod's is installed on the remote.
 - Docs: README.md, docs/ARCHITECTURE.md and docs/air-integration.md follow the new command line and packages.

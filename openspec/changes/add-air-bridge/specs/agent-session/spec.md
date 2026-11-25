@@ -152,6 +152,20 @@ otherwise change Claude's session name.
 - **WHEN** Hermod starts Claude for a conversation
 - **THEN** the argv carries no `--name` that the caller did not pass
 
+### Requirement: Claude and its adapter start without a shell
+Hermod SHALL start Claude and `claude-agent-acp` on the remote as their own argv and variables, with no shell
+script in front, every path in the argv resolved before the start. The adapter SHALL be given
+`CLAUDE_CODE_EXECUTABLE`: the value the remote's environment sets, else the path of the `claude` the remote's shell
+finds.
+
+#### Scenario: Adapter finds the remote's Claude
+- **WHEN** the adapter starts on a remote whose environment sets no `CLAUDE_CODE_EXECUTABLE`
+- **THEN** it runs with `CLAUDE_CODE_EXECUTABLE` naming the `claude` on the remote's `PATH`
+
+#### Scenario: The remote's own choice kept
+- **WHEN** the remote's environment sets `CLAUDE_CODE_EXECUTABLE`
+- **THEN** the adapter runs with that value
+
 ### Requirement: Only declared variables reach the remote
 A worker that runs Claude or its ACP adapter SHALL be given only the variables Claude declares and the git
 identity: the caller's `CLAUDE_*`, `ANTHROPIC_*` and `MAX_THINKING_TOKENS`, leaving out `CLAUDE_CODE_EXECUTABLE`
@@ -356,16 +370,21 @@ SHALL detach the workspace and the adapter keeps running.
 - **WHEN** Air marks done the only shown chat of a project whose other chat runs hidden
 - **THEN** the chat's agent stops, the workspace is detached, and the adapter keeps running
 
-### Requirement: The adapters' requests are renumbered
-Every request an adapter sends SHALL reach the client under an ID unique on the client's connection, and the
-client's answer SHALL reach the adapter that asked under that adapter's own ID. The client's requests SHALL keep
-their IDs. A request whose adapter is detached before it is answered SHALL be forgotten.
+### Requirement: Each connection numbers its own requests
+Every request Hermod sends, on the client's connection or on an adapter's, SHALL carry an ID Hermod numbers on that
+connection, and its answer SHALL reach the side that asked under the ID that side sent. A cancel SHALL follow its
+request to the next connection under that connection's ID. A request whose adapter is detached before it is
+answered SHALL be forgotten.
 
 #### Scenario: Two adapters use the same ID
 - **WHEN** the adapters of two projects each send `session/request_permission` with ID 0
 - **THEN** Air receives two requests with different IDs, and each answer reaches the adapter that asked, under
   ID 0
 
-#### Scenario: Client IDs unchanged
+#### Scenario: A prompt answered under the client's ID
 - **WHEN** Air sends a prompt with ID 7
-- **THEN** the adapter receives it with ID 7
+- **THEN** the adapter receives it under an ID of its connection, and Air receives the adapter's answer under ID 7
+
+#### Scenario: A cancelled prompt
+- **WHEN** Air sends `$/cancel_request` for its prompt with ID 7
+- **THEN** the adapter receives `$/cancel_request` naming the ID under which it received that prompt

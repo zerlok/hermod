@@ -132,3 +132,30 @@ the same project.
 #### Scenario: Port gone with the run
 - **WHEN** the run that asked for `-R 9000:localhost:8080` detaches
 - **THEN** a connection to port 9000 on the remote no longer reaches `localhost:8080`
+
+### Requirement: Graceful shutdown
+Every Hermod command SHALL stop its work at the first SIGINT or SIGTERM and then give up what it holds (the relay
+leases, the attached workspaces) within a teardown deadline: `--teardown-timeout`, else `HERMOD_TEARDOWN_TIMEOUT`,
+else 10 seconds, counted from the first signal or from the start of the teardown, whichever is first. At the deadline, or at a second SIGINT or SIGTERM, the command
+SHALL exit at once with an error, abandoning what is left. The stand-in SHALL take the deadline from
+`HERMOD_TEARDOWN_TIMEOUT` alone.
+
+#### Scenario: Teardown within the deadline
+- **WHEN** an attached run receives SIGTERM and its relays settle in time
+- **THEN** it detaches the workspace and exits
+
+#### Scenario: Teardown cut by the deadline
+- **WHEN** an attached run receives SIGTERM and detaching takes longer than the teardown deadline
+- **THEN** it exits with an error at the deadline, and its file relays are left Disconnected
+
+#### Scenario: Teardown without a signal
+- **WHEN** `hermod air acp`'s stdin closes with no signal and detaching hangs
+- **THEN** it exits with an error at the teardown deadline, counted from the start of the teardown
+
+#### Scenario: Second signal
+- **WHEN** a run that is tearing down receives a second SIGINT
+- **THEN** it exits at once with an error
+
+#### Scenario: Deadline from the environment
+- **WHEN** the user runs `hermod attach prod-box` with `HERMOD_TEARDOWN_TIMEOUT=30s` and no `--teardown-timeout`
+- **THEN** the run's teardown deadline is 30 seconds
