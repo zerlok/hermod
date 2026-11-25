@@ -3,6 +3,7 @@ package workspace
 import (
 	"context"
 	"errors"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -885,27 +886,38 @@ func TestMapRefusesARelativeHome(t *testing.T) {
 }
 
 func TestAttach(t *testing.T) {
+	ws := n(api, apiR)
+	k := key(t, "hermod-a")
 	cases := []struct {
-		name    string
-		form    worker.Form
-		ends    bool // the worker's stdio ends at once
-		taken   bool // another reader holds the worker's line stream
-		gone    bool // the project FS relay is terminated from outside
-		wantErr error
+		name      string
+		form      worker.Form
+		ends      bool // the worker's stdio ends at once
+		taken     bool // another reader holds the worker's line stream
+		gone      bool // the project FS relay is terminated from outside
+		dryRun    bool // a new workspace with its FS relay added, changed on a dry-run executor and read on the fake
+		wantErr   error
+		wantRelay string // the relay the error names; "" for an attach refused before it serves, or ended by either relay
 	}{
-		{"a terminal whose process ends", worker.Terminal, true, false, false, relay.ErrEnded},
-		{"a line stream whose process ends", worker.LineStream, true, false, false, relay.ErrEnded},
-		{"a second reader of a line stream", worker.LineStream, false, true, false, relay.ErrInUse},
-		{"an FS relay terminated elsewhere", worker.LineStream, false, false, true, ErrRelayGone},
+		{"a terminal whose process ends", worker.Terminal, true, false, false, false, relay.ErrEnded, ioName(testHost, k)},
+		{"a line stream whose process ends", worker.LineStream, true, false, false, false, relay.ErrEnded, ioName(testHost, k)},
+		{"a second reader of a line stream", worker.LineStream, false, true, false, false, relay.ErrInUse, ""},
+		{"an FS relay terminated elsewhere", worker.LineStream, false, false, true, false, exitError(1), ws},
+		{"a dry run of a new workspace", worker.LineStream, false, false, false, true, relay.ErrEnded, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			ws := n(api, apiR)
-			f := newFake(syncsOf(rel{local: api, remote: apiR}), map[string]*tmuxSession{"hermod-a": tagged(ws, worker.Running)})
+			syncs := syncsOf(rel{local: api, remote: apiR})
+			if tc.dryRun {
+				syncs = nil
+			}
+			f := newFake(syncs, map[string]*tmuxSession{"hermod-a": tagged(ws, worker.Running)})
 			f.ioEnds = tc.ends
 			local := testLocal(t)
-			k := key(t, "hermod-a")
+			remote := f.remote()
+			if tc.dryRun {
+				remote.Exec = shell.NewDryRun(io.Discard)
+			}
 			if tc.taken {
 				other := relay.NewIO(shell.NewSSH(f, testHost), local.Locks, ioName(testHost, k), relay.Lines{}, relay.Streams{})
 				lease, err := other.Connect(ctx)
@@ -914,44 +926,157 @@ func TestAttach(t *testing.T) {
 				}
 				defer func() { _ = lease.Release(ctx) }()
 			}
-			w, err := Open(ctx, f.remote(), local, api, Worktree{}, unbounded)
+			w, err := Open(ctx, remote, local, api, Worktree{}, unbounded)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
 			defer func() { _ = w.Detach(ctx) }()
-			w.poll = time.Millisecond
+			if tc.dryRun {
+				if err := w.AddFS(ctx, pathmap.Place{Local: api, Remote: apiR}); err != nil {
+					t.Fatalf("AddFS: %v", err)
+				}
+			}
 			if tc.gone {
 				f.mu.Lock()
-				delete(f.syncs, ws)
+				f.terminate(ws)
 				f.mu.Unlock()
 			}
-			if err := w.Attach(ctx, k, tc.form, relay.Streams{}); !errors.Is(err, tc.wantErr) {
+			err = w.Attach(ctx, k, tc.form, relay.Streams{})
+			if !errors.Is(err, tc.wantErr) {
 				t.Errorf("Attach: %v, want %v", err, tc.wantErr)
+			}
+			if named := "relay " + tc.wantRelay + ": "; tc.wantRelay != "" && (err == nil || !strings.Contains(err.Error(), named)) {
+				t.Errorf("Attach: %v, want it to name %q", err, named)
 			}
 		})
 	}
 }
 
+func TestLeases(t *testing.T) {
+	cases := []struct {
+		name        string
+		add         []string
+		has         string
+		wantHas     bool
+		wantDrained []string
+	}{
+		{"none held", nil, "a", false, nil},
+		{"one held", []string{"a"}, "a", true, []string{"a"}},
+		{"another relay held", []string{"a"}, "b", false, []string{"a"}},
+		{"drained in the order taken", []string{"b", "a"}, "a", true, []string{"b", "a"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ls leases
+			for _, name := range tc.add {
+				ls.add(held{name: name})
+			}
+			if got := ls.has(tc.has); got != tc.wantHas {
+				t.Errorf("has(%q) = %v, want %v", tc.has, got, tc.wantHas)
+			}
+			var drained []string
+			for _, h := range ls.drain() {
+				drained = append(drained, h.name)
+			}
+			if !reflect.DeepEqual(drained, tc.wantDrained) {
+				t.Errorf("drain() = %q, want %q", drained, tc.wantDrained)
+			}
+			if ls.has(tc.has) || len(ls.drain()) != 0 {
+				t.Error("a lease is still held after drain")
+			}
+		})
+	}
+}
+
+// TestLeasesWatch checks which lease ends a watch and what it returns: the
+// leases held when watch is called, drained or not, and none added later.
+func TestLeasesWatch(t *testing.T) {
+	failed := errors.New("failed")
+	cases := []struct {
+		name    string
+		add     []string
+		drain   bool   // the leases are drained after watch
+		later   string // a lease added after watch; "" for none
+		end     string // the lease whose Done closes; "" for none
+		endErr  error
+		cancel  bool // ctx ends before the wait
+		wantErr string
+	}{
+		{name: "a lease ends with its error", add: []string{"a", "b"}, end: "b", endErr: failed, wantErr: "relay b: failed"},
+		{name: "a lease given up", add: []string{"a"}, end: "a"},
+		{name: "a drained lease given up", add: []string{"a"}, drain: true, end: "a"},
+		{name: "a lease added after watch", add: []string{"a"}, later: "b", end: "b", endErr: failed, cancel: true, wantErr: context.Canceled.Error()},
+		{name: "none held", cancel: true, wantErr: context.Canceled.Error()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ls leases
+			ends := map[string]*endingLease{}
+			for _, name := range tc.add {
+				ends[name] = &endingLease{done: make(chan struct{})}
+				ls.add(held{name: name, lease: ends[name]})
+			}
+			wait := ls.watch()
+			if tc.drain {
+				ls.drain()
+			}
+			if tc.later != "" {
+				ends[tc.later] = &endingLease{done: make(chan struct{})}
+				ls.add(held{name: tc.later, lease: ends[tc.later]})
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			if tc.end != "" {
+				ends[tc.end].err = tc.endErr
+				close(ends[tc.end].done)
+			}
+			if tc.cancel {
+				cancel()
+			}
+			defer cancel()
+			err := wait(ctx)
+			if (tc.wantErr == "" && err != nil) || (tc.wantErr != "" && (err == nil || err.Error() != tc.wantErr)) {
+				t.Errorf("wait = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// endingLease is a lease whose Done the test closes, with err as its Err.
+type endingLease struct {
+	relay.Lease
+	done chan struct{}
+	err  error
+}
+
+func (l *endingLease) Done() <-chan struct{} { return l.done }
+func (l *endingLease) Err() error            { return l.err }
+
 // TestJoin checks which failure Join reports itself, before anyone reads the
 // streams, and which one its wait reports once the relays served.
 func TestJoin(t *testing.T) {
+	ws := n(api, apiR)
+	k := key(t, "hermod-a")
 	cases := []struct {
 		name        string
+		ends        bool // the worker's stdio ends at once
 		taken       bool // another reader holds the worker's line stream
+		detach      bool // the workspace is detached between Join and wait
+		gone        bool // the project FS relay is terminated from outside after Join
 		wantJoinErr error
 		wantWaitErr error
+		wantRelay   string // the relay the wait's error names; "" for none
 	}{
-		{"a line stream whose process ends", false, nil, relay.ErrEnded},
-		{"a second reader of a line stream", true, relay.ErrInUse, nil},
+		{name: "a line stream whose process ends", ends: true, wantWaitErr: relay.ErrEnded, wantRelay: ioName(testHost, k)},
+		{name: "a second reader of a line stream", ends: true, taken: true, wantJoinErr: relay.ErrInUse},
+		{name: "a detach before the wait", detach: true},
+		{name: "an FS relay terminated after Join", gone: true, wantWaitErr: exitError(1), wantRelay: ws},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			ws := n(api, apiR)
 			f := newFake(syncsOf(rel{local: api, remote: apiR}), map[string]*tmuxSession{"hermod-a": tagged(ws, worker.Running)})
-			f.ioEnds = true
+			f.ioEnds = tc.ends
 			local := testLocal(t)
-			k := key(t, "hermod-a")
 			if tc.taken {
 				other := relay.NewIO(shell.NewSSH(f, testHost), local.Locks, ioName(testHost, k), relay.Lines{}, relay.Streams{})
 				lease, err := other.Connect(ctx)
@@ -972,8 +1097,28 @@ func TestJoin(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if err := wait(); !errors.Is(err, tc.wantWaitErr) {
+			if tc.detach {
+				if err := w.Detach(ctx); err != nil {
+					t.Fatalf("Detach: %v", err)
+				}
+			}
+			if tc.gone {
+				f.mu.Lock()
+				f.terminate(ws)
+				f.mu.Unlock()
+			}
+			waited := make(chan error, 1)
+			go func() { waited <- wait() }()
+			select {
+			case err = <-waited:
+			case <-time.After(5 * time.Second):
+				t.Fatal("wait did not return")
+			}
+			if !errors.Is(err, tc.wantWaitErr) {
 				t.Errorf("wait: %v, want %v", err, tc.wantWaitErr)
+			}
+			if named := "relay " + tc.wantRelay + ": "; tc.wantRelay != "" && (err == nil || !strings.Contains(err.Error(), named)) {
+				t.Errorf("wait: %v, want it to name %q", err, named)
 			}
 		})
 	}

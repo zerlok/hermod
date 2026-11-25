@@ -13,8 +13,8 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"slices"
 	"sync"
-	"time"
 
 	"github.com/zerlok/hermod/internal/env"
 	"github.com/zerlok/hermod/internal/pathmap"
@@ -106,15 +106,6 @@ type Worktree struct {
 // each would carry the other's files back.
 var ErrRemoteTaken = errors.New("workspace: the remote root is joined to another local root")
 
-// ErrRelayGone is why an attach ended when an FS relay it holds was removed
-// from outside this process.
-var ErrRelayGone = errors.New("workspace: an FS relay is gone")
-
-// fsPoll is how often an attach reads Mutagen for the FS relays it holds:
-// nothing in this process serves one, so a relay terminated elsewhere is seen
-// only there.
-const fsPoll = 5 * time.Second
-
 // Local is what a workspace needs of this workstation.
 type Local struct {
 	Home   string // the local user's home, absolute
@@ -135,10 +126,76 @@ type Workspace struct {
 	root   pathmap.Place // its project FS relay's ends
 	nested []pathmap.Place
 	paths  pathmap.Map
-	poll   time.Duration
+	leases leases
+}
 
+// leases are the leases this process holds through the workspace, by relay
+// name, in the order taken. They are safe for concurrent use.
+type leases struct {
 	mu   sync.Mutex
-	held []held // in the order taken
+	held []held
+}
+
+// has reports whether a lease on the relay name is held.
+func (ls *leases) has(name string) bool {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	for _, h := range ls.held {
+		if h.name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// add keeps a lease just taken.
+func (ls *leases) add(h held) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	ls.held = append(ls.held, h)
+}
+
+// drain hands every lease over, in the order taken, and keeps none.
+func (ls *leases) drain() []held {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	all := ls.held
+	ls.held = nil
+	return all
+}
+
+// watch waits on the leases held now: the wait returns when the Done of one
+// of them closes, with its Err named by the relay, nil when this process gave
+// the lease up, or when ctx ends. They are taken now rather than when the wait
+// runs, because a detach may drain them first, and their Done, closed by
+// giving them up, must still end the wait.
+func (ls *leases) watch() func(ctx context.Context) error {
+	ls.mu.Lock()
+	watched := slices.Clone(ls.held)
+	ls.mu.Unlock()
+	return func(ctx context.Context) error {
+		ended := make(chan held, len(watched))
+		stop := make(chan struct{})
+		defer close(stop)
+		for _, h := range watched {
+			go func() {
+				select {
+				case <-h.lease.Done():
+					ended <- h
+				case <-stop:
+				}
+			}()
+		}
+		select {
+		case h := <-ended:
+			if err := h.lease.Err(); err != nil {
+				return fmt.Errorf("relay %s: %w", h.name, err)
+			}
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // held is one lease this process took through the workspace. owner is the
@@ -311,7 +368,7 @@ func Open(ctx context.Context, remote Remote, local Local, dir string, tree Work
 		return nil, err
 	}
 	project := func(f found) bool { return f.project() }
-	w := &Workspace{remote: remote, local: local, poll: fsPoll}
+	w := &Workspace{remote: remote, local: local}
 	var holder found // the FS relay that holds dir
 	if p, ok := covering(all, dir, project); ok {
 		w.name, w.root, holder = p.name, p.place, p
@@ -471,7 +528,7 @@ func (w *Workspace) AddFS(ctx context.Context, place pathmap.Place) error {
 	}
 	place = pathmap.Place{Local: path.Clean(place.Local), Remote: path.Clean(place.Remote)}
 	name := relayName(w.remote.Host, place)
-	if w.holds(name) {
+	if w.leases.has(name) {
 		return nil
 	}
 	all, err := list(ctx, w.remote, w.local)
@@ -488,7 +545,7 @@ func (w *Workspace) AddFS(ctx context.Context, place pathmap.Place) error {
 // addFS leases the FS relay name of the workspace owner, making it in this
 // workspace when it is Absent.
 func (w *Workspace) addFS(ctx context.Context, name, owner string, roots relay.Roots) error {
-	if w.holds(name) {
+	if w.leases.has(name) {
 		return nil
 	}
 	fs := relay.NewFS(w.remote.Exec, w.remote.Read, w.local.Locks, roots, name, w.local.Output, fsLabels(w.remote.Host, w.name)...)
@@ -496,7 +553,7 @@ func (w *Workspace) addFS(ctx context.Context, name, owner string, roots relay.R
 	if err != nil {
 		return err
 	}
-	w.hold(held{name: name, owner: owner, fs: true, lease: lease})
+	w.leases.add(held{name: name, owner: owner, fs: true, lease: lease})
 	return fs.Flush(ctx)
 }
 
@@ -505,14 +562,14 @@ func (w *Workspace) addFS(ctx context.Context, name, owner string, roots relay.R
 // another process took fails here, so the caller can go on without it.
 func (w *Workspace) AddNet(ctx context.Context, port int, local string, filter relay.Filter) error {
 	name := netName(w.remote.Host, port)
-	if w.holds(name) {
+	if w.leases.has(name) {
 		return nil
 	}
 	lease, err := relay.NewNet(w.remote.Exec, w.local.Locks, name, w.remote.Host, port, local, filter).Connect(ctx)
 	if err != nil {
 		return err
 	}
-	w.hold(held{name: name, owner: w.name, lease: lease})
+	w.leases.add(held{name: name, owner: w.name, lease: lease})
 	return nil
 }
 
@@ -583,8 +640,8 @@ func (h host) start(ctx context.Context, cmd shell.Command) error {
 }
 
 // Attach connects the workspace's relays and the IO relay between the
-// worker's stdio in form and streams, and returns when that relay or an FS
-// relay stops serving, with why, or when ctx ends. The leases stay held for
+// worker's stdio in form and streams, and returns when a relay it holds stops
+// serving, with why, or when ctx ends. The leases stay held for
 // Detach. A line stream has one reader: while another lease holds its relay
 // the attach fails with ErrInUse.
 func (w *Workspace) Attach(ctx context.Context, key Key, form Form, streams Streams) error {
@@ -623,45 +680,9 @@ func (w *Workspace) Join(ctx context.Context, key Key, form Form, streams Stream
 	if err != nil {
 		return nil, err
 	}
-	w.hold(held{name: name, owner: w.name, lease: lease})
-	return func() error { return w.serve(ctx, lease) }, nil
-}
-
-// serve waits until io stops serving, or an FS relay the workspace holds is
-// gone.
-func (w *Workspace) serve(ctx context.Context, io relay.Lease) error {
-	ticker := time.NewTicker(w.poll)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-io.Done():
-			return io.Err()
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if name, gone := w.fsGone(ctx); gone {
-				return fmt.Errorf("%w: %s", ErrRelayGone, name)
-			}
-		}
-	}
-}
-
-// fsGone is an FS relay this process holds that Mutagen no longer lists. A
-// read that fails finds none: the relays outlive a moment Mutagen cannot be
-// read.
-func (w *Workspace) fsGone(ctx context.Context) (string, bool) {
-	all, err := list(ctx, w.remote, w.local)
-	if err != nil {
-		return "", false
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	for _, h := range w.held {
-		if _, listed := named(all, h.name); h.fs && !listed {
-			return h.name, true
-		}
-	}
-	return "", false
+	w.leases.add(held{name: name, owner: w.name, lease: lease})
+	watch := w.leases.watch()
+	return func() error { return watch(ctx) }, nil
 }
 
 // connect leases every FS relay of the workspace this process does not hold
@@ -672,33 +693,16 @@ func (w *Workspace) connect(ctx context.Context) error {
 		return err
 	}
 	for _, r := range relays {
-		if w.holds(r.Name) {
+		if w.leases.has(r.Name) {
 			continue
 		}
 		lease, err := relay.NewFS(w.remote.Exec, w.remote.Read, w.local.Locks, r.Roots, r.Name, w.local.Output, fsLabels(w.remote.Host, w.name)...).Connect(ctx)
 		if err != nil {
 			return err
 		}
-		w.hold(held{name: r.Name, owner: w.name, fs: true, lease: lease})
+		w.leases.add(held{name: r.Name, owner: w.name, fs: true, lease: lease})
 	}
 	return nil
-}
-
-func (w *Workspace) holds(name string) bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	for _, h := range w.held {
-		if h.name == name {
-			return true
-		}
-	}
-	return false
-}
-
-func (w *Workspace) hold(h held) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.held = append(w.held, h)
 }
 
 // Detach gives up every lease this process holds on the workspace's relays:
@@ -711,10 +715,7 @@ func (w *Workspace) hold(h held) {
 // is returned together, and the leases are given up all the same. A detach
 // that failed once ctx ended returns ctx's error too: the end cut it.
 func (w *Workspace) Detach(ctx context.Context) error {
-	w.mu.Lock()
-	leases := w.held
-	w.held = nil
-	w.mu.Unlock()
+	leases := w.leases.drain()
 	if len(leases) == 0 {
 		return nil
 	}

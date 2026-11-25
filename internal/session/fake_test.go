@@ -86,6 +86,7 @@ type fake struct {
 	joins        []string             // the form of each join, in order
 	ran          []string
 	cut          []string // the changes run with their context already ended
+	monitors     relaytest.Monitors
 }
 
 func newFake() *fake {
@@ -173,6 +174,9 @@ func (f *fake) onLocal(args []string) play {
 		return func(context.Context, io.Reader, io.Writer, io.Writer) error { return nil }
 	}
 	verb, rest := args[2], args[3:]
+	if verb == "monitor" {
+		return f.monitor(rest)
+	}
 	return func(ctx context.Context, _ io.Reader, out, errOut io.Writer) error {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -213,8 +217,18 @@ func (f *fake) onLocal(args []string) play {
 			s.paused = false
 		case "terminate":
 			delete(f.syncs, rest[0])
+			f.monitors.End(rest[0])
 		}
 		return nil
+	}
+}
+
+// monitor watches a session until its context ends or the session is
+// terminated; it changes no state, so it is not recorded.
+func (f *fake) monitor(rest []string) play {
+	return func(ctx context.Context, _ io.Reader, _, errOut io.Writer) error {
+		exists := func(name string) bool { _, ok := f.syncs[name]; return ok }
+		return f.monitors.Run(ctx, rest, &f.mu, exists, errOut, exitError(1))
 	}
 }
 

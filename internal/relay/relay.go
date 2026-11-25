@@ -56,10 +56,10 @@ type Relay interface {
 
 // Lease is a connect lease: a claim that the relay delivers.
 type Lease interface {
-	// Done is closed when the relay stops serving: on its own, for an IO relay
-	// whose local side left or whose process ended and a Net relay whose
-	// connection dropped, or when this process gave up its last lease on it. An
-	// FS relay has nothing serving it in this process, so its Done stays open.
+	// Done is closed when the relay stops serving: on its own, for an FS relay
+	// whose Mutagen session disappeared, an IO relay whose local side left or
+	// whose process ended and a Net relay whose connection dropped, or when
+	// this process gave up its last lease on it.
 	Done() <-chan struct{}
 	// Err is why Done was closed: ErrLeft, ErrEnded or the failure, and nil for
 	// a relay this process stopped serving itself.
@@ -97,7 +97,7 @@ type mechanism interface {
 	// is taken: creates or resumes an FS relay.
 	make(ctx context.Context) error
 	// serve starts what serves the relay in this process, for the first lease
-	// this process takes on it; nil for a kind with nothing to serve.
+	// this process takes on it.
 	serve(ctx context.Context) (*serving, error)
 	// settle acts on the last lease given up across processes, while its
 	// holder still has the lock to itself.
@@ -121,7 +121,7 @@ type leases struct {
 	making sync.Mutex
 
 	mu  sync.Mutex
-	srv *serving // what serves leases taken now; nil for a kind with nothing to serve
+	srv *serving // what serves leases taken now
 }
 
 func (ls *leases) connect(ctx context.Context) (Lease, error) {
@@ -154,9 +154,7 @@ func (ls *leases) connect(ctx context.Context) (Lease, error) {
 		}
 		ls.srv = srv
 	}
-	if ls.srv != nil {
-		ls.srv.holders++
-	}
+	ls.srv.holders++
 	return &lease{owner: ls, lock: lk, srv: ls.srv}, nil
 }
 
@@ -172,13 +170,11 @@ func (ls *leases) settleLast(ctx context.Context, lk *lock, how giveUp) error {
 func (ls *leases) giveUp(ctx context.Context, l *lease, how giveUp) error {
 	var stopped error
 	ls.mu.Lock()
-	if l.srv != nil {
-		l.srv.holders--
-		// A serving already replaced was stopped then.
-		if l.srv.holders == 0 && l.srv == ls.srv {
-			stopped = ls.srv.stop(ctx)
-			ls.srv = nil
-		}
+	l.srv.holders--
+	// A serving already replaced was stopped then.
+	if l.srv.holders == 0 && l.srv == ls.srv {
+		stopped = ls.srv.stop(ctx)
+		ls.srv = nil
 	}
 	ls.mu.Unlock()
 	return errors.Join(stopped, ls.settleLast(ctx, l.lock, how))
@@ -188,27 +184,14 @@ func (ls *leases) giveUp(ctx context.Context, l *lease, how giveUp) error {
 type lease struct {
 	owner *leases
 	lock  *lock
-	srv   *serving // nil for a kind with nothing to serve
+	srv   *serving
 
 	once sync.Once
 }
 
-// never is the Done of a relay that has nothing serving it in this process.
-var never = make(chan struct{})
+func (l *lease) Done() <-chan struct{} { return l.srv.done }
 
-func (l *lease) Done() <-chan struct{} {
-	if l.srv == nil {
-		return never
-	}
-	return l.srv.done
-}
-
-func (l *lease) Err() error {
-	if l.srv == nil {
-		return nil
-	}
-	return l.srv.result()
-}
+func (l *lease) Err() error { return l.srv.result() }
 
 func (l *lease) Suspend(ctx context.Context) error { return l.end(ctx, suspend) }
 func (l *lease) Release(ctx context.Context) error { return l.end(ctx, release) }

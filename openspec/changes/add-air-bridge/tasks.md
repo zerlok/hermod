@@ -175,10 +175,10 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 ## 24. Relays end their own leases; workspace leases
 
-- [ ] 24.1 The FS relay watches its Mutagen session with `mutagen sync monitor <name>` while the lease is held, its end closing the lease's `Done` with Mutagen's error as `Err` ([`relay.Relay` and `relay.Lease`](../../../docs/ARCHITECTURE.md#relayrelay-and-relaylease--one-channel-and-a-claim-on-it))
-- [ ] 24.2 `Workspace.Attach` waits on every lease's `Done` alike and returns its `Err` wrapped with the relay's name; delete the ticker, `fsGone` and `ErrRelayGone`
-- [ ] 24.3 Replace `holds` and `hold` with a `leases` collection in `workspace`: `has(name)`, `add(lease)`, `drain()` ([Detach](../../../docs/ARCHITECTURE.md#detach))
-- [ ] 24.4 Tests: an FS lease whose monitor ends; an attach ended by an FS relay's `Done`; the collection's `has`, `add` and `drain`
+- [x] 24.1 The FS relay watches its Mutagen session with `mutagen sync monitor <name>` while the lease is held, its end closing the lease's `Done` with Mutagen's error as `Err` ([`relay.Relay` and `relay.Lease`](../../../docs/ARCHITECTURE.md#relayrelay-and-relaylease--one-channel-and-a-claim-on-it))
+- [x] 24.2 `Workspace.Attach` waits on every lease's `Done` alike and returns its `Err` wrapped with the relay's name; delete the ticker, `fsGone` and `ErrRelayGone`
+- [x] 24.3 Replace `holds` and `hold` with a `leases` collection in `workspace`: `has(name)`, `add(lease)`, `drain()` ([Detach](../../../docs/ARCHITECTURE.md#detach))
+- [x] 24.4 Tests: an FS lease whose monitor ends; an attach ended by an FS relay's `Done`; the collection's `has`, `add` and `drain`
 
 ## 25. `claude` without shell scripts
 

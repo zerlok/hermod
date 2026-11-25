@@ -55,6 +55,7 @@ type fake struct {
 	lines     []string                     // every command line run over ssh
 	written   map[string]map[string]string // the files each write put in a staging directory
 	started   map[string]workertest.Start  // what each worker was started with, by session
+	monitors  relaytest.Monitors
 }
 
 func newFake(syncs map[string]*mutagenSession, sessions map[string]*tmuxSession) *fake {
@@ -166,6 +167,9 @@ func (f *fake) onLocal(args []string) play {
 		return ok
 	}
 	verb, rest := args[2], args[3:]
+	if verb == "monitor" {
+		return f.monitor(rest)
+	}
 	var said string // what the command prints on success, as Mutagen does
 	switch verb {
 	case "list":
@@ -200,11 +204,26 @@ func (f *fake) onLocal(args []string) play {
 		case "resume":
 			f.syncs[rest[0]].paused = false
 		case "terminate":
-			delete(f.syncs, rest[0])
+			f.terminate(rest[0])
 		}
 		_, _ = fmt.Fprintln(out, said)
 		return nil
 	}
+}
+
+// monitor watches a session until its context ends or the session is
+// terminated; it changes no state, so it is not recorded.
+func (f *fake) monitor(rest []string) play {
+	return func(ctx context.Context, _ io.Reader, _, errOut io.Writer) error {
+		exists := func(name string) bool { _, ok := f.syncs[name]; return ok }
+		return f.monitors.Run(ctx, rest, &f.mu, exists, errOut, exitError(1))
+	}
+}
+
+// terminate removes the session name and ends its watches; f.mu is held.
+func (f *fake) terminate(name string) {
+	delete(f.syncs, name)
+	f.monitors.End(name)
 }
 
 func (f *fake) list(rest []string, out, errOut io.Writer) error {

@@ -1,5 +1,5 @@
-// Package relaytest reads back the listings package relay asks Mutagen for and
-// gives Mutagen's answer, for a fake Mutagen in tests. A fake keeps its own
+// Package relaytest reads back the listings and the watches package relay asks
+// Mutagen for and gives Mutagen's answer, for a fake Mutagen in tests. A fake keeps its own
 // sessions and answers from them; the fakes in relay, workspace and session
 // tests share this one copy of the listing's format. The template relay asks
 // for and what Mutagen says of a name it has no session under repeat what
@@ -8,12 +8,14 @@
 package relaytest
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"slices"
 	"strings"
+	"sync"
 )
 
 // Session is one Mutagen session as a fake keeps it.
@@ -138,4 +140,48 @@ func beta(url string, connected bool) endpoint {
 		return endpoint{Protocol: "local", Path: url, Connected: connected}
 	}
 	return endpoint{Protocol: "ssh", Host: host, Path: path, Connected: connected}
+}
+
+// Monitors plays `mutagen sync monitor` for a fake's sessions: each watch
+// runs until its context ends or the fake ends the session it watches. Its
+// watches are guarded by the lock of the fake's sessions.
+type Monitors struct {
+	watch map[string][]chan struct{}
+}
+
+// Run plays one `mutagen sync monitor`, rest the arguments after it, for a
+// fake whose sessions mu guards and exists reads. It runs until ctx ends,
+// which kills it with ctx's error, or until the session is gone or was never
+// there, which fails it with fail and Mutagen's message on errOut. The session
+// is read and the watch kept under mu, so an End of the session cannot slip
+// in between.
+func (m *Monitors) Run(ctx context.Context, rest []string, mu sync.Locker, exists func(name string) bool, errOut io.Writer, fail error) error {
+	mu.Lock()
+	if len(rest) != 1 || !exists(rest[0]) {
+		mu.Unlock()
+		_, _ = fmt.Fprintln(errOut, "Error: no matching sessions exist")
+		return fail
+	}
+	if m.watch == nil {
+		m.watch = map[string][]chan struct{}{}
+	}
+	ended := make(chan struct{})
+	m.watch[rest[0]] = append(m.watch[rest[0]], ended)
+	mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-ended:
+		_, _ = fmt.Fprintln(errOut, "Error: list failed: unable to locate requested sessions")
+		return fail
+	}
+}
+
+// End ends every watch of the session name, as Mutagen's do once the
+// session is terminated. The caller holds the lock it passes to Run.
+func (m *Monitors) End(name string) {
+	for _, ended := range m.watch[name] {
+		close(ended)
+	}
+	delete(m.watch, name)
 }

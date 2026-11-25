@@ -27,7 +27,7 @@ type subject struct {
 	relay   Relay
 	changes func() [][]string
 	state   func(t *testing.T) State
-	drop    func() // ends the remote side that serves the relay; nil for a kind with nothing serving it
+	drop    func() // ends, from outside, what the relay's lease watches
 }
 
 // droppable is a long-running process that writes text and runs until its
@@ -49,6 +49,7 @@ func droppable(text string, drop <-chan struct{}) script {
 func fsSubject(t *testing.T, locks string) subject {
 	m := newFakeMutagen(nil, "")
 	return subject{
+		drop:    func() { m.terminate(testName) },
 		relay:   NewFS(m.exec, m.exec, locks, testRoots, testName, nil, testLabels...),
 		changes: m.changes,
 		state: func(t *testing.T) State {
@@ -157,6 +158,15 @@ func TestStates(t *testing.T) {
 			{"suspend", "b", nil, Disconnected},
 			{"connect", "a", ioAttach, Connected},
 			{"release", "a", nil, Disconnected},
+		}},
+		{"FS: a session terminated elsewhere under two holders is made anew for the next lease", fsSubject, []step{
+			{"connect", "a", fsCreate, Connected},
+			{"connect", "b", nil, Connected},
+			{"drop", "a", nil, Absent},
+			{"connect", "c", fsCreate, Connected},
+			{"suspend", "a", nil, Connected},
+			{"suspend", "b", nil, Connected},
+			{"suspend", "c", fsPause, Disconnected},
 		}},
 		{"IO: a process that ended under two holders is attached anew for the next lease", ioSubject, []step{
 			{"connect", "a", ioAttach, Connected},

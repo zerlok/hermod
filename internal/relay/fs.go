@@ -34,7 +34,7 @@ func (r Roots) endpoint() string { return r.Host + ":" + r.Remote }
 
 // FS is an FS relay: a Mutagen two-way-safe session between its two ends.
 type FS struct {
-	exec   shell.Executor // changes a state; the dry-run leaf in a dry run
+	exec   shell.Executor // changes a state, or watches one a dry run only plans; the dry-run leaf in a dry run
 	probe  shell.Executor // only reads a state; always a real leaf
 	roots  Roots
 	name   string
@@ -44,8 +44,9 @@ type FS struct {
 }
 
 // NewFS is the FS relay named name between roots, carrying labels. Commands
-// that change a state run on exec and commands that read one on probe; the
-// lock files of its leases are in locks. What the Mutagen commands that
+// that change a state, and the watch a dry run must only plan, run on exec;
+// commands that read one run on probe. The lock files of its leases are in
+// locks. What the Mutagen commands that
 // change a state print goes to output as well, which may be nil.
 func NewFS(exec, probe shell.Executor, locks string, roots Roots, name string, output io.Writer, labels ...Label) *FS {
 	if output != nil {
@@ -61,7 +62,8 @@ func NewFS(exec, probe shell.Executor, locks string, roots Roots, name string, o
 // none, resumes and flushes a paused one so what each side buffered is
 // delivered before the caller works on the files, and uses a running one as it
 // is. A session found under the name with another remote end is neither
-// resumed nor used.
+// resumed nor used. Its lease's Done is closed with Mutagen's error when the
+// session disappears.
 func (f *FS) Connect(ctx context.Context) (Lease, error) { return f.leases.connect(ctx) }
 
 // Flush waits until both ends are consistent.
@@ -103,7 +105,25 @@ func (f *FS) make(ctx context.Context) error {
 	return f.Flush(ctx)
 }
 
-func (f *FS) serve(context.Context) (*serving, error) { return nil, nil }
+// serve watches the Mutagen session while the lease is held. Mutagen ends
+// `sync monitor` with an error once the session it locked on to is no longer
+// listed or its daemon cannot be reached; given a --template it watches a
+// selection instead and never ends on its own, so none is given. Its status
+// lines are of no use here and are dropped. The watch runs on exec: a dry run
+// made no session to watch, and plans the watch instead, which ends at once as
+// an IO relay's attach does there.
+func (f *FS) serve(ctx context.Context) (*serving, error) {
+	srv, ctx := newServing(ctx)
+	srv.run(func() error {
+		args := []string{"mutagen", "sync", "monitor", f.name}
+		out, err := shell.Run(ctx, f.exec, shell.Command{Args: args, Stdout: io.Discard})
+		if err := failed(args, out, err); err != nil {
+			return err
+		}
+		return ErrEnded
+	})
+	return srv, nil
+}
 
 func (f *FS) settle(ctx context.Context, how giveUp) error {
 	switch how {

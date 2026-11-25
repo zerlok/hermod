@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/zerlok/hermod/internal/relay/relaytest"
+	"github.com/zerlok/hermod/internal/shell"
 )
 
 // fakeSession is one Mutagen session as fakeMutagen keeps it.
@@ -28,6 +29,7 @@ type fakeMutagen struct {
 	sessions map[string]*fakeSession
 	failing  string
 	exec     *fakeExec
+	monitors relaytest.Monitors
 }
 
 var errFake = errors.New("exit status 1")
@@ -42,11 +44,11 @@ func newFakeMutagen(sessions map[string]*fakeSession, failing string) *fakeMutag
 }
 
 // changes is what the relay ran since the last call that changes a state:
-// every command but a listing.
+// every command but a listing and a watch.
 func (m *fakeMutagen) changes() [][]string {
 	var out [][]string
 	for _, args := range m.exec.commands() {
-		if len(args) > 2 && args[0] == "mutagen" && args[2] == "list" {
+		if len(args) > 2 && args[0] == "mutagen" && (args[2] == "list" || args[2] == "monitor") {
 			continue
 		}
 		out = append(out, args)
@@ -55,9 +57,7 @@ func (m *fakeMutagen) changes() [][]string {
 }
 
 func (m *fakeMutagen) answer(args []string) script {
-	return func(_ context.Context, _ io.Reader, out, errOut io.Writer) error {
-		m.mu.Lock()
-		defer m.mu.Unlock()
+	return func(ctx context.Context, _ io.Reader, out, errOut io.Writer) error {
 		if m.failing != "" && strings.HasPrefix(strings.Join(args, " "), m.failing) {
 			_, _ = io.WriteString(errOut, "failed as asked\n")
 			return errFake
@@ -66,6 +66,12 @@ func (m *fakeMutagen) answer(args []string) script {
 			return nil
 		}
 		verb, rest := args[2], args[3:]
+		if verb == "monitor" {
+			exists := func(name string) bool { _, ok := m.sessions[name]; return ok }
+			return m.monitors.Run(ctx, rest, &m.mu, exists, errOut, errFake)
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
 		switch verb {
 		case "list":
 			return m.list(rest, out, errOut)
@@ -78,12 +84,17 @@ func (m *fakeMutagen) answer(args []string) script {
 				}
 			}
 			m.sessions[rest[1]] = s
-		case "pause":
-			m.sessions[rest[0]].paused = true
-		case "resume":
-			m.sessions[rest[0]].paused = false
-		case "terminate":
-			delete(m.sessions, rest[0])
+		case "pause", "resume", "terminate":
+			s, ok := m.sessions[rest[0]]
+			if !ok {
+				relaytest.NotFound(errOut)
+				return errFake
+			}
+			s.paused = verb == "pause"
+			if verb == "terminate" {
+				delete(m.sessions, rest[0])
+				m.monitors.End(rest[0])
+			}
 		}
 		return nil
 	}
@@ -202,6 +213,85 @@ func TestFSConnect(t *testing.T) {
 			}
 			if l != nil {
 				_ = l.Suspend(context.Background())
+			}
+		})
+	}
+}
+
+// terminate removes the session name as a `mutagen sync terminate` run by
+// another process would.
+func (m *fakeMutagen) terminate(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sessions, name)
+	m.monitors.End(name)
+}
+
+// watches are the commands the relay ran that watch a session.
+func (m *fakeMutagen) watches() [][]string {
+	var out [][]string
+	for _, args := range m.exec.commands() {
+		if len(args) > 2 && args[0] == "mutagen" && args[2] == "monitor" {
+			out = append(out, args)
+		}
+	}
+	return out
+}
+
+func TestFSWatch(t *testing.T) {
+	watch := [][]string{{"mutagen", "sync", "monitor", testName}}
+	cases := []struct {
+		name      string
+		dryRun    bool   // the relay changes states on a dry-run executor and reads them on the fake
+		failing   string // a command that fails
+		elsewhere bool   // another process terminates the session
+		giveUp    bool   // this process gives its lease up
+		wantErr   error  // what Err is, through errors.Is; nil for an error wantMsg describes, or none
+		wantMsg   string // what Err says; "" for no message to check
+		wantWatch [][]string
+	}{
+		{name: "a session terminated elsewhere", elsewhere: true, wantMsg: "mutagen sync monitor " + testName + ": ", wantWatch: watch},
+		{name: "a watch that fails, as with no daemon", failing: "mutagen sync monitor", wantMsg: "failed as asked", wantWatch: watch},
+		{name: "a lease given up stops the watch", giveUp: true, wantWatch: watch},
+		{name: "a dry run plans the watch of the session it did not make", dryRun: true, wantErr: ErrEnded},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newFakeMutagen(map[string]*fakeSession{}, tc.failing)
+			var exec shell.Executor = m.exec
+			if tc.dryRun {
+				exec = shell.NewDryRun(io.Discard)
+			} else {
+				m.sessions[testName] = &fakeSession{local: testRoots.Local, beta: testRoots.endpoint()}
+			}
+			l, err := NewFS(exec, m.exec, t.TempDir(), testRoots, testName, nil, testLabels...).Connect(context.Background())
+			if err != nil {
+				t.Fatalf("Connect: %v", err)
+			}
+			if tc.elsewhere {
+				m.terminate(testName)
+			}
+			if tc.giveUp {
+				if err := l.Suspend(context.Background()); err != nil {
+					t.Fatalf("Suspend: %v", err)
+				}
+			}
+			<-l.Done()
+			err = l.Err()
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Errorf("Err() = %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantErr == nil && ((err != nil) != (tc.wantMsg != "") || (err != nil && !strings.Contains(err.Error(), tc.wantMsg))) {
+				t.Errorf("Err() = %v, want one saying %q", err, tc.wantMsg)
+			}
+			if got := m.watches(); !reflect.DeepEqual(got, tc.wantWatch) {
+				t.Errorf("watched with %q, want %q", got, tc.wantWatch)
+			}
+			if !tc.giveUp {
+				_ = l.Suspend(context.Background())
+			}
+			if n := m.exec.running(); n != 0 {
+				t.Errorf("%d commands still running after the lease was given up", n)
 			}
 		})
 	}
