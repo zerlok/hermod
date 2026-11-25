@@ -144,9 +144,9 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 - [x] 19.1 `session` reaches workers and relays only through `workspace`, and imports `relay` only to implement `relay.Filter`: `workspace` declares the worker key, the stdio `Form`, a worker's state, the attach streams and the errors an attach or a connect lease ends with, which `session` uses ([Concrete types](../../../docs/ARCHITECTURE.md#concrete-types)) ([Package dependencies](../../../docs/ARCHITECTURE.md#package-dependencies))
 - [x] 19.2 `cli` only wires: it builds the executors, a local and a remote `claude.Agent`, Air's serializer and `air.IsHook`, hands `agent.ACP` to the chat path only when the agent implements it, and redefines no other package's constant, such as Claude's config directory variable ([The command-line seam](../../../docs/ARCHITECTURE.md#the-command-line-seam))
 - [x] 19.3 Tests: each command's wiring through fakes
-- [ ] 19.4 Run `gofmt -l .`, `go vet ./...`, `go test ./...` and `go build ./...` on the whole module, and check that the imports match [Package dependencies](../../../docs/ARCHITECTURE.md#package-dependencies)
+- [x] 19.4 Run `gofmt -l .`, `go vet ./...`, `go test ./...` and `go build ./...` on the whole module, and check that the imports match [Package dependencies](../../../docs/ARCHITECTURE.md#package-dependencies)
 
 ## 20. Documentation
 
 - [ ] 20.1 Check README.md, docs/ARCHITECTURE.md and docs/air-integration.md against the code, each package against its [Packages](../../../docs/ARCHITECTURE.md#packages) row
-- [ ] 20.2 Run `openspec validate add-air-bridge --strict`
+- [x] 20.2 Run `openspec validate add-air-bridge --strict`

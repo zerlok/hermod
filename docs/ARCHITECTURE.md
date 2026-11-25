@@ -264,7 +264,7 @@ Two of these stores are files Hermod writes itself:
 | `cli`       | the process's interface | The only package that reads the arguments, the environment and the process's streams, and the one place every variable Hermod reads is named. Builds everything a command needs from the other adapters and hands it into the core: the agent implementation, the shells, the developer's git facts, the ACP connection and Air's own messages. Decides nothing from a state. | the commands |
 | `session`   | [Session](#session) | The only package that decides from states: what to do for a pair of agent and worker states, and where a chat's message goes. Reaches relays and workers only through `workspace` (`relay.Filter` excepted), and an agent only through `agent.Agent` and `agent.ACP`. Declares the messages it routes by what they mean to it (start the connection, list the chats, cancel a request, open, suspend or close a chat, a remote's question and the client's answer, or pass through) and the channel they arrive on, and never a wire format or a client's own method names. Keeps nothing past the process. | `Attach`, `Chat`, `ExitStatus`, `Channel`, `Message`, `Kind`, `Result` |
 | `workspace` | [Workspace](#workspace) | The only package that imports both `relay` and `worker`, and the one that names and tags them. Its state is computed on every call. | `Workspace`, `State`, `Members` |
-| `relay`     | [Relay](#relay), [Leases](#leases) | The only package that takes a lock. FS runs the `mutagen` command; Net runs `ssh -R` and a listener in this process; IO copies between local streams and a remote stdio it is handed. | `Relay`, `State`, `Lease`, `Filter`, `Ends`; a constructor for each kind |
+| `relay`     | [Relay](#relay), [Leases](#leases) | The only package that takes a lock. FS runs the `mutagen` command; Net runs `ssh -R` and a listener in this process; IO copies between local streams and a remote stdio it is handed. | `Relay`, `State`, `Lease`, `Filter`, `Roots`; a constructor for each kind |
 | `worker`    | [Worker](#worker)                                    | Lifecycle only: key, tags, state, start, close and remove, through `shell`'s tmux on the remote; builds no tmux command. Does not know what its process is. Holds the [scripts](#remote-scripts) a worker starts with. | `Worker`, `State`, `Spec`, `Form`, `Stdio`, `List`                           |
 | `agent`     | [Agent](#agent), the contract                        | Interfaces of behaviour, performed through a `shell.Executor` an agent is handed; ACP is a separate, optional one. No dependency but the foundation. | `Agent`, `ACP`, `State`, `Conversation`, `Invocation`, `Launch`, `Handshake`, `Hook`, `ErrUnknown` |
 | `claude`    | [Agent](#agent), for Claude Code | The only package that knows Claude Code's arguments, files, settings format and ACP adapter program. Runs its commands through the `shell.Executor` it is built with, and knows nothing of which workstation that reaches, of Air, ports or tokens. | `Agent` (implements `agent.Agent` and `agent.ACP`) |
@@ -317,7 +317,7 @@ flowchart TD
     cli --> claude
     cli --> workspace
     cli --> worker
-    cli --> relay
+    cli --> agent
     cli --> shell
     cli --> env
     git --> shell
@@ -341,6 +341,8 @@ flowchart TD
     workspace --> worker
     workspace --> pathmap
     workspace --> shell
+    workspace --> env
+    workspace --> secret
     relay --> shell
     worker --> shell
     worker --> env
