@@ -16,8 +16,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zerlok/hermod/internal/env"
 	"github.com/zerlok/hermod/internal/pathmap"
 	"github.com/zerlok/hermod/internal/relay"
+	"github.com/zerlok/hermod/internal/secret"
 	"github.com/zerlok/hermod/internal/shell"
 	"github.com/zerlok/hermod/internal/worker"
 )
@@ -511,15 +513,70 @@ func (w *Workspace) AddNet(ctx context.Context, port int, local string, filter r
 	return nil
 }
 
-// Start starts spec's worker as one of the workspace's: tagged with the
-// workspace, and with the origin when there is one.
-func (w *Workspace) Start(ctx context.Context, spec worker.Spec) (worker.Worker, error) {
-	tags, err := workerTags(w.name, w.local.Origin)
-	if err != nil {
-		return worker.Worker{}, err
+// Record is what a worker started on a Host is given besides its command's
+// own: files for its directory, which only its process reads, and variables
+// added to its command's.
+type Record struct {
+	Files []File
+	Vars  env.Vars
+}
+
+// File is one file of a worker's directory. Its content stays masked until
+// the worker is started with it, since a record may carry a token.
+type File struct {
+	Name    string
+	Content secret.Token
+}
+
+// Host is the workstation the worker under key runs on, as a shell.Executor:
+// each command executed on it starts that worker as one of the workspace's,
+// with its stdio in form, in the command's directory, its variables and the
+// record's files written to the worker's directory and never on a command
+// line. Its Execution ends once the worker runs; the worker's stdio is not the
+// command's, so the command's streams are left unused. record is read when the
+// command executes, so it holds what the start's own command has decided by
+// then; an error from it fails the start before anything changes.
+func (w *Workspace) Host(key worker.Key, form worker.Form, record func() (Record, error)) shell.Executor {
+	return host{w: w, key: key, form: form, record: record}
+}
+
+type host struct {
+	w      *Workspace
+	key    worker.Key
+	form   worker.Form
+	record func() (Record, error)
+}
+
+func (h host) Exec(ctx context.Context, cmd shell.Command) shell.Execution {
+	return shell.Finished(cmd, h.start(ctx, cmd))
+}
+
+func (h host) start(ctx context.Context, cmd shell.Command) error {
+	var rec Record
+	if h.record != nil {
+		var err error
+		if rec, err = h.record(); err != nil {
+			return err
+		}
 	}
-	spec.Tags = append(append([]worker.Tag(nil), spec.Tags...), tags...)
-	return worker.Start(ctx, w.workerRemote(), spec)
+	tags, err := workerTags(h.w.name, h.w.local.Origin)
+	if err != nil {
+		return err
+	}
+	files := make([]worker.File, len(rec.Files))
+	for i, f := range rec.Files {
+		files[i] = worker.File{Name: f.Name, Content: []byte(f.Content.Reveal())}
+	}
+	_, err = worker.Start(ctx, h.w.workerRemote(), worker.Spec{
+		Key:     h.key,
+		Dir:     cmd.Dir,
+		Command: cmd.Args,
+		Files:   files,
+		Vars:    cmd.Env.With(rec.Vars.Pairs()...),
+		Tags:    tags,
+		Form:    h.form,
+	})
+	return err
 }
 
 // Attach connects the workspace's relays and the IO relay between the
@@ -686,11 +743,10 @@ func (w *Workspace) Detach(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// Look reads in one call the state of the worker under key, the named files of
-// its directory and the output of cmd run on the remote beside them, so a
-// decision on the worker's and an agent's states reads both at one moment.
-func (w *Workspace) Look(ctx context.Context, key worker.Key, cmd []string, files ...string) (worker.Look, error) {
-	return worker.New(w.workerRemote(), key).Look(ctx, cmd, files...)
+// Look reads in one call the state of the worker under key and the named
+// files of its directory.
+func (w *Workspace) Look(ctx context.Context, key worker.Key, files ...string) (worker.Look, error) {
+	return worker.New(w.workerRemote(), key).Look(ctx, nil, files...)
 }
 
 // FreePort picks the first of candidates free on the remote and recorded in no

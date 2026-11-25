@@ -9,11 +9,9 @@ import (
 	"maps"
 	"path"
 	"slices"
-	"strings"
 	"sync"
 
 	"github.com/zerlok/hermod/internal/agent"
-	"github.com/zerlok/hermod/internal/shell"
 	"github.com/zerlok/hermod/internal/workspace"
 )
 
@@ -36,7 +34,11 @@ type AttachFunc func(ctx context.Context, dir Path) (Attachment, error)
 // ChatRequest is one chat client's connection, as the command line built it.
 type ChatRequest struct {
 	Client Channel
-	Agent  agent.Agent
+	// Agent answers for the remote where a chat belongs and which chats a
+	// directory has.
+	Agent agent.Agent
+	// ACP answers the client's connection start.
+	ACP    agent.ACP
 	Remote workspace.Remote
 	Local  workspace.Local
 	Attach AttachFunc
@@ -114,7 +116,7 @@ func newRouter(running context.Context, req ChatRequest) *router {
 	r.deps = sessionDeps{
 		client: req.Client,
 		agent:  req.Agent,
-		query:  r.query,
+		acp:    req.ACP,
 		log:    logger,
 		shared: &shared{owners: map[ChatID]Path{}, requests: newRequests()},
 	}
@@ -140,7 +142,7 @@ func (r *router) fromClient(ctx context.Context, msg Message) error {
 	switch msg.Kind() {
 	case Connect:
 		r.connect = msg.WithoutClientCapabilities()
-		return r.req.Client.Send(msg.Reply(HandshakeResult{Handshake: r.req.Agent.Connect()}))
+		return r.req.Client.Send(msg.Reply(HandshakeResult{Handshake: r.req.ACP.Connect()}))
 
 	case List:
 		return r.req.Client.Send(r.list(ctx, msg))
@@ -241,19 +243,11 @@ func (r *router) fail(msg Message, err error) error {
 
 // locate asks the agent program where a chat belongs.
 func (r *router) locate(ctx context.Context, chat ChatID) (agent.Conversation, error) {
-	lookup := r.req.Agent.Locate(string(chat))
-	out, err := r.query(ctx, lookup.Command())
-	if err != nil {
-		return agent.Conversation{}, err
-	}
-	conv, found, err := lookup.Read(out)
-	if err != nil {
-		return agent.Conversation{}, err
-	}
-	if !found {
+	conv, err := r.req.Agent.Lookup(ctx, string(chat))
+	if errors.Is(err, agent.ErrUnknown) {
 		return agent.Conversation{}, fmt.Errorf("hermod: the agent program on %s has no chat %q", r.req.Remote.Host, chat)
 	}
-	return conv, nil
+	return conv, err
 }
 
 // list answers a List with the conversations of exactly the directory asked:
@@ -270,12 +264,7 @@ func (r *router) list(ctx context.Context, msg Message) Message {
 		return msg.Fail(err)
 	}
 	remoteDir := path.Clean(paths.ToRemote(dir))
-	listing := r.req.Agent.List(remoteDir)
-	out, err := r.query(ctx, listing.Command())
-	if err != nil {
-		return msg.Fail(err)
-	}
-	found, err := listing.Read(out)
+	found, err := r.req.Agent.List(ctx, remoteDir)
 	if err != nil {
 		return msg.Fail(err)
 	}
@@ -385,18 +374,4 @@ func (r *router) forward(dir Path, s *SessionControl, adapter Channel) {
 			return
 		}
 	}
-}
-
-// query runs a command of the agent's on the remote, under the remote user's
-// login shell where the agent program is found.
-func (r *router) query(ctx context.Context, cmd []string) ([]byte, error) {
-	ex := shell.NewLogin(shell.NewSSH(r.req.Remote.Read, r.req.Remote.Host))
-	out, err := shell.Run(ctx, ex, shell.Command{Args: cmd})
-	if err != nil {
-		if detail := strings.TrimSpace(out.Stderr); detail != "" {
-			err = fmt.Errorf("%w: %s", err, detail)
-		}
-		return nil, fmt.Errorf("run %q on %s: %w", cmd, r.req.Remote.Host, err)
-	}
-	return []byte(out.Stdout), nil
 }

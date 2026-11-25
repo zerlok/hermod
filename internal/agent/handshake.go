@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 )
 
 // Handshake is the answer to a client's connection start: the protocol
@@ -20,7 +21,7 @@ func NewHandshake(version int, capabilities []byte) (Handshake, error) {
 	if err := json.Unmarshal(capabilities, &object); err != nil || object == nil {
 		return Handshake{}, fmt.Errorf("agent: capabilities are not a JSON object: %q", capabilities)
 	}
-	return Handshake{version: version, capabilities: clone(capabilities)}, nil
+	return Handshake{version: version, capabilities: slices.Clone(capabilities)}, nil
 }
 
 // Version is the protocol version.
@@ -32,7 +33,7 @@ func (h Handshake) Capabilities() json.RawMessage {
 	if h.capabilities == nil {
 		return json.RawMessage(noCapabilities)
 	}
-	return clone(h.capabilities)
+	return slices.Clone(h.capabilities)
 }
 
 const noCapabilities = `{}`

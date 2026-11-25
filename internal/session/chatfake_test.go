@@ -177,7 +177,8 @@ func mustHandshake(version int, caps string) agent.Handshake {
 func (e *chatEnv) request() ChatRequest {
 	return ChatRequest{
 		Client: e.client,
-		Agent:  fakeAgent{handshake: testHandshake},
+		Agent:  fakeAgent{f: e.f},
+		ACP:    fakeAgent{f: e.f, handshake: testHandshake},
 		Remote: e.f.remote(),
 		Local:  e.local,
 		Attach: e.attach,

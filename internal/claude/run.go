@@ -1,7 +1,7 @@
 package claude
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"path"
 	"strconv"
@@ -11,6 +11,7 @@ import (
 	"github.com/zerlok/hermod/internal/env"
 	"github.com/zerlok/hermod/internal/pathmap"
 	"github.com/zerlok/hermod/internal/secret"
+	"github.com/zerlok/hermod/internal/shell"
 )
 
 // The files a conversation's worker is given in its directory.
@@ -19,41 +20,23 @@ const (
 	mcpPrefix    = "mcp-" // followed by the value's position and ".json"
 )
 
+// fileVarPrefix, followed by a file's position, is the variable that carries
+// one file's contents to the start command, which writes it into the worker's
+// directory: a variable reaches where the start runs in the worker's env file,
+// never on a command line.
+const fileVarPrefix = "HERMOD_CLAUDE_FILE_"
+
 // The variables of Claude's own that Hermod leaves out or reads.
 const (
 	envConfigDir  = "CLAUDE_CONFIG_DIR"
 	envExecutable = "CLAUDE_CODE_EXECUTABLE"
 )
 
-// EnvConfigDir is the variable that names Claude's config directory, where
-// Claude keeps a workstation's transcripts.
-const EnvConfigDir = envConfigDir
-
-// configDirUnderHome is Claude's config directory when EnvConfigDir is unset.
-const configDirUnderHome = ".claude"
-
-// ConfigDir is the config directory Claude uses on a workstation, given the
-// value of EnvConfigDir there and the user's home: the value when it is set,
-// else the default under the home.
-func ConfigDir(value, home string) string {
-	if value != "" {
-		return value
-	}
-	return path.Join(home, configDirUnderHome)
-}
-
-// ConfigDirCommand prints the config directory Claude uses on the workstation
-// it runs on, as ConfigDir decides it in the environment it runs in, followed
-// by a newline.
-func ConfigDirCommand() []string {
-	return []string{"sh", "-c", `printf '%s\n' "${` + envConfigDir + `:-$HOME/` + configDirUnderHome + `}"`}
-}
-
-// localOnlyEnv are the variables of Claude's own that belong to this machine
-// or to one process on it, so on the remote they would point at nothing, or at
-// the wrong thing:
+// localOnlyEnv are the variables of Claude's own that belong to the caller's
+// workstation or to one process on it, so where the start runs they would
+// point at nothing, or at the wrong thing:
 //
-//   - the executable Hermod stands in for and the local config directory;
+//   - the executable Hermod stands in for and the caller's config directory;
 //   - what a running Claude sets for the programs it starts (its executable
 //     path, PID, session, messaging socket and token, IDE port, project
 //     directory and hook env file), present when Hermod itself runs under a
@@ -88,85 +71,76 @@ func declared(key string) bool {
 	return strings.HasPrefix(key, "CLAUDE_") || strings.HasPrefix(key, "ANTHROPIC_") || key == "MAX_THINKING_TOKENS"
 }
 
-// Run is what Claude needs on the remote for a call of its own.
+// Start runs the conversation the Launch's arguments name through ex.
 //
-// A conversation's command is the caller's argv with every local path mapped,
-// run by `claude` found on the remote's PATH, with no `--name` added:
-// Claude's session name is what the user sees. The documents `--settings` and
-// `--mcp-config` name, files or inline JSON, are given to the worker as files
-// in its directory, their paths mapped, and the options name those files, so
-// a credential in them stays off the command line. The settings also lose
-// their hooks to a loopback endpoint other than Air's, which nothing on the
-// remote could reach; those are declared as dropped. The conversation's transcripts directory is a place, so a
-// conversation that exists only locally is on the remote before Claude
-// resumes it, and the remote's appear locally.
-//
-// A one-shot call runs with its paths mapped and no worker's directory.
-func (a Agent) Run(call agent.Call, paths pathmap.Map) (agent.Needs, error) {
-	args := call.Args()
-	_, conversation := call.ID()
-	switch {
-	case call.OneShot():
-		return agent.NewNeeds(append([]string{"claude"}, mapWords(args[1:], paths)...)).WithVars(declared), nil
-	case !conversation:
+// The command is the caller's argv with every local path mapped, run by
+// `claude` found on PATH where ex runs it, with no `--name` added: Claude's
+// session name is what the user sees. The documents `--settings` and
+// `--mcp-config` name, files or inline JSON, are carried as variables, their
+// paths mapped, and the start command writes them into the worker's directory
+// and names those files in the options, so a credential in them stays off the
+// command line. The settings' hooks are rewritten by the Launch's function
+// first. Only the variables Claude declares are taken from the caller's.
+func (a Agent) Start(ctx context.Context, ex shell.Executor, l agent.Launch) error {
+	if invocation, _ := a.Classify(l.Args); invocation != agent.InvokesConversation {
 		// The arguments are not named: an inline document may hold a credential.
-		return agent.Needs{}, errors.New("claude: the call is not one Claude runs")
+		return fmt.Errorf("claude: the arguments are a %s, not a conversation Claude runs", invocation)
 	}
-	place, err := a.transcripts(paths)
-	if err != nil {
-		return agent.Needs{}, err
+	if !path.IsAbs(l.Dir) {
+		return fmt.Errorf("claude: directory %q is not absolute", l.Dir)
 	}
-	r := rewriter{agent: a, paths: paths}
-	if err := r.rewrite(args[1:]); err != nil {
-		return agent.Needs{}, err
-	}
-	needs := agent.NewNeeds(r.command()).WithVars(declared).WithPlace(place)
-	for _, f := range r.files {
-		needs = needs.WithFile(f.name, f.content)
+	r := rewriter{agent: a, dir: l.Dir, paths: l.Paths}
+	if err := r.rewrite(l.Args[1:]); err != nil {
+		return err
 	}
 	if !r.settings.IsZero() {
-		document, cb, hooked, dropped, err := carry(r.settings)
-		switch {
-		case err != nil:
-			return agent.Needs{}, err
-		case hooked:
-			needs = needs.WithHookedSettings(settingsFile, document, cb)
-		default:
-			needs = needs.WithSettings(settingsFile, document)
+		doc, err := rewriteHooks(r.settings, l.Hook)
+		if err != nil {
+			return err
 		}
-		needs = needs.WithDroppedHooks(dropped...)
+		r.settings = doc
 	}
-	return needs, nil
+	args, files := r.command()
+	return run(ctx, ex, shell.Command{
+		Args: args,
+		Dir:  l.Paths.ToRemote(path.Clean(l.Dir)),
+		Env:  l.Environ.Select(declared).With(files...),
+	})
 }
 
-// adapterScript runs claude-agent-acp with the claude found on the remote's
-// PATH: the adapter is installed without the Claude it would otherwise bundle,
-// and the caller's own CLAUDE_CODE_EXECUTABLE names a local path that is never
-// carried.
+// adapterScript runs claude-agent-acp with the claude found on PATH: the
+// adapter is installed without the Claude it would otherwise bundle, and the
+// caller's own CLAUDE_CODE_EXECUTABLE names a path of the caller's that is
+// never carried.
 const adapterScript = `CLAUDE_CODE_EXECUTABLE=${CLAUDE_CODE_EXECUTABLE:-$(command -v claude)}
 export CLAUDE_CODE_EXECUTABLE
 exec claude-agent-acp`
 
-// Adapter is what claude-agent-acp needs on the remote. It reads the
-// remote's transcripts where they are, so it needs no place, and a chat's
-// settings come over ACP, so it needs no file.
-func (Agent) Adapter(pathmap.Map) (agent.Needs, error) {
-	return agent.NewNeeds([]string{"sh", "-c", adapterScript, "claude-agent-acp"}).WithVars(declared), nil
+// Adapter runs claude-agent-acp through ex in the Launch's directory, mapped.
+// It reads the transcripts where Claude keeps them there, and a chat's
+// settings come over ACP, so it is given no file.
+func (Agent) Adapter(ctx context.Context, ex shell.Executor, l agent.Launch) error {
+	if !path.IsAbs(l.Dir) {
+		return fmt.Errorf("claude: directory %q is not absolute", l.Dir)
+	}
+	return run(ctx, ex, shell.Command{
+		Args: []string{"sh", "-c", adapterScript, "claude-agent-acp"},
+		Dir:  l.Paths.ToRemote(path.Clean(l.Dir)),
+		Env:  l.Environ.Select(declared),
+	})
 }
 
-// transcripts is the place that joins the local directory where Claude keeps
-// the conversations of cfg.Dir to the one where Claude on the remote keeps
-// those of its mapped directory.
-func (a Agent) transcripts(paths pathmap.Map) (pathmap.Place, error) {
-	for _, dir := range []string{a.cfg.Dir, a.cfg.ConfigDir, a.cfg.RemoteConfigDir} {
-		if !path.IsAbs(dir) {
-			return pathmap.Place{}, fmt.Errorf("claude: directory %q is not absolute", dir)
+// run executes a start command through ex to its end, with no input: the
+// started program's stdin is not the start command's.
+func run(ctx context.Context, ex shell.Executor, cmd shell.Command) error {
+	out, err := shell.Run(ctx, ex, cmd)
+	if err != nil {
+		if detail := strings.TrimSpace(out.Stderr); detail != "" {
+			err = fmt.Errorf("%w: %s", err, detail)
 		}
+		return fmt.Errorf("claude: start: %w", err)
 	}
-	return pathmap.Place{
-		Local:  transcriptDir(a.cfg.ConfigDir, a.cfg.Dir),
-		Remote: transcriptDir(a.cfg.RemoteConfigDir, paths.ToRemote(path.Clean(a.cfg.Dir))),
-	}, nil
+	return nil
 }
 
 // projectDirName is the name Claude gives a directory under
@@ -189,8 +163,9 @@ func transcriptDir(configDir, dir string) string {
 	return path.Join(configDir, "projects", projectDirName(dir))
 }
 
-// word is one argument of the command on the remote: the caller's, mapped, or
-// the path of a file in the worker's directory, which only the remote knows.
+// word is one argument of the start command: the caller's, mapped, or the path
+// of a file in the worker's directory, which only the command itself knows
+// where it runs.
 type word struct {
 	text string
 	file bool
@@ -201,9 +176,10 @@ type file struct {
 	content secret.Token
 }
 
-// rewriter carries a conversation's arguments to the remote.
+// rewriter carries a conversation's arguments to where it runs.
 type rewriter struct {
 	agent    Agent
+	dir      string // the caller's directory, which a relative file is under
 	paths    pathmap.Map
 	words    []word
 	files    []file
@@ -278,7 +254,7 @@ func (r *rewriter) document(option, value string) (secret.Token, error) {
 		}
 		name := value
 		if !path.IsAbs(name) {
-			name = path.Join(r.agent.cfg.Dir, name)
+			name = path.Join(r.dir, name)
 		}
 		read, err := r.agent.cfg.ReadFile(name)
 		if err != nil {
@@ -302,34 +278,46 @@ func describe(value string) string {
 	return value
 }
 
-// command is the command that runs Claude on the remote. Without files it is
-// Claude's argv itself. A file's path is known only to the worker, so then a
-// shell joins each to the variable that holds the worker's directory; the
+// command is the command that runs Claude, and the variables that carry its
+// files. Without files it is Claude's argv itself. A file's path is known only
+// where the worker runs, so then a shell first writes each file from its
+// variable into the directory env.WorkerDir names, private to the user, and
+// unsets the variable, so Claude's own environment does not hold it; the
 // caller's words reach Claude as the shell's positional parameters, so none of
 // them is ever read as shell text.
-func (r *rewriter) command() []string {
-	hasFile := false
-	for _, w := range r.words {
-		hasFile = hasFile || w.file
+func (r *rewriter) command() ([]string, []env.Pair) {
+	files := r.files
+	if !r.settings.IsZero() {
+		files = append([]file{{name: settingsFile, content: r.settings}}, files...)
 	}
-	if !hasFile {
+	if len(files) == 0 {
 		out := []string{"claude"}
 		for _, w := range r.words {
 			out = append(out, w.text)
 		}
-		return out
+		return out, nil
 	}
-	script := []string{"exec claude"}
+	script := []string{`d="${` + env.WorkerDir + `:?}"`, "umask 077"}
+	vars := make([]env.Pair, 0, len(files))
+	for i, f := range files {
+		name := fileVarPrefix + strconv.Itoa(i+1)
+		script = append(script,
+			`printf '%s' "$`+name+`" >"$d/`+f.name+`" || exit`,
+			"unset "+name)
+		vars = append(vars, env.Pair{Key: name, Value: env.Secret(f.content)})
+	}
+	exec := []string{"exec claude"}
 	var params []string
 	for _, w := range r.words {
 		if w.file {
-			script = append(script, `"${`+env.WorkerDir+`:?}/`+w.text+`"`)
+			exec = append(exec, `"$d/`+w.text+`"`)
 			continue
 		}
 		params = append(params, w.text)
-		script = append(script, `"${`+strconv.Itoa(len(params))+`}"`)
+		exec = append(exec, `"${`+strconv.Itoa(len(params))+`}"`)
 	}
-	return append([]string{"sh", "-c", strings.Join(script, " "), "claude"}, params...)
+	script = append(script, strings.Join(exec, " "))
+	return append([]string{"sh", "-c", strings.Join(script, "\n"), "claude"}, params...), vars
 }
 
 // isInline reports whether an option's value is a JSON document rather than a

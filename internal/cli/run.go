@@ -22,10 +22,6 @@ import (
 	"github.com/zerlok/hermod/internal/workspace"
 )
 
-// envClaudeConfigDir is Claude's local config directory, where Claude keeps
-// this workstation's transcripts; ~/.claude when unset.
-const envClaudeConfigDir = claude.EnvConfigDir
-
 // attachIntent is one attach, as its command line resolved it.
 type attachIntent struct {
 	remote   string
@@ -79,7 +75,7 @@ func (a app) runAttach(ctx context.Context, in attachIntent, out attachOutput) e
 	if in.dryRun {
 		exec, setup = a.dryRun(out.plan), nil
 	}
-	remote, configDir, err := a.readRemote(ctx, in.remote, exec)
+	remote, err := a.readRemote(ctx, in.remote, exec)
 	if err != nil {
 		return err
 	}
@@ -89,18 +85,20 @@ func (a app) runAttach(ctx context.Context, in attachIntent, out attachOutput) e
 		tree = workspace.Worktree{Main: main, Root: root}
 	}
 	return a.attach(ctx, session.Request{
-		Remote:   remote,
-		Local:    a.workspaceLocal(l.home, setup),
-		Dir:      dir,
-		Tree:     tree,
-		Agent:    a.agent(dir, l.home, configDir),
-		Args:     in.args,
-		Name:     name,
-		Forwards: in.forwards,
-		Environ:  env.Environ(a.environ()),
-		Identity: session.Identity{Name: identity.Name, Email: identity.Email},
-		Streams:  relay.Streams{In: a.stdin, Out: a.stdout, Err: a.stderr},
-		Log:      log.New(out.logs, "", 0),
+		Remote:     remote,
+		Local:      a.workspaceLocal(l.home, setup),
+		Dir:        dir,
+		Tree:       tree,
+		Agent:      a.remoteAgent(in.remote),
+		LocalAgent: a.localAgent(),
+		IsHook:     air.IsHook,
+		Args:       in.args,
+		Name:       name,
+		Forwards:   in.forwards,
+		Environ:    env.Environ(a.environ()),
+		Identity:   session.Identity{Name: identity.Name, Email: identity.Email},
+		Streams:    relay.Streams{In: a.stdin, Out: a.stdout, Err: a.stderr},
+		Log:        log.New(out.logs, "", 0),
 	})
 }
 
@@ -111,12 +109,12 @@ func (a app) runChat(ctx context.Context, host string) error {
 	if err != nil {
 		return err
 	}
-	remote, configDir, err := a.readRemote(ctx, host, a.local)
+	remote, err := a.readRemote(ctx, host, a.local)
 	if err != nil {
 		return err
 	}
 	logger := log.New(a.stderr, "", 0)
-	ag := a.agent(l.cwd, l.home, configDir)
+	ag := a.remoteAgent(host)
 	adapters := session.Adapters{
 		Remote:  remote,
 		Local:   a.workspaceLocal(l.home, nil),
@@ -140,6 +138,7 @@ func (a app) runChat(ctx context.Context, host string) error {
 	return a.chat(ctx, session.ChatRequest{
 		Client: client,
 		Agent:  ag,
+		ACP:    ag,
 		Remote: remote,
 		Local:  adapters.Local,
 		Attach: adapters.Attach,
@@ -219,15 +218,23 @@ func (a app) runConfigure(in configureIntent, out io.Writer) error {
 	return nil
 }
 
-// agent is Claude's contract for a session in dir.
-func (a app) agent(dir, home, remoteConfigDir string) claude.Agent {
-	value, _ := a.lookupEnv(envClaudeConfigDir)
-	return claude.New(claude.Config{
-		Dir:             dir,
-		ConfigDir:       claude.ConfigDir(value, home),
-		RemoteConfigDir: remoteConfigDir,
-		ReadFile:        a.readFile,
-	})
+// remoteReader runs the commands that read the remote host's state, under the
+// remote user's login shell, where a profile sets the home and puts Claude on
+// PATH. They only read, so they run in a dry run too; the remote's commands
+// that change a state run on the executor the command line chose.
+func (a app) remoteReader(host string) shell.Executor {
+	return shell.NewLogin(shell.NewSSH(a.local, host))
+}
+
+// remoteAgent is Claude answering for the remote host, asked through the
+// remote's reader.
+func (a app) remoteAgent(host string) claude.Agent {
+	return claude.New(claude.Config{Exec: a.remoteReader(host), ReadFile: a.readFile})
+}
+
+// localAgent is Claude answering for this workstation.
+func (a app) localAgent() claude.Agent {
+	return claude.New(claude.Config{Exec: a.local, ReadFile: a.readFile})
 }
 
 // workspaceLocal is this workstation as a workspace needs it, its FS relays
@@ -241,31 +248,25 @@ func (a app) workspaceLocal(home string, setup io.Writer) workspace.Local {
 	}
 }
 
-// remoteHome prints the remote user's home and then runs its arguments.
-const remoteHome = `printf '%s\n' "$HOME"; exec "$@"`
+// remoteHome prints the remote user's home.
+const remoteHome = `printf '%s\n' "$HOME"`
 
-// readRemote reads, in one call on the remote under its user's login shell
-// where a profile sets them, the user's home and Claude's config directory
-// there. It only reads, so it runs in a dry run too. The remote's commands
-// that change a state run on exec.
-func (a app) readRemote(ctx context.Context, host string, exec shell.Executor) (workspace.Remote, string, error) {
-	cmd := append([]string{"sh", "-c", remoteHome, "sh"}, claude.ConfigDirCommand()...)
-	out, err := shell.Run(ctx, shell.NewLogin(shell.NewSSH(a.local, host)), shell.Command{Args: cmd})
+// readRemote reads the remote user's home through the remote's reader. The
+// remote's commands that change a state run on exec.
+func (a app) readRemote(ctx context.Context, host string, exec shell.Executor) (workspace.Remote, error) {
+	out, err := shell.Run(ctx, a.remoteReader(host), shell.Command{Args: []string{"sh", "-c", remoteHome}})
 	if err != nil {
 		if detail := strings.TrimSpace(out.Stderr); detail != "" {
 			err = fmt.Errorf("%w: %s", err, detail)
 		}
-		return workspace.Remote{}, "", fmt.Errorf("read the home on %s: %w", host, err)
+		return workspace.Remote{}, fmt.Errorf("read the home on %s: %w", host, err)
 	}
 	// A login profile may print lines of its own first, so the answer is the
-	// last two.
+	// last line.
 	lines := strings.Split(strings.TrimSuffix(out.Stdout, "\n"), "\n")
-	if len(lines) < 2 {
-		return workspace.Remote{}, "", fmt.Errorf("read the home on %s: unexpected answer %q", host, out.Stdout)
+	home := lines[len(lines)-1]
+	if !path.IsAbs(home) {
+		return workspace.Remote{}, fmt.Errorf("read the home on %s: unexpected answer %q", host, out.Stdout)
 	}
-	home, configDir := lines[len(lines)-2], lines[len(lines)-1]
-	if !path.IsAbs(home) || !path.IsAbs(configDir) {
-		return workspace.Remote{}, "", fmt.Errorf("read the home on %s: unexpected answer %q", host, out.Stdout)
-	}
-	return workspace.Remote{Host: host, Home: home, Exec: exec, Read: a.local}, configDir, nil
+	return workspace.Remote{Host: host, Home: home, Exec: exec, Read: a.local}, nil
 }

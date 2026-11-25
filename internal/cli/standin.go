@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/claude"
 )
 
@@ -30,9 +31,10 @@ func (a app) standIn(ctx context.Context, claudeArgs []string) (err error) {
 		return err
 	}
 	args := append([]string{standInName}, claudeArgs...)
-	// Parsing reads only the arguments, so a contract for no workstation does.
-	call := claude.New(claude.Config{}).Parse(args)
-	if !call.OneShot() && !a.terminal() {
+	// Classifying reads only the arguments, so Claude built for no
+	// workstation does.
+	invocation, id := claude.New(claude.Config{}).Classify(args)
+	if invocation != agent.InvokesOneShot && !a.terminal() {
 		return errors.New("a conversation runs on a terminal only; a program holds one through `hermod air acp " + agentClaude + "`")
 	}
 	l, err := a.readLocal()
@@ -40,7 +42,7 @@ func (a app) standIn(ctx context.Context, claudeArgs []string) (err error) {
 		return err
 	}
 	key := workerName(l.cwd, l.home)
-	if id, ok := call.ID(); ok {
+	if invocation == agent.InvokesConversation {
 		key = id
 	}
 	own, finish := a.sessionLog(filepath.Join(logDir(l.home, a.lookupEnv), key+".log"))

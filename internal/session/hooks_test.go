@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/pathmap"
 	"github.com/zerlok/hermod/internal/relay"
 	"github.com/zerlok/hermod/internal/secret"
@@ -85,6 +86,52 @@ func TestHookFilter(t *testing.T) {
 			}
 			if answer := string(got.Answer([]byte(tc.answer))); answer != tc.wantAnswer {
 				t.Errorf("answer %s, want %s", answer, tc.wantAnswer)
+			}
+		})
+	}
+}
+
+// TestAimerPicksOnce checks that the worker's port and token are asked for
+// once however many hooks go to the client, and that after a failed pick no
+// hook is aimed and the record fails with that pick's error.
+func TestAimerPicksOnce(t *testing.T) {
+	errPick := errors.New("no free port")
+	client := endpoint{address: "127.0.0.1:1", authorization: airHook.Headers["Authorization"]}
+	cases := []struct {
+		name      string
+		pickErr   error
+		hooks     []agent.Hook
+		wantPicks int
+		wantAimed []bool
+		wantErr   error
+	}{
+		{"picked once for every hook to the client", nil, []agent.Hook{airHook, airOther, airHook}, 1, []bool{true, true, true}, nil},
+		{"a failed pick aims no later hook", errPick, []agent.Hook{airHook, airOther, airHook}, 1, []bool{false, false, false}, errPick},
+		{"no hook to the client picks nothing", nil, []agent.Hook{webHook}, 0, []bool{true}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			picks := 0
+			a := newAimer(Request{}, &client, func() (workerHook, error) {
+				picks++
+				if tc.pickErr != nil {
+					return workerHook{}, tc.pickErr
+				}
+				return workerHook{port: 10000, token: secret.FromString(zeros)}, nil
+			})
+			var aimed []bool
+			for _, h := range tc.hooks {
+				_, ok := a.aim(h)
+				aimed = append(aimed, ok)
+			}
+			if picks != tc.wantPicks {
+				t.Errorf("picked %d times, want %d", picks, tc.wantPicks)
+			}
+			if !reflect.DeepEqual(aimed, tc.wantAimed) {
+				t.Errorf("aimed %v, want %v", aimed, tc.wantAimed)
+			}
+			if _, err := a.record(); !errors.Is(err, tc.wantErr) {
+				t.Errorf("record() error = %v, want %v", err, tc.wantErr)
 			}
 		})
 	}

@@ -33,7 +33,7 @@ func (a action) String() string {
 // Hermod's runs it: a start would run a second copy of it.
 var ErrRunsOutside = errors.New("session: the conversation runs outside Hermod; end it there first")
 
-// states are the two states a session decides from, read at one moment.
+// states are the two states a session decides from.
 type states struct {
 	worker    worker.State
 	runsAgent bool        // the worker runs one agent's conversation

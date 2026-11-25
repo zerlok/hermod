@@ -1,9 +1,9 @@
-// Package claude is Claude Code's contract as an agent.Agent: which call an
-// argv asks for, what running it or Claude's ACP adapter needs on the remote,
-// how to ask Claude which conversations exist and which run, and how its hook
-// settings are aimed at a worker's port. It follows Claude's command line and
-// files and changes when they do; it runs no command, and reads a local file
-// only through the reader it is handed.
+// Package claude is Claude Code as an agent.Agent and an agent.ACP: which
+// call an argv asks for, how Claude lists and runs its conversations and its
+// ACP adapter, and how its settings carry hooks. It follows Claude's command
+// line, files and settings format and changes when they do. It runs every
+// command through the shell.Executor it is built with, or the one it is handed
+// for a start, and knows nothing of which workstation that reaches.
 package claude
 
 import (
@@ -13,24 +13,16 @@ import (
 	"strings"
 
 	"github.com/zerlok/hermod/internal/agent"
+	"github.com/zerlok/hermod/internal/shell"
 )
 
-// Config is what Claude's contract needs to know of the workstations.
+// Config is what Claude is built with.
 type Config struct {
-	// Dir is the local directory a conversation run on a terminal works in,
-	// absolute: Claude names its transcripts' directory after it, and a
-	// relative path in the arguments is relative to it.
-	Dir string
-	// ConfigDir is Claude's local config directory, absolute.
-	ConfigDir string
-	// RemoteConfigDir is Claude's config directory on the remote, absolute:
-	// the one Claude there uses, `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` in the
-	// remote's environment. The transcripts' place and the asking for
-	// conversations both use it, so a conversation listed is one the relay
-	// keeps.
-	RemoteConfigDir string
-	// ReadFile reads a local file that `--settings` or `--mcp-config` names,
-	// whose contents the worker is given in place of the path.
+	// Exec runs the commands that ask Claude about its conversations and its
+	// config directory, on the workstation this Agent answers for.
+	Exec shell.Executor
+	// ReadFile reads a file of the caller's that `--settings` or `--mcp-config`
+	// names, whose contents the conversation is given in place of the path.
 	ReadFile func(name string) ([]byte, error)
 }
 
@@ -39,9 +31,12 @@ type Agent struct {
 	cfg Config
 }
 
-var _ agent.Agent = Agent{}
+var (
+	_ agent.Agent = Agent{}
+	_ agent.ACP   = Agent{}
+)
 
-// New is Claude's contract for the workstations cfg describes.
+// New is Claude as cfg builds it.
 func New(cfg Config) Agent { return Agent{cfg: cfg} }
 
 // oneShotSubcommands are Claude's subcommands. Each runs to completion without
@@ -54,8 +49,8 @@ var oneShotSubcommands = map[string]bool{
 	"kill": true, "ultrareview": true, "update": true, "upgrade": true,
 }
 
-// Parse reads a command's argv. A command is Claude's when its program's base
-// name is `claude`; any other command is not the agent's.
+// Classify reads a command's argv. A command is Claude's when its program's
+// base name is `claude`; any other command is not the agent's.
 //
 //   - A subcommand, `--version` or `--help`, or `-p` with no conversation is a
 //     one-shot call. Claude reads a subcommand only as its first argument, so a
@@ -67,24 +62,22 @@ var oneShotSubcommands = map[string]bool{
 //     UUID known in advance.
 //   - Anything else, including `--resume` with no UUID (Claude's own picker),
 //     runs as given.
-func (Agent) Parse(argv []string) agent.Call {
+func (Agent) Classify(argv []string) (agent.Invocation, string) {
 	if len(argv) == 0 || path.Base(argv[0]) != "claude" {
-		return agent.NewCommand(argv)
+		return agent.InvokesCommand, ""
 	}
 	a := scan(argv[1:])
 	id := a.key()
 	switch {
 	case a.subcommand || a.info || (a.print && id == ""):
-		return agent.NewOneShot(argv)
+		return agent.InvokesOneShot, ""
 	case id != "":
-		// The ID is a parsed UUID, never empty here, so the call is built.
-		call, _ := agent.NewConversation(id, argv)
-		return call
+		return agent.InvokesConversation, id
 	}
-	return agent.NewCommand(argv)
+	return agent.InvokesCommand, ""
 }
 
-// args is what Parse needs from Claude's arguments.
+// args is what Classify needs from Claude's arguments.
 type args struct {
 	subcommand bool
 	info       bool // --version or --help: Claude prints and exits
@@ -172,8 +165,7 @@ func splitOption(word string) (name, value string, inline bool) {
 }
 
 // isSessionID accepts a UUID in its canonical 8-4-4-4-12 hexadecimal form,
-// the only form Claude stores a conversation under. Only such an ID is safe as
-// a file name and a tmux session name.
+// the only form Claude stores a conversation under, and safe as a file name.
 func isSessionID(s string) bool {
 	if len(s) != 36 {
 		return false
@@ -195,24 +187,6 @@ func isSessionID(s string) bool {
 
 func isHex(r rune) bool {
 	return (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
-}
-
-// agentsCommand lists the conversations Claude runs, each with its directory.
-var agentsCommand = []string{"claude", "agents", "--json"}
-
-// Probe asks `claude agents --json`, which lists exactly the conversations
-// Claude runs.
-func (Agent) Probe(id string) agent.Probe {
-	return agent.NewProbe(id, agentsCommand, func(out []byte) (agent.State, error) {
-		running, err := readAgents(out)
-		if err != nil {
-			return agent.Stopped, err
-		}
-		if _, ok := running[strings.ToLower(id)]; ok {
-			return agent.Running, nil
-		}
-		return agent.Stopped, nil
-	})
 }
 
 // running is one entry of `claude agents --json`.

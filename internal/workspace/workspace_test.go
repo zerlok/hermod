@@ -8,10 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zerlok/hermod/internal/env"
 	"github.com/zerlok/hermod/internal/pathmap"
 	"github.com/zerlok/hermod/internal/relay"
+	"github.com/zerlok/hermod/internal/secret"
 	"github.com/zerlok/hermod/internal/shell"
 	"github.com/zerlok/hermod/internal/worker"
+	"github.com/zerlok/hermod/internal/worker/workertest"
 )
 
 // rel is an FS relay that exists before a test, on host, of workspace: its
@@ -147,7 +150,7 @@ func TestStateDiagram(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				if _, err := w.ws.Start(ctx, worker.Spec{Key: k, Dir: apiR, Form: worker.Terminal}); err != nil {
+				if err := w.ws.Host(k, worker.Terminal, nil).Exec(ctx, shell.Command{Dir: apiR}).Wait(); err != nil {
 					return err
 				}
 				return w.ws.Detach(ctx)
@@ -532,7 +535,7 @@ func TestFSOutput(t *testing.T) {
 	}
 }
 
-func TestStartTags(t *testing.T) {
+func TestHostTags(t *testing.T) {
 	cases := []struct {
 		name     string
 		origin   string
@@ -556,8 +559,8 @@ func TestStartTags(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := w.Start(ctx, worker.Spec{Key: k, Dir: apiR, Form: worker.LineStream}); err != nil {
-				t.Fatalf("Start: %v", err)
+			if err := w.Host(k, worker.LineStream, nil).Exec(ctx, shell.Command{Dir: apiR}).Wait(); err != nil {
+				t.Fatalf("Host: %v", err)
 			}
 			if got := f.sessions[k.String()].tags; !reflect.DeepEqual(got, tc.wantTags) {
 				t.Errorf("tags %v, want %v", got, tc.wantTags)
@@ -1028,7 +1031,7 @@ func TestLookAndFreePort(t *testing.T) {
 			}
 			defer func() { _ = w.Detach(ctx) }()
 			f.changes()
-			look, err := w.Look(ctx, key(t, "hermod-a"), nil)
+			look, err := w.Look(ctx, key(t, "hermod-a"))
 			if err != nil || look.State != tc.wantState {
 				t.Errorf("Look = %v, %v; want %v", look.State, err, tc.wantState)
 			}
@@ -1038,6 +1041,109 @@ func TestLookAndFreePort(t *testing.T) {
 			}
 			if got := f.changes(); len(got) != 0 {
 				t.Errorf("changes %q, want none", got)
+			}
+		})
+	}
+}
+
+// errRecord is a record that cannot be read.
+var errRecord = errors.New("no port free")
+
+// TestHost checks what a command executed on a Host starts: the worker under
+// the Host's key and form, in the command's directory, running its arguments,
+// with its variables and the record's in the worker's env and the record's
+// files beside it, none of them on a command line, and an Execution that has
+// ended once the worker runs.
+func TestHost(t *testing.T) {
+	const hidden = "SEKRIT"
+	cases := []struct {
+		name      string
+		form      worker.Form
+		cmd       shell.Command
+		record    Record
+		recordErr error
+		present   bool // a worker runs under the key already
+		wantErr   error
+		want      *workertest.Start // nil starts nothing
+		wantFiles map[string]string
+	}{
+		{
+			name: "a terminal worker with variables and a record",
+			form: worker.Terminal,
+			cmd: shell.Command{
+				Args: []string{"claude", "--resume", "c1"},
+				Dir:  apiR,
+				Env:  env.New(env.Pair{Key: "TOKEN", Value: env.Secret(secret.FromString(hidden))}),
+			},
+			record: Record{
+				Files: []File{{Name: "hook-token", Content: secret.FromString(hidden)}},
+				Vars:  env.New(env.Pair{Key: "GIT_AUTHOR_NAME", Value: env.Plain("Me")}),
+			},
+			want: &workertest.Start{Dir: apiR, Form: "terminal", Command: []string{"claude", "--resume", "c1"}},
+			wantFiles: map[string]string{
+				"env":        "export TOKEN=" + hidden + "\nexport GIT_AUTHOR_NAME=Me\n",
+				"hook-token": hidden,
+			},
+		},
+		{
+			name:      "a line stream with no record",
+			form:      worker.LineStream,
+			cmd:       shell.Command{Args: []string{"adapter"}, Dir: apiR},
+			want:      &workertest.Start{Dir: apiR, Form: "stream", Command: []string{"adapter"}},
+			wantFiles: map[string]string{"env": ""},
+		},
+		{
+			name:      "a record that cannot be read starts nothing",
+			form:      worker.Terminal,
+			cmd:       shell.Command{Args: []string{"claude"}, Dir: apiR},
+			recordErr: errRecord,
+			wantErr:   errRecord,
+		},
+		{
+			name:    "a worker already under the key",
+			form:    worker.Terminal,
+			cmd:     shell.Command{Args: []string{"claude"}, Dir: apiR},
+			present: true,
+			wantErr: worker.ErrPresent,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := newFake(nil, nil)
+			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer func() { _ = w.Detach(ctx) }()
+			k := key(t, "hermod-c1")
+			if tc.present {
+				f.sessions[k.String()] = tagged(w.Name(), worker.Running)
+			}
+			record := func() (Record, error) { return tc.record, tc.recordErr }
+			err = w.Host(k, tc.form, record).Exec(ctx, tc.cmd).Wait()
+			if !errors.Is(err, tc.wantErr) || (err == nil) != (tc.wantErr == nil) {
+				t.Fatalf("Wait: %v, want %v", err, tc.wantErr)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			got, started := f.started[k.String()]
+			if started != (tc.want != nil) {
+				t.Fatalf("started %v, want %v", started, tc.want != nil)
+			}
+			for _, line := range f.lines {
+				if strings.Contains(line, hidden) {
+					t.Errorf("a command line holds a secret: %q", line)
+				}
+			}
+			if tc.want == nil {
+				return
+			}
+			if got.Dir != tc.want.Dir || got.Form != tc.want.Form || !reflect.DeepEqual(got.Command, tc.want.Command) {
+				t.Errorf("started in %q as %q running %q, want in %q as %q running %q", got.Dir, got.Form, got.Command, tc.want.Dir, tc.want.Form, tc.want.Command)
+			}
+			if files := f.written[got.Staging]; !reflect.DeepEqual(files, tc.wantFiles) {
+				t.Errorf("worker's directory %q, want %q", files, tc.wantFiles)
 			}
 		})
 	}

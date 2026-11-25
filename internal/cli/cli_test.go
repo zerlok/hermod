@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -148,8 +149,8 @@ func TestAttachResolves(t *testing.T) {
 			if got := viewAttach(req, r); !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("request\n%+v\nwant\n%+v", got, tc.want)
 			}
-			if req.Agent == nil {
-				t.Error("the request carries no agent")
+			if req.Agent == nil || req.LocalAgent == nil || req.IsHook == nil {
+				t.Errorf("agent, local agent, hook test = %v, %v, %v; want all given", req.Agent, req.LocalAgent, req.IsHook != nil)
 			}
 		})
 	}
@@ -283,8 +284,8 @@ func TestACPResolves(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("request %+v, want %+v", got, tc.want)
 			}
-			if req.Client == nil || req.Agent == nil || req.Attach == nil {
-				t.Errorf("client, agent, attach = %v, %v, %v; want all given", req.Client, req.Agent, req.Attach != nil)
+			if req.Client == nil || req.Agent == nil || req.ACP == nil || req.Attach == nil {
+				t.Errorf("client, agent, ACP, attach = %v, %v, %v, %v; want all given", req.Client, req.Agent, req.ACP, req.Attach != nil)
 			}
 			if _, dry := req.Remote.Exec.(planner); dry {
 				t.Error("a chat plans its commands, want them run")
@@ -465,40 +466,35 @@ func TestMutagenOutput(t *testing.T) {
 	}
 }
 
-// TestReadRemote checks the read of the remote's home and Claude's config
-// directory there. A row with a remote environment runs the command readRemote
-// sends under a real sh, so its quoting and the order of its answer are
-// checked as well as their parsing.
+// TestReadRemote checks the read of the remote's home. A row with a remote
+// environment runs the command readRemote sends under a real sh, so its
+// quoting is checked as well as the parsing of its answer.
 func TestReadRemote(t *testing.T) {
 	cases := []struct {
-		name       string
-		out        string
-		err        error
-		remoteEnv  []string // nil answers out
-		wantHome   string
-		wantConfig string
-		wantErr    bool
+		name      string
+		out       string
+		err       error
+		remoteEnv []string // nil answers out
+		wantHome  string
+		wantErr   bool
 	}{
-		{"an answer", "/home/u\n/home/u/.claude\n", nil, nil, "/home/u", "/home/u/.claude", false},
-		{"after a profile's own lines", "Welcome!\n/home/u\n/srv/claude\n", nil, nil, "/home/u", "/srv/claude", false},
-		{"a relative home", "u\n/home/u/.claude\n", nil, nil, "", "", true},
-		{"one line", "/home/u\n", nil, nil, "", "", true},
-		{"ssh fails", "", errors.New("exit status 255"), nil, "", "", true},
-		{"the command, with Claude's directory unset", "", nil,
-			[]string{"SHELL=/bin/sh", "HOME=/nonexistent/u"}, "/nonexistent/u", "/nonexistent/u/.claude", false},
-		{"the command, with Claude's directory set", "", nil,
-			[]string{"SHELL=/bin/sh", "HOME=/nonexistent/u", envClaudeConfigDir + "=/srv/claude"}, "/nonexistent/u", "/srv/claude", false},
+		{"an answer", "/home/u\n", nil, nil, "/home/u", false},
+		{"after a profile's own lines", "Welcome!\n/home/u\n", nil, nil, "/home/u", false},
+		{"a relative home", "u\n", nil, nil, "", true},
+		{"no answer", "", nil, nil, "", true},
+		{"ssh fails", "", errors.New("exit status 255"), nil, "", true},
+		{"the command", "", nil, []string{"SHELL=/bin/sh", "HOME=/nonexistent/u"}, "/nonexistent/u", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			a, r := newApp(t, setup{})
 			r.local.remoteOut, r.local.remoteErr, r.local.remoteEnv = tc.out, tc.err, tc.remoteEnv
-			remote, configDir, err := a.readRemote(context.Background(), "prod-box", r.local)
+			remote, err := a.readRemote(context.Background(), "prod-box", r.local)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("readRemote: %v, want error %v", err, tc.wantErr)
 			}
-			if remote.Home != tc.wantHome || configDir != tc.wantConfig {
-				t.Errorf("home, config = %q, %q, want %q, %q", remote.Home, configDir, tc.wantHome, tc.wantConfig)
+			if remote.Home != tc.wantHome {
+				t.Errorf("home = %q, want %q", remote.Home, tc.wantHome)
 			}
 		})
 	}
@@ -684,6 +680,46 @@ func TestParseSSHHosts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := parseSSHHosts(strings.NewReader(tc.config)); !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("hosts %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReadOnce checks that every read of a file gets its first answer, for a
+// file that gives its bytes to one read only, such as a pipe, and for one that
+// fails.
+func TestReadOnce(t *testing.T) {
+	errRead := errors.New("no such file")
+	cases := []struct {
+		name      string
+		first     []byte // the file's bytes on its first read; later reads get none
+		firstErr  error
+		reads     int
+		want      []byte
+		wantErr   error
+		wantCalls int
+	}{
+		{"a file read once however often it is asked for", []byte(`{"hooks":{}}`), nil, 3, []byte(`{"hooks":{}}`), nil, 1},
+		{"a failed read kept", nil, errRead, 2, nil, errRead, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			read := readOnce(func(string) ([]byte, error) {
+				calls++
+				if calls > 1 {
+					return nil, nil
+				}
+				return tc.first, tc.firstErr
+			})
+			for i := range tc.reads {
+				got, err := read("/dev/fd/63")
+				if !errors.Is(err, tc.wantErr) || !bytes.Equal(got, tc.want) {
+					t.Errorf("read %d = %q, %v, want %q, %v", i+1, got, err, tc.want, tc.wantErr)
+				}
+			}
+			if calls != tc.wantCalls {
+				t.Errorf("read the file %d times, want %d", calls, tc.wantCalls)
 			}
 		})
 	}

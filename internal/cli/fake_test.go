@@ -22,7 +22,6 @@ const (
 	testHostname   = "laptop"
 	testHermod     = "/home/me/go/bin/hermod"
 	testRemoteHome = "/home/u"
-	testRemoteConf = "/home/u/.claude"
 )
 
 // vars is a fixed environment; a key that is absent is unset.
@@ -159,7 +158,7 @@ func newApp(t *testing.T, s setup) (app, *recorder) {
 	t.Helper()
 	r := &recorder{
 		logs:  map[string]*memLog{},
-		local: &workstation{remoteOut: testRemoteHome + "\n" + testRemoteConf + "\n", answers: s.answers},
+		local: &workstation{remoteOut: testRemoteHome + "\n", answers: s.answers},
 		stdin: strings.NewReader(""),
 	}
 	a := app{

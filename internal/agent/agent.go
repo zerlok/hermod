@@ -1,46 +1,103 @@
-// Package agent declares the contract of an agent program: the questions the
-// core asks about a conversation, and the values that answer them. An agent
-// performs nothing: every command it declares is run by its caller, on the
-// remote, and read back with the reading the agent declared beside it. An agent
-// is handed a path map and never learns where the other workstation is or how
-// it is reached.
+// Package agent declares the contract of an agent program as behaviour: the
+// operations the core asks of it, and the values they answer with. An agent
+// performs every operation itself, through the shell.Executor it is built with
+// or the one it is handed to start a conversation, so one agent may run
+// commands while another reads a database. It is handed a path map and
+// executors, and never learns which workstation an executor reaches or how.
 package agent
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"path"
 	"time"
 
+	"github.com/zerlok/hermod/internal/env"
 	"github.com/zerlok/hermod/internal/pathmap"
 	"github.com/zerlok/hermod/internal/secret"
+	"github.com/zerlok/hermod/internal/shell"
 )
 
-// Agent is one agent program's contract. Each method is a question answered
-// with a value.
+// Agent is one agent program's contract.
 type Agent interface {
-	// Parse says what the arguments ask for: a conversation and its ID, a
-	// one-shot call, or a command the agent does not run.
-	Parse(args []string) Call
-	// Run says what running a call needs on the remote, its paths mapped by
-	// paths.
-	Run(call Call, paths pathmap.Map) (Needs, error)
-	// Adapter says what the program's ACP adapter needs on the remote, for the
-	// workspace paths maps, which decides where the program keeps the
-	// workspace's conversations.
-	Adapter(paths pathmap.Map) (Needs, error)
-	// Probe says how to ask the agent program whether a conversation runs.
-	Probe(id string) Probe
+	// Classify says what the arguments ask for, and for a conversation its ID.
+	Classify(args []string) (Invocation, string)
+	// List is the conversations of a directory and of the directories under
+	// it, as the program reports them.
+	List(ctx context.Context, dir string) ([]Conversation, error)
+	// Lookup is one conversation: its directory and state. A conversation
+	// the program does not have is ErrUnknown.
+	Lookup(ctx context.Context, id string) (Conversation, error)
+	// Start starts or resumes the conversation the Launch's arguments name,
+	// through ex, and returns once ex has started it.
+	Start(ctx context.Context, ex shell.Executor, launch Launch) error
+	// StateDir is the directory where the program keeps the state of dir's
+	// conversations, such as their transcripts.
+	StateDir(ctx context.Context, dir string) (string, error)
+}
+
+// ACP is the optional contract of an agent that serves a chat client through
+// the program's ACP adapter.
+type ACP interface {
+	// Adapter starts the program's ACP adapter for the Launch, through ex.
+	Adapter(ctx context.Context, ex shell.Executor, launch Launch) error
 	// Connect is the answer to a client's connection start.
 	Connect() Handshake
-	// List says how to ask the agent program for the conversations of a remote
-	// directory and of the directories under it.
-	List(dir string) Listing
-	// Locate says how to ask the agent program where one conversation belongs.
-	Locate(id string) Lookup
-	// Hooks rewrites a settings document so that its hooks call back on a port
-	// of the remote and carry a token generated for the worker. The rewritten
-	// document holds that token, so it stays a secret on both sides.
-	Hooks(document secret.Token, port int, token secret.Token) (secret.Token, error)
+}
+
+// ErrUnknown is a conversation the agent program does not have.
+var ErrUnknown = errors.New("agent: the program has no such conversation")
+
+// Invocation is what a command's arguments ask of an agent.
+type Invocation int
+
+const (
+	// InvokesCommand is a command the agent does not run: it runs as given.
+	// It is the zero value, so arguments nobody classified are never taken
+	// for a conversation.
+	InvokesCommand Invocation = iota
+	// InvokesOneShot runs to completion without a conversation, such as a
+	// subcommand or a version query.
+	InvokesOneShot
+	// InvokesConversation runs the conversation the program stores under an
+	// ID.
+	InvokesConversation
+)
+
+func (i Invocation) String() string {
+	switch i {
+	case InvokesCommand:
+		return "command"
+	case InvokesOneShot:
+		return "one-shot"
+	case InvokesConversation:
+		return "conversation"
+	}
+	return fmt.Sprintf("Invocation(%d)", int(i))
+}
+
+// Launch is what a start is given.
+type Launch struct {
+	// Args are the caller's arguments, program first, with local paths.
+	Args []string
+	// Dir is the directory the caller works in, on the caller's workstation,
+	// absolute: a relative path in Args is relative to it.
+	Dir string
+	// Paths maps the caller's paths to where the start runs.
+	Paths pathmap.Map
+	// Environ is the caller's environment; the agent takes from it only the
+	// variables it declares, so a local credential never travels by default.
+	Environ env.Vars
+	// Hook rewrites one hook of the agent's settings, or leaves it out when
+	// ok is false. Nil keeps every hook as it is.
+	Hook func(h Hook) (rewritten Hook, ok bool)
+}
+
+// Hook is one hook of an agent's settings: a URL the program calls, and the
+// headers it sends. A header may carry a credential, so each stays masked.
+type Hook struct {
+	URL     string
+	Headers map[string]secret.Token
 }
 
 // State is what the agent program says of a conversation.
@@ -65,32 +122,11 @@ func (s State) String() string {
 	return fmt.Sprintf("unknown state %d", int(s))
 }
 
-func (s State) check() error {
-	switch s {
-	case Stopped, Running:
-		return nil
-	}
-	return fmt.Errorf("agent: %v", s)
-}
-
 // Conversation is one conversation as the agent program reports it.
 type Conversation struct {
 	ID      string
-	Dir     string // where it runs, a path on the remote
+	Dir     string // where it runs, absolute and clean, on the agent's workstation
 	State   State
 	Title   string
 	Updated time.Time // its last update; zero when the program gives none
-}
-
-func (c Conversation) check() error {
-	if c.ID == "" {
-		return fmt.Errorf("agent: a conversation in %q has no ID", c.Dir)
-	}
-	// Sessions and the router match a directory by its exact string, and
-	// pathmap.Under trusts both paths to be clean, so a directory written any
-	// other way would name one place while matching another.
-	if !path.IsAbs(c.Dir) || path.Clean(c.Dir) != c.Dir {
-		return fmt.Errorf("agent: conversation %s has no absolute, clean directory: %q", c.ID, c.Dir)
-	}
-	return c.State.check()
 }

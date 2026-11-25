@@ -20,7 +20,8 @@ import (
 type Adapters struct {
 	Remote workspace.Remote
 	Local  workspace.Local
-	Agent  agent.Agent
+	// Agent starts the agent program's adapter, answering for the remote.
+	Agent agent.ACP
 
 	Environ env.Vars // the caller's environment, of which the adapter gets only what the agent declares
 	// Identity is the developer's git identity in a local directory, which
@@ -37,8 +38,7 @@ type Adapters struct {
 	// nil, or a log that cannot be opened, leaves those lines to Log.
 	Errors func(key worker.Key) (io.WriteCloser, error)
 
-	Log    *log.Logger // nil discards
-	Random io.Reader   // hook tokens and ports; nil is crypto/rand
+	Log *log.Logger // nil discards
 }
 
 // Attach attaches the workspace dir belongs to and its adapter, a line-stream
@@ -63,11 +63,7 @@ func (a Adapters) Attach(ctx context.Context, dir Path) (Attachment, error) {
 }
 
 func (a Adapters) attach(ctx context.Context, ws *workspace.Workspace, dir string) (Attachment, error) {
-	req := Request{
-		Remote: a.Remote, Local: a.Local, Dir: ws.Root(), Agent: a.Agent,
-		Environ: a.Environ, Identity: a.Identity(ctx, dir), Log: a.Log, Random: a.Random,
-	}
-	logger := req.logger()
+	logger := orDiscardLog(a.Log)
 	for _, p := range ws.Nested() {
 		logger.Printf("workspace %s holds the workspace of %s, whose files are now carried twice", ws.Root(), p.Local)
 	}
@@ -75,7 +71,7 @@ func (a Adapters) attach(ctx context.Context, ws *workspace.Workspace, dir strin
 	if err != nil {
 		return Attachment{}, err
 	}
-	seen, err := ws.Look(ctx, key, nil, portFile, tokenFile)
+	seen, err := ws.Look(ctx, key)
 	if err != nil {
 		return Attachment{}, err
 	}
@@ -84,11 +80,12 @@ func (a Adapters) attach(ctx context.Context, ws *workspace.Workspace, dir strin
 		return Attachment{}, fmt.Errorf("%s: %w", key, err)
 	}
 	logger.Printf("adapter %s: %s", key, act)
-	needs, err := a.Agent.Adapter(ws.PathMap())
+	err = carryOut(ctx, ws, key, act, func() error {
+		host := ws.Host(key, worker.LineStream, identityRecord(a.Identity(ctx, dir)))
+		launch := agent.Launch{Dir: ws.Root(), Paths: ws.PathMap(), Environ: a.Environ}
+		return a.Agent.Adapter(ctx, host, launch)
+	})
 	if err != nil {
-		return Attachment{}, err
-	}
-	if err := apply(ctx, req, ws, key, act, needs, seen, worker.LineStream); err != nil {
 		return Attachment{}, err
 	}
 

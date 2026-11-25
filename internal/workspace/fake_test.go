@@ -52,6 +52,9 @@ type fake struct {
 	tmuxFails bool // tmux cannot tell which sessions exist
 	ioEnds    bool // a joined stdio ends at once, as for a process that ended
 	ran       []string
+	lines     []string                     // every command line run over ssh
+	written   map[string]map[string]string // the files each write put in a staging directory
+	started   map[string]workertest.Start  // what each worker was started with, by session
 }
 
 func newFake(syncs map[string]*mutagenSession, sessions map[string]*tmuxSession) *fake {
@@ -61,7 +64,7 @@ func newFake(syncs map[string]*mutagenSession, sessions map[string]*tmuxSession)
 	if sessions == nil {
 		sessions = map[string]*tmuxSession{}
 	}
-	return &fake{syncs: syncs, sessions: sessions}
+	return &fake{syncs: syncs, sessions: sessions, written: map[string]map[string]string{}, started: map[string]workertest.Start{}}
 }
 
 // remote is the fake as a workspace's Remote.
@@ -104,6 +107,9 @@ func (f *fake) Exec(ctx context.Context, cmd shell.Command) shell.Execution {
 	args := cmd.Args
 	remote := false
 	if len(args) > 0 && args[0] == "ssh" {
+		f.mu.Lock()
+		f.lines = append(f.lines, args[len(args)-1])
+		f.mu.Unlock()
 		args, remote = remoteWords(args), true
 	}
 	var p play
@@ -225,6 +231,8 @@ func (f *fake) onRemote(words []string) play {
 		return f.act(c)
 	case isWorker && c.Script == "keep":
 		return f.keep(c)
+	case isWorker && c.Script == "write":
+		return f.write(c.Args[0], c.Args[1:])
 	case len(words) == 3 && words[0] == "sh" && words[1] == "-c" && strings.HasPrefix(words[2], "echo hermod-net-ready"):
 		return f.forward
 	}
@@ -252,7 +260,25 @@ func (f *fake) keep(c workertest.Command) play {
 			return exitError(c.Refused)
 		}
 		f.sessions[c.Session] = &tmuxSession{state: worker.Running, tags: c.Start.Tags}
+		f.started[c.Session] = c.Start
 		f.ran = append(f.ran, "start "+c.Session)
+		return nil
+	}
+}
+
+// write reads the files a start writes into its staging directory: pairs of
+// a name and a length, the contents on stdin.
+func (f *fake) write(staging string, pairs []string) play {
+	return func(_ context.Context, in io.Reader, _, _ io.Writer) error {
+		b, _ := io.ReadAll(in)
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		files := map[string]string{}
+		for i := 0; i+1 < len(pairs); i += 2 {
+			n, _ := strconv.Atoi(pairs[i+1])
+			files[pairs[i]], b = string(b[:n]), b[n:]
+		}
+		f.written[staging] = files
 		return nil
 	}
 }

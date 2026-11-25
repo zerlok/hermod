@@ -1,16 +1,20 @@
-# Reports the conversations Claude keeps and runs on this workstation.
+# Reports Claude's config directory, and the conversations Claude keeps and
+# runs on this workstation.
 #
-#   sh -c "$(cat conversations.sh)" conversations CONFIG list PREFIX
-#   sh -c "$(cat conversations.sh)" conversations CONFIG locate [ID]
+#   sh -c "$(cat conversations.sh)" conversations config
+#   sh -c "$(cat conversations.sh)" conversations list PREFIX
+#   sh -c "$(cat conversations.sh)" conversations locate [ID]
 #
-# CONFIG is Claude's config directory, absolute: the one the transcripts' place
-# fills, so what is reported is what a relay keeps. PREFIX is the name Claude
-# gives a directory under its projects/, and every transcript of a directory
-# whose name starts with it is reported: those of the directories under it
-# start with it too. ID is a conversation's UUID, whose transcript is reported
-# wherever it is; without one no transcript is.
+# Claude's config directory is the one Claude here uses,
+# ${CLAUDE_CONFIG_DIR:-$HOME/.claude}, absolute; `config` prints it. PREFIX is
+# the name Claude gives a directory under its projects/, and every transcript
+# of a directory whose name starts with it is reported: those of the
+# directories under it start with it too. ID is a conversation's UUID, whose
+# transcript is reported wherever it is; without one no transcript is.
 #
-# Each transcript is reported as a line `transcript PATH`, a line
+# Every operation prints a line `conversations:` first, so a reader can tell
+# its report from what a login profile printed around it. Each transcript is
+# reported as a line `transcript PATH`, a line
 # `updated SECONDS` with its last change, a line `cwd MEMBER` for each distinct
 # directory it ran in, in the order it first ran there, and, when the
 # transcript has them, lines `custom-title MEMBER` and `ai-title MEMBER` with
@@ -19,9 +23,9 @@
 # another workstation names that one's directory until it is resumed here. A
 # line `agents:` and the conversations Claude runs, as `claude agents --json`
 # lists them, follow.
-c=$1
-op=$2
-shift 2
+c=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+op=$1
+shift
 case $c in
 /*) ;;
 *)
@@ -43,8 +47,19 @@ report() {
 }
 
 case $op in
-list) report "$c"/projects/"$1"*/*.jsonl ;;
-locate) if [ "$#" -gt 0 ]; then report "$c"/projects/*/"$1".jsonl; fi ;;
+config)
+  echo conversations:
+  printf '%s\n' "$c"
+  exit 0
+  ;;
+list)
+  echo conversations:
+  report "$c"/projects/"$1"*/*.jsonl
+  ;;
+locate)
+  echo conversations:
+  if [ "$#" -gt 0 ]; then report "$c"/projects/*/"$1".jsonl; fi
+  ;;
 *)
   printf 'unknown operation %s\n' "$op" >&2
   exit 2

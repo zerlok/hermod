@@ -3,8 +3,10 @@ package claude
 import (
 	"bufio"
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path"
 	"slices"
@@ -14,62 +16,95 @@ import (
 
 	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/pathmap"
+	"github.com/zerlok/hermod/internal/shell"
 )
 
-// conversationsScript reports Claude's transcripts and the conversations it
-// runs. It is sent to the remote's sh as it is, its inputs as arguments.
+// conversationsScript reports Claude's config directory, its transcripts and
+// the conversations it runs. It is sent to sh as it is, its inputs as
+// arguments.
 //
 //go:embed conversations.sh
 var conversationsScript string
 
-// conversations is the command that runs conversationsScript with args, in
-// the remote config directory the transcripts' place uses, so the conversations
-// reported are those the relay keeps.
-func (a Agent) conversations(args ...string) []string {
-	return append([]string{"sh", "-c", conversationsScript, "conversations", a.cfg.RemoteConfigDir}, args...)
-}
-
-// List asks Claude on the remote for the conversations of dir and of the
-// directories under it: each one Claude keeps a transcript of, in the
-// directory the transcript names, and each one it runs, Running.
-func (a Agent) List(dir string) agent.Listing {
-	dir = path.Clean(dir)
-	return agent.NewListing(dir, a.conversations("list", projectDirName(dir)), func(out []byte) ([]agent.Conversation, error) {
-		all, err := readConversations(out, dir)
-		if err != nil {
-			return nil, err
+// conversations runs conversationsScript with args on the workstation this
+// Agent answers for, where it reads Claude's config directory as Claude there
+// does, and returns what the script printed.
+func (a Agent) conversations(ctx context.Context, args ...string) ([]byte, error) {
+	if a.cfg.Exec == nil {
+		return nil, errors.New("claude: no executor to ask Claude with")
+	}
+	cmd := shell.Command{Args: append([]string{"sh", "-c", conversationsScript, "conversations"}, args...)}
+	out, err := shell.Run(ctx, a.cfg.Exec, cmd)
+	if err != nil {
+		if detail := strings.TrimSpace(out.Stderr); detail != "" {
+			err = fmt.Errorf("%w: %s", err, detail)
 		}
-		// The transcripts' directory names lose which character was a '/', so
-		// the script reports a superset, and the transcripts' own directories
-		// decide.
-		return slices.DeleteFunc(all, func(c agent.Conversation) bool {
-			_, under := pathmap.Under(c.Dir, dir)
-			return !under
-		}), nil
-	})
+		return nil, fmt.Errorf("claude: conversations %s: %w", args[0], err)
+	}
+	return []byte(out.Stdout), nil
 }
 
-// Locate asks Claude on the remote for one conversation: where its
-// transcript says it ran, or where Claude runs it. An ID that is no UUID is
-// none Claude has.
-func (a Agent) Locate(id string) agent.Lookup {
+// StateDir is where Claude keeps the transcripts of the conversations run in
+// dir: under its config directory, named after dir.
+func (a Agent) StateDir(ctx context.Context, dir string) (string, error) {
+	if !path.IsAbs(dir) {
+		return "", fmt.Errorf("claude: directory %q is not absolute", dir)
+	}
+	out, err := a.conversations(ctx, "config")
+	if err != nil {
+		return "", err
+	}
+	_, after, found := cutLine(out, reportMarker)
+	config, _, _ := strings.Cut(string(after), "\n")
+	if !found || !path.IsAbs(config) {
+		return "", fmt.Errorf("claude: config directory: unexpected answer %q", out)
+	}
+	return transcriptDir(config, path.Clean(dir)), nil
+}
+
+// List asks Claude for the conversations of dir and of the directories under
+// it: each one Claude keeps a transcript of, in the directory the transcript
+// names, and each one it runs, Running.
+func (a Agent) List(ctx context.Context, dir string) ([]agent.Conversation, error) {
+	dir = path.Clean(dir)
+	out, err := a.conversations(ctx, "list", projectDirName(dir))
+	if err != nil {
+		return nil, err
+	}
+	all, err := readConversations(out, dir)
+	if err != nil {
+		return nil, err
+	}
+	// The transcripts' directory names lose which character was a '/', so the
+	// script reports a superset, and the transcripts' own directories decide.
+	return slices.DeleteFunc(all, func(c agent.Conversation) bool {
+		_, under := pathmap.Under(c.Dir, dir)
+		return !under
+	}), nil
+}
+
+// Lookup asks Claude for one conversation: where its transcript says it ran,
+// or where Claude runs it. An ID that is no UUID is none Claude has.
+func (a Agent) Lookup(ctx context.Context, id string) (agent.Conversation, error) {
 	args := []string{"locate"}
 	if isSessionID(id) {
 		args = append(args, strings.ToLower(id))
 	}
-	return agent.NewLookup(id, a.conversations(args...), func(out []byte) (agent.Conversation, bool, error) {
-		all, err := readConversations(out, "")
-		if err != nil {
-			return agent.Conversation{}, false, err
+	out, err := a.conversations(ctx, args...)
+	if err != nil {
+		return agent.Conversation{}, err
+	}
+	all, err := readConversations(out, "")
+	if err != nil {
+		return agent.Conversation{}, err
+	}
+	for _, c := range all {
+		if strings.EqualFold(c.ID, id) {
+			c.ID = id
+			return c, nil
 		}
-		for _, c := range all {
-			if strings.EqualFold(c.ID, id) {
-				c.ID = id
-				return c, true, nil
-			}
-		}
-		return agent.Conversation{}, false, nil
-	})
+	}
+	return agent.Conversation{}, fmt.Errorf("claude: conversation %q: %w", id, agent.ErrUnknown)
 }
 
 // transcript is what the script reported of one transcript.
@@ -115,10 +150,19 @@ func (t transcript) title() string {
 
 // readConversations reads the script's report into conversations, newest
 // first; asked is the directory listed, if any. A conversation is Running when
-// `claude agents` lists it and Stopped otherwise. A transcript whose file is not named by a UUID is not a
-// conversation's, and a conversation with no absolute, clean directory cannot
-// be placed, so both are left out rather than failing the rest.
+// `claude agents` lists it and Stopped otherwise. A transcript whose file is
+// not named by a UUID is not a conversation's, and a conversation with no
+// absolute, clean directory cannot be placed, so both are left out rather than
+// failing the rest.
+// reportMarker is the line conversations.sh prints before its answer to any
+// operation: a login profile may print lines of its own around it.
+const reportMarker = "conversations:"
+
 func readConversations(out []byte, asked string) ([]agent.Conversation, error) {
+	_, out, found := cutLine(out, reportMarker)
+	if !found {
+		return nil, fmt.Errorf("claude: conversations: no report in the answer")
+	}
 	report, agentsJSON, found := cutLine(out, "agents:")
 	if !found {
 		return nil, fmt.Errorf("claude: conversations: no list of running conversations in the answer")

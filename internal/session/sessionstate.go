@@ -15,7 +15,7 @@ type sessionContext struct {
 	dir    Path // the directory the session was made for: its key among the sessions
 	client Sender[Message]
 	agent  agent.Agent
-	query  query
+	acp    agent.ACP
 	log    *log.Logger
 
 	// A chat is found in the two ways a message names it: by the chat's ID,
@@ -94,7 +94,7 @@ func newSession(dir Path, att Attachment, deps sessionDeps, connect Message) (*S
 			dir:        dir,
 			client:     deps.client,
 			agent:      deps.agent,
-			query:      deps.query,
+			acp:        deps.acp,
 			log:        deps.log,
 			chats:      map[ChatID]*ChatControl{},
 			opening:    map[MessageID]opening{},
@@ -118,7 +118,7 @@ func newSession(dir Path, att Attachment, deps sessionDeps, connect Message) (*S
 type sessionDeps struct {
 	client Sender[Message]
 	agent  agent.Agent
-	query  query
+	acp    agent.ACP
 	log    *log.Logger
 	shared *shared
 }
@@ -399,12 +399,7 @@ func (s *sessionContext) leave(sm SessionSM) {
 // runsConversation asks the agent program whether a conversation of the
 // workspace runs, in its root or under it.
 func (s *sessionContext) runsConversation(ctx context.Context) (bool, error) {
-	listing := s.agent.List(string(s.Paths.ToRemote(s.Root)))
-	out, err := s.query(ctx, listing.Command())
-	if err != nil {
-		return false, err
-	}
-	found, err := listing.Read(out)
+	found, err := s.agent.List(ctx, string(s.Paths.ToRemote(s.Root)))
 	if err != nil {
 		return false, err
 	}
@@ -419,7 +414,7 @@ func (s *sessionContext) runsConversation(ctx context.Context) (bool, error) {
 // compareHandshake logs where the adapter's answer to the kept Connect differs
 // from what the agent declared, which the client was answered with.
 func (s *sessionContext) compareHandshake(msg Message) {
-	declared := s.agent.Connect()
+	declared := s.acp.Connect()
 	got, ok := msg.Handshake()
 	switch {
 	case !ok:
@@ -522,6 +517,3 @@ func (r *requests) forget(dir Path) {
 		}
 	}
 }
-
-// query runs a command of the agent's on the remote and returns its output.
-type query func(ctx context.Context, cmd []string) ([]byte, error)

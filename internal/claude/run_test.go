@@ -1,7 +1,7 @@
 package claude
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"io/fs"
 	"os/exec"
@@ -20,23 +20,25 @@ import (
 const credential = "SECRET"
 
 const (
-	otherHook      = `{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"http://u:` + credential + `@localhost:9000/mine?tok=` + credential + `"},{"type":"command","command":"x"}]}]}}`
-	airDefaultPort = `{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"http://localhost/air/claude/hook"}]}]}}`
-	airHTTPS       = `{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"https://127.0.0.1:63342/air/claude/hook"}]}]}}`
+	localDir  = "/home/me/dev/api"
+	remoteDir = "/home/u/dev/api"
 )
 
-const airHook = `{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"http://localhost:63342/air/claude/hook?x=1","headers":{"Authorization":"Bearer air-` + credential + `"}}]}]}}`
+const (
+	airHook = `{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"http://localhost:63342/air/claude/hook?x=1","headers":{"Authorization":"Bearer air-` + credential + `"}}]}]}}`
+	aimed   = `{"hooks":{"Stop":[{"hooks":[{"headers":{"Authorization":"Bearer worker"},"type":"http","url":"http://localhost:45001/air/claude/hook?x=1"}]}]}}`
+)
 
 func paths(t *testing.T) pathmap.Map {
 	t.Helper()
-	m, err := pathmap.New(pathmap.Place{Local: "/home/me/dev/api", Remote: "/home/u/dev/api"})
+	m, err := pathmap.New(pathmap.Place{Local: localDir, Remote: remoteDir})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return m
 }
 
-// reader reads the local files of a table.
+// reader reads the caller's files of a table.
 func reader(files map[string]string) func(string) ([]byte, error) {
 	return func(name string) ([]byte, error) {
 		content, ok := files[name]
@@ -47,124 +49,109 @@ func reader(files map[string]string) func(string) ([]byte, error) {
 	}
 }
 
-var config = Config{Dir: "/home/me/dev/api", ConfigDir: "/home/me/.claude", RemoteConfigDir: "/home/u/.claude"}
-
-var transcriptPlace = pathmap.Place{Local: "/home/me/.claude/projects/-home-me-dev-api", Remote: "/home/u/.claude/projects/-home-u-dev-api"}
-
-type settings struct{ file, doc string }
-
-type hooks struct {
-	address string
-	routes  []string
-	token   string
+// aim is a hook function that points every hook at port 45001 with the
+// worker's token.
+func aim(h agent.Hook) (agent.Hook, bool) {
+	_, rest, _ := strings.Cut(strings.TrimPrefix(h.URL, "http://"), "/")
+	return agent.Hook{
+		URL:     "http://localhost:45001/" + rest,
+		Headers: map[string]secret.Token{"Authorization": secret.FromString("Bearer worker")},
+	}, true
 }
 
-func TestRun(t *testing.T) {
+// fileScript is the start command's script that writes the files named, in
+// order, into the worker's directory, followed by its exec line.
+func fileScript(exec string, files ...string) string {
+	lines := []string{`d="${HERMOD_WORKER_DIR:?}"`, "umask 077"}
+	for i, name := range files {
+		v := fmt.Sprintf("HERMOD_CLAUDE_FILE_%d", i+1)
+		lines = append(lines, `printf '%s' "$`+v+`" >"$d/`+name+`" || exit`, "unset "+v)
+	}
+	return strings.Join(append(lines, exec), "\n")
+}
+
+func TestStart(t *testing.T) {
 	cases := []struct {
-		name         string
-		argv         []string
-		local        map[string]string // the local files, by path
-		config       *Config           // config reading local, when nil
-		want         []string
-		wantFiles    map[string]string
-		wantPlaces   []pathmap.Place
-		wantSettings *settings
-		wantHooks    *hooks
-		wantDropped  []string
-		wantErr      error // errAny for any error
+		name    string
+		argv    []string
+		dir     string
+		local   map[string]string // the caller's files, by path
+		noRead  bool              // the agent has no reader of the caller's files
+		hook    func(agent.Hook) (agent.Hook, bool)
+		fails   error // the executor's result
+		want    []string
+		wantEnv []string
+		wantErr error // errAny for any error
 	}{
 		{
-			name:       "paths mapped, IDs unchanged, no name added",
-			argv:       []string{"claude", "--resume", uuid, "--add-dir", "/home/me/dev/api/lib", "--append-system-prompt=/home/me/dev/api/x", "--", "/home/me/dev/api/README"},
-			want:       []string{"claude", "--resume", uuid, "--add-dir", "/home/u/dev/api/lib", "--append-system-prompt=/home/u/dev/api/x", "--", "/home/u/dev/api/README"},
-			wantPlaces: []pathmap.Place{transcriptPlace},
+			name: "paths mapped, IDs unchanged, no name added",
+			argv: []string{"claude", "--resume", uuid, "--add-dir", localDir + "/lib", "--append-system-prompt=" + localDir + "/x", "--", localDir + "/README"},
+			want: []string{"claude", "--resume", uuid, "--add-dir", remoteDir + "/lib", "--append-system-prompt=" + remoteDir + "/x", "--", remoteDir + "/README"},
 		},
 		{
-			name:       "a path under no root left as it is",
-			argv:       []string{"claude", "--session-id", uuid, "--add-dir", "/srv/data"},
-			want:       []string{"claude", "--session-id", uuid, "--add-dir", "/srv/data"},
-			wantPlaces: []pathmap.Place{transcriptPlace},
+			name: "a path under no root left as it is",
+			argv: []string{"claude", "--session-id", uuid, "--add-dir", "/srv/data"},
+			want: []string{"claude", "--session-id", uuid, "--add-dir", "/srv/data"},
 		},
 		{
-			name:         "settings file moved to the worker's directory, its hooks declared",
-			argv:         []string{"claude", "--session-id", uuid, "--settings", "/tmp/air/settings.json", "--model", "opus"},
-			local:        map[string]string{"/tmp/air/settings.json": airHook},
-			want:         []string{"sh", "-c", `exec claude "${1}" "${2}" "${3}" "${HERMOD_WORKER_DIR:?}/settings.json" "${4}" "${5}"`, "claude", "--session-id", uuid, "--settings", "--model", "opus"},
-			wantPlaces:   []pathmap.Place{transcriptPlace},
-			wantSettings: &settings{file: "settings.json", doc: airHook},
-			wantHooks:    &hooks{address: "localhost:63342", routes: []string{"/air/claude/hook?x=1"}, token: "Bearer air-" + credential},
+			name:    "a settings file carried as a variable, its hooks rewritten by the function",
+			argv:    []string{"claude", "--session-id", uuid, "--settings", "/tmp/air/settings.json", "--model", "opus"},
+			local:   map[string]string{"/tmp/air/settings.json": airHook},
+			hook:    aim,
+			want:    []string{"sh", "-c", fileScript(`exec claude "${1}" "${2}" "${3}" "$d/settings.json" "${4}" "${5}"`, "settings.json"), "claude", "--session-id", uuid, "--settings", "--model", "opus"},
+			wantEnv: []string{"HERMOD_CLAUDE_FILE_1=" + aimed},
 		},
 		{
-			name:         "inline settings without hooks, paths mapped",
-			argv:         []string{"claude", "--resume", uuid, `--settings={"cwd":"/home/me/dev/api"}`},
-			want:         []string{"sh", "-c", `exec claude "${1}" "${2}" "${3}" "${HERMOD_WORKER_DIR:?}/settings.json"`, "claude", "--resume", uuid, "--settings"},
-			wantPlaces:   []pathmap.Place{transcriptPlace},
-			wantSettings: &settings{file: "settings.json", doc: `{"cwd":"/home/u/dev/api"}`},
+			name:    "a relative settings file read under the caller's directory, kept with no function",
+			argv:    []string{"claude", "--session-id", uuid, "--settings", "s.json"},
+			local:   map[string]string{localDir + "/s.json": airHook},
+			want:    []string{"sh", "-c", fileScript(`exec claude "${1}" "${2}" "${3}" "$d/settings.json"`, "settings.json"), "claude", "--session-id", uuid, "--settings"},
+			wantEnv: []string{"HERMOD_CLAUDE_FILE_1=" + airHook},
 		},
 		{
-			name:         "settings with only another local endpoint: its hook dropped, no callback",
-			argv:         []string{"claude", "--session-id", uuid, "--settings", otherHook},
-			want:         []string{"sh", "-c", `exec claude "${1}" "${2}" "${3}" "${HERMOD_WORKER_DIR:?}/settings.json"`, "claude", "--session-id", uuid, "--settings"},
-			wantPlaces:   []pathmap.Place{transcriptPlace},
-			wantSettings: &settings{file: "settings.json", doc: `{"hooks":{"Stop":[{"hooks":[{"command":"x","type":"command"}]}]}}`},
-			wantDropped:  []string{"http://localhost:9000/mine"},
+			name:    "inline settings, paths mapped",
+			argv:    []string{"claude", "--resume", uuid, `--settings={"cwd":"` + localDir + `"}`},
+			hook:    aim,
+			want:    []string{"sh", "-c", fileScript(`exec claude "${1}" "${2}" "${3}" "$d/settings.json"`, "settings.json"), "claude", "--resume", uuid, "--settings"},
+			wantEnv: []string{`HERMOD_CLAUDE_FILE_1={"cwd":"` + remoteDir + `"}`},
 		},
 		{
-			name:         "Air's hook on its scheme's default port called back on that port",
-			argv:         []string{"claude", "--session-id", uuid, "--settings", airDefaultPort},
-			want:         []string{"sh", "-c", `exec claude "${1}" "${2}" "${3}" "${HERMOD_WORKER_DIR:?}/settings.json"`, "claude", "--session-id", uuid, "--settings"},
-			wantPlaces:   []pathmap.Place{transcriptPlace},
-			wantSettings: &settings{file: "settings.json", doc: airDefaultPort},
-			wantHooks:    &hooks{address: "localhost:80", routes: []string{"/air/claude/hook"}},
-		},
-		{
-			name:         "an https loopback hook dropped, no callback",
-			argv:         []string{"claude", "--session-id", uuid, "--settings", airHTTPS},
-			want:         []string{"sh", "-c", `exec claude "${1}" "${2}" "${3}" "${HERMOD_WORKER_DIR:?}/settings.json"`, "claude", "--session-id", uuid, "--settings"},
-			wantPlaces:   []pathmap.Place{transcriptPlace},
-			wantSettings: &settings{file: "settings.json", doc: `{"hooks":{}}`},
-			wantDropped:  []string{"https://127.0.0.1:63342/air/claude/hook"},
-		},
-		{
-			name:  "every MCP config written as given, paths mapped",
-			argv:  []string{"claude", "--session-id", uuid, "--mcp-config", "cfg/a.json", `{"mcpServers":{"b":{"command":"/home/me/dev/api/b","env":{"TOKEN":"` + credential + `"}}}}`, "--strict-mcp-config"},
-			local: map[string]string{"/home/me/dev/api/cfg/a.json": `{"mcpServers":{"ide":{"command":"/opt/air/bin/ide","headers":{"Authorization":"` + credential + `"}}}}`},
-			want: []string{"sh", "-c", `exec claude "${1}" "${2}" "${3}" "${HERMOD_WORKER_DIR:?}/mcp-1.json" "${HERMOD_WORKER_DIR:?}/mcp-2.json" "${4}"`,
-				"claude", "--session-id", uuid, "--mcp-config", "--strict-mcp-config"},
-			wantFiles: map[string]string{
-				"mcp-1.json": `{"mcpServers":{"ide":{"command":"/opt/air/bin/ide","headers":{"Authorization":"` + credential + `"}}}}`,
-				"mcp-2.json": `{"mcpServers":{"b":{"command":"/home/u/dev/api/b","env":{"TOKEN":"` + credential + `"}}}}`,
+			name:  "settings and every MCP config carried, paths mapped",
+			argv:  []string{"claude", "--session-id", uuid, "--mcp-config", "cfg/a.json", `{"mcpServers":{"b":{"command":"` + localDir + `/b","env":{"TOKEN":"` + credential + `"}}}}`, "--strict-mcp-config", "--settings", `{"model":"opus"}`},
+			local: map[string]string{localDir + "/cfg/a.json": `{"mcpServers":{"ide":{"command":"/opt/air/bin/ide","headers":{"Authorization":"` + credential + `"}}}}`},
+			want: []string{"sh", "-c", fileScript(`exec claude "${1}" "${2}" "${3}" "$d/mcp-1.json" "$d/mcp-2.json" "${4}" "${5}" "$d/settings.json"`, "settings.json", "mcp-1.json", "mcp-2.json"),
+				"claude", "--session-id", uuid, "--mcp-config", "--strict-mcp-config", "--settings"},
+			wantEnv: []string{
+				`HERMOD_CLAUDE_FILE_1={"model":"opus"}`,
+				`HERMOD_CLAUDE_FILE_2={"mcpServers":{"ide":{"command":"/opt/air/bin/ide","headers":{"Authorization":"` + credential + `"}}}}`,
+				`HERMOD_CLAUDE_FILE_3={"mcpServers":{"b":{"command":"` + remoteDir + `/b","env":{"TOKEN":"` + credential + `"}}}}`,
 			},
-			wantPlaces: []pathmap.Place{transcriptPlace},
 		},
 		{
-			name:       "MCP config in the inline form",
-			argv:       []string{"claude", "--session-id", uuid, `--mcp-config={"mcpServers":{}}`},
-			want:       []string{"sh", "-c", `exec claude "${1}" "${2}" "${3}" "${HERMOD_WORKER_DIR:?}/mcp-1.json"`, "claude", "--session-id", uuid, "--mcp-config"},
-			wantFiles:  map[string]string{"mcp-1.json": `{"mcpServers":{}}`},
-			wantPlaces: []pathmap.Place{transcriptPlace},
+			name:    "MCP config in the inline form takes one value, the prompt after it passed on",
+			argv:    []string{"claude", "--session-id", uuid, `--mcp-config={"mcpServers":{}}`, "fix the login bug"},
+			want:    []string{"sh", "-c", fileScript(`exec claude "${1}" "${2}" "${3}" "$d/mcp-1.json" "${4}"`, "mcp-1.json"), "claude", "--session-id", uuid, "--mcp-config", "fix the login bug"},
+			wantEnv: []string{`HERMOD_CLAUDE_FILE_1={"mcpServers":{}}`},
 		},
 		{
-			name:       "MCP config in the inline form takes one value, the prompt after it passed on",
-			argv:       []string{"claude", "--session-id", uuid, `--mcp-config={"mcpServers":{}}`, "fix the login bug"},
-			want:       []string{"sh", "-c", `exec claude "${1}" "${2}" "${3}" "${HERMOD_WORKER_DIR:?}/mcp-1.json" "${4}"`, "claude", "--session-id", uuid, "--mcp-config", "fix the login bug"},
-			wantFiles:  map[string]string{"mcp-1.json": `{"mcpServers":{}}`},
-			wantPlaces: []pathmap.Place{transcriptPlace},
+			name: "options with no value passed as given",
+			argv: []string{"claude", "--session-id", uuid, "--mcp-config", "--settings"},
+			want: []string{"claude", "--session-id", uuid, "--mcp-config", "--settings"},
 		},
 		{
-			name:       "options with no value passed as given",
-			argv:       []string{"claude", "--session-id", uuid, "--mcp-config", "--settings"},
-			want:       []string{"claude", "--session-id", uuid, "--mcp-config", "--settings"},
-			wantPlaces: []pathmap.Place{transcriptPlace},
-		},
-		{
-			name: "one-shot call mapped, with no file and no place",
-			argv: []string{"claude", "-p", "--add-dir", "/home/me/dev/api/lib", "hello"},
-			want: []string{"claude", "-p", "--add-dir", "/home/u/dev/api/lib", "hello"},
+			name:    "a one-shot call is no conversation",
+			argv:    []string{"claude", "-p", "hello"},
+			wantErr: errAny,
 		},
 		{
 			name:    "a command Claude does not run",
 			argv:    []string{"claude", "--model", "opus"},
+			wantErr: errAny,
+		},
+		{
+			name:    "a relative directory",
+			argv:    []string{"claude", "--session-id", uuid},
+			dir:     "dev/api",
 			wantErr: errAny,
 		},
 		{
@@ -173,139 +160,120 @@ func TestRun(t *testing.T) {
 			wantErr: fs.ErrNotExist,
 		},
 		{
+			name:    "no reader of the caller's files",
+			argv:    []string{"claude", "--session-id", uuid, "--settings", "/tmp/air/settings.json"},
+			noRead:  true,
+			wantErr: errAny,
+		},
+		{
 			name:    "a malformed inline document",
 			argv:    []string{"claude", "--session-id", uuid, `--mcp-config={"` + credential + `":`},
 			wantErr: errAny,
 		},
 		{
-			name:    "settings that are not an object",
+			name:    "settings whose hook has a header that is not a string",
 			argv:    []string{"claude", "--session-id", uuid, "--settings", `{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"http://localhost:1/h","headers":{"Authorization":1}}]}]}}`},
+			hook:    aim,
 			wantErr: errAny,
 		},
 		{
-			name:    "no reader of local files",
-			argv:    []string{"claude", "--session-id", uuid, "--settings", "/tmp/air/settings.json"},
-			config:  &Config{Dir: config.Dir, ConfigDir: config.ConfigDir, RemoteConfigDir: config.RemoteConfigDir},
-			wantErr: errAny,
-		},
-		{
-			name:    "a relative config directory",
+			name:    "the start fails",
 			argv:    []string{"claude", "--session-id", uuid},
-			config:  &Config{Dir: config.Dir, ConfigDir: ".claude", RemoteConfigDir: config.RemoteConfigDir},
-			wantErr: errAny,
+			fails:   errFailed,
+			want:    []string{"claude", "--session-id", uuid},
+			wantErr: errFailed,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := config
-			cfg.ReadFile = reader(tc.local)
-			if tc.config != nil {
-				cfg = *tc.config
+			cfg := Config{ReadFile: reader(tc.local)}
+			if tc.noRead {
+				cfg.ReadFile = nil
 			}
-			a := New(cfg)
-			needs, err := a.Run(a.Parse(tc.argv), paths(t))
-			if tc.wantErr != nil {
-				if err == nil || (tc.wantErr != errAny && !errors.Is(err, tc.wantErr)) {
-					t.Fatalf("Run() error = %v, want %v", err, tc.wantErr)
-				}
-				if strings.Contains(err.Error(), credential) {
-					t.Errorf("Run() error shows a credential: %v", err)
+			dir := tc.dir
+			if dir == "" {
+				dir = localDir
+			}
+			ex := &fakeExec{err: tc.fails}
+			err := New(cfg).Start(context.Background(), ex, agent.Launch{Args: tc.argv, Dir: dir, Paths: paths(t), Hook: tc.hook})
+			if !matches(err, tc.wantErr) {
+				t.Fatalf("Start() error = %v, want %v", err, tc.wantErr)
+			}
+			if err != nil && strings.Contains(err.Error(), credential) {
+				t.Errorf("Start() error shows a credential: %v", err)
+			}
+			if tc.want == nil {
+				if len(ex.got) != 0 {
+					t.Errorf("executed %q, want nothing", ex.args())
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("Run() error: %v", err)
+			if len(ex.got) != 1 {
+				t.Fatalf("executed %q, want one command", ex.args())
 			}
-			if got := needs.Command(); !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("Command() =\n %q\nwant\n %q", got, tc.want)
+			cmd := ex.got[0]
+			if !reflect.DeepEqual(cmd.Args, tc.want) {
+				t.Errorf("command =\n %q\nwant\n %q", cmd.Args, tc.want)
 			}
-			if strings.Contains(strings.Join(needs.Command(), " "), credential) {
-				t.Errorf("Command() shows a credential: %q", needs.Command())
+			if strings.Contains(strings.Join(cmd.Args, " "), credential) {
+				t.Errorf("the command line shows a credential: %q", cmd.Args)
 			}
-			if got := reveal(needs.Files()); !reflect.DeepEqual(got, tc.wantFiles) {
-				t.Errorf("Files() = %q, want %q", got, tc.wantFiles)
+			if cmd.Dir != remoteDir {
+				t.Errorf("directory %q, want %q", cmd.Dir, remoteDir)
 			}
-			if got := needs.Places(); !reflect.DeepEqual(got, tc.wantPlaces) {
-				t.Errorf("Places() = %v, want %v", got, tc.wantPlaces)
+			if got := cmd.Env.Entries(env.Value.Reveal); !reflect.DeepEqual(got, orEmpty(tc.wantEnv)) {
+				t.Errorf("variables =\n %q\nwant\n %q", got, tc.wantEnv)
 			}
-			var gotSettings *settings
-			if file, doc, ok := needs.Settings(); ok {
-				gotSettings = &settings{file: file, doc: doc.Reveal()}
-			}
-			if !reflect.DeepEqual(gotSettings, tc.wantSettings) {
-				t.Errorf("Settings() = %+v, want %+v", gotSettings, tc.wantSettings)
-			}
-			address, routes, token, hooked := needs.Hooks()
-			var got *hooks
-			if hooked {
-				got = &hooks{address: address, routes: routes, token: token.Reveal()}
-			}
-			if !reflect.DeepEqual(got, tc.wantHooks) {
-				t.Errorf("Hooks() = %+v, want %+v", got, tc.wantHooks)
-			}
-			if got := needs.DroppedHooks(); !reflect.DeepEqual(got, tc.wantDropped) {
-				t.Errorf("DroppedHooks() = %q, want %q", got, tc.wantDropped)
-			}
-			if strings.Contains(strings.Join(needs.DroppedHooks(), " "), credential) {
-				t.Errorf("DroppedHooks() shows a credential: %q", needs.DroppedHooks())
+			if strings.Contains(cmd.Env.String(), credential) {
+				t.Errorf("the variables print a credential: %v", cmd.Env)
 			}
 		})
 	}
 }
 
-var errAny = errors.New("any error")
-
-func reveal(files map[string]secret.Token) map[string]string {
-	if len(files) == 0 {
-		return nil
+func orEmpty(s []string) []string {
+	if s == nil {
+		return []string{}
 	}
-	out := map[string]string{}
-	for name, content := range files {
-		out[name] = content.Reveal()
-	}
-	return out
+	return s
 }
 
 func TestAdapter(t *testing.T) {
 	cases := []struct {
-		name         string
-		cfg          Config
-		want         []string
-		wantFiles    map[string]string
-		wantPlaces   []pathmap.Place
-		wantSettings *settings
+		name    string
+		dir     string
+		fails   error
+		want    []string
+		wantDir string
+		wantErr error
 	}{
-		{name: "for a configured agent", cfg: config, want: []string{"sh", "-c", adapterScript, "claude-agent-acp"}},
-		{name: "for an agent with nothing configured", cfg: Config{}, want: []string{"sh", "-c", adapterScript, "claude-agent-acp"}},
+		{"in the workspace's root, mapped", localDir, nil, []string{"sh", "-c", adapterScript, "claude-agent-acp"}, remoteDir, nil},
+		{"the start fails", localDir, errFailed, []string{"sh", "-c", adapterScript, "claude-agent-acp"}, remoteDir, errFailed},
+		{"a relative directory", "dev/api", nil, nil, "", errAny},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			needs, err := New(tc.cfg).Adapter(paths(t))
-			if err != nil {
-				t.Fatalf("Adapter() error: %v", err)
+			ex := &fakeExec{err: tc.fails}
+			err := New(Config{}).Adapter(context.Background(), ex, agent.Launch{Dir: tc.dir, Paths: paths(t)})
+			if !matches(err, tc.wantErr) {
+				t.Fatalf("Adapter() error = %v, want %v", err, tc.wantErr)
 			}
-			if got := needs.Command(); !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("Command() = %q, want %q", got, tc.want)
+			var want [][]string
+			if tc.want != nil {
+				want = [][]string{tc.want}
 			}
-			if got := reveal(needs.Files()); !reflect.DeepEqual(got, tc.wantFiles) {
-				t.Errorf("Files() = %q, want %q", got, tc.wantFiles)
+			if !reflect.DeepEqual(ex.args(), want) {
+				t.Fatalf("executed %q, want %q", ex.args(), want)
 			}
-			if got := needs.Places(); !reflect.DeepEqual(got, tc.wantPlaces) {
-				t.Errorf("Places() = %v, want %v", got, tc.wantPlaces)
-			}
-			var gotSettings *settings
-			if file, doc, ok := needs.Settings(); ok {
-				gotSettings = &settings{file: file, doc: doc.Reveal()}
-			}
-			if !reflect.DeepEqual(gotSettings, tc.wantSettings) {
-				t.Errorf("Settings() = %+v, want %+v", gotSettings, tc.wantSettings)
+			if len(ex.got) == 1 && ex.got[0].Dir != tc.wantDir {
+				t.Errorf("directory %q, want %q", ex.got[0].Dir, tc.wantDir)
 			}
 		})
 	}
 }
 
-// TestDeclaredVars checks that both of Claude's commands declare the same
-// variables, and only those.
+// TestDeclaredVars checks that both of Claude's starts take the same
+// variables from the caller's, and only those.
 func TestDeclaredVars(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -332,54 +300,82 @@ func TestDeclaredVars(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			a := New(config)
-			run, err := a.Run(a.Parse([]string{"claude", "--session-id", uuid}), paths(t))
-			if err != nil {
-				t.Fatalf("Run() error: %v", err)
+			launch := agent.Launch{Args: []string{"claude", "--session-id", uuid}, Dir: localDir, Paths: paths(t), Environ: env.Environ(tc.environ)}
+			ex := &fakeExec{}
+			a := New(Config{})
+			if err := a.Start(context.Background(), ex, launch); err != nil {
+				t.Fatalf("Start() error: %v", err)
 			}
-			adapter, err := a.Adapter(paths(t))
-			if err != nil {
+			if err := a.Adapter(context.Background(), ex, launch); err != nil {
 				t.Fatalf("Adapter() error: %v", err)
 			}
-			for name, needs := range map[string]agent.Needs{"Run": run, "Adapter": adapter} {
-				got := needs.Vars(env.Environ(tc.environ)).Entries(env.Value.Reveal)
-				if !reflect.DeepEqual(got, tc.want) {
-					t.Errorf("%s: Vars() = %q, want %q", name, got, tc.want)
+			for i, name := range []string{"Start", "Adapter"} {
+				if got := ex.got[i].Env.Entries(env.Value.Reveal); !reflect.DeepEqual(got, tc.want) {
+					t.Errorf("%s: variables %q, want %q", name, got, tc.want)
 				}
 			}
 		})
 	}
 }
 
-// TestConfigDir checks that the config directory ConfigDir decides and the
-// one ConfigDirCommand prints agree, with the variable set and unset.
-func TestConfigDir(t *testing.T) {
+func TestStateDir(t *testing.T) {
+	config := []string{"sh", "-c", conversationsScript, "conversations", "config"}
 	cases := []struct {
-		name  string
-		value string // "" is unset
-		home  string
-		want  string
+		name        string
+		dir         string
+		out         string
+		fails       error
+		wantCommand [][]string
+		want        string
+		wantErr     error
 	}{
-		{"unset", "", "/home/u", "/home/u/.claude"},
-		{"set", "/srv/claude", "/home/u", "/srv/claude"},
+		{"under the config directory, named after the directory", localDir, "conversations:\n/home/me/.claude\n", nil, [][]string{config}, "/home/me/.claude/projects/-home-me-dev-api", nil},
+		{"between a login profile's own lines", remoteDir + "/", "Welcome!\nconversations:\n/srv/claude\nBye!\n", nil, [][]string{config}, "/srv/claude/projects/-home-u-dev-api", nil},
+		{"no marker", localDir, "/home/me/.claude\n", nil, [][]string{config}, "", errAny},
+		{"a relative answer", localDir, "conversations:\nclaude\n", nil, [][]string{config}, "", errAny},
+		{"the command fails", localDir, "", errFailed, [][]string{config}, "", errFailed},
+		{"a relative directory", "dev/api", "", nil, nil, "", errAny},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ConfigDir(tc.value, tc.home); got != tc.want {
-				t.Errorf("ConfigDir = %q, want %q", got, tc.want)
+			ex := &fakeExec{out: tc.out, err: tc.fails}
+			got, err := New(Config{Exec: ex}).StateDir(context.Background(), tc.dir)
+			if !matches(err, tc.wantErr) {
+				t.Fatalf("StateDir() error = %v, want %v", err, tc.wantErr)
 			}
-			argv := ConfigDirCommand()
-			cmd := exec.Command(argv[0], argv[1:]...)
-			cmd.Env = []string{"HOME=" + tc.home}
-			if tc.value != "" {
-				cmd.Env = append(cmd.Env, EnvConfigDir+"="+tc.value)
+			if got != tc.want {
+				t.Errorf("StateDir() = %q, want %q", got, tc.want)
 			}
+			if !reflect.DeepEqual(ex.args(), tc.wantCommand) {
+				t.Errorf("executed %q, want %q", ex.args(), tc.wantCommand)
+			}
+		})
+	}
+}
+
+// TestConfigOperation runs the script's config operation in a local sh, with
+// Claude's variable set and unset, as Claude reads its config directory.
+func TestConfigOperation(t *testing.T) {
+	cases := []struct {
+		name    string
+		environ []string
+		want    string
+		wantErr bool
+	}{
+		{"unset", []string{"HOME=/home/u"}, "conversations:\n/home/u/.claude\n", false},
+		{"set", []string{"HOME=/home/u", envConfigDir + "=/srv/claude"}, "conversations:\n/srv/claude\n", false},
+		{"relative", []string{"HOME=/home/u", envConfigDir + "=claude"}, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("sh", "-c", conversationsScript, "conversations", "config")
+			cmd.Env = tc.environ
 			out, err := cmd.Output()
-			if err != nil {
-				t.Fatalf("run %q: %v", argv, err)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("run: %v, want error %v", err, tc.wantErr)
 			}
-			if got := string(out); got != tc.want+"\n" {
-				t.Errorf("ConfigDirCommand printed %q, want %q", got, tc.want+"\n")
+			if string(out) != tc.want {
+				t.Errorf("printed %q, want %q", out, tc.want)
 			}
 		})
 	}

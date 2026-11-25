@@ -107,7 +107,7 @@ func TestAdaptersAttach(t *testing.T) {
 			local := testLocal(t)
 			var conns []adapterConn
 			adapters := Adapters{
-				Remote: f.remote(), Local: local, Agent: fakeAgent{},
+				Remote: f.remote(), Local: local, Agent: fakeAgent{f: f},
 				Identity:     func(context.Context, string) Identity { return Identity{} },
 				MainWorktree: func(context.Context, string) (string, string, bool) { return "", "", false },
 				Connect: func(from io.Reader, to io.Writer) Channel {
@@ -220,7 +220,7 @@ func TestAdaptersErrors(t *testing.T) {
 				conns  []adapterConn
 			)
 			adapters := Adapters{
-				Remote: f.remote(), Local: testLocal(t), Agent: fakeAgent{},
+				Remote: f.remote(), Local: testLocal(t), Agent: fakeAgent{f: f},
 				Identity:     func(context.Context, string) Identity { return Identity{} },
 				MainWorktree: func(context.Context, string) (string, string, bool) { return "", "", false },
 				Connect: func(from io.Reader, to io.Writer) Channel {

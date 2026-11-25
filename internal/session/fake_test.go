@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -14,7 +15,6 @@ import (
 	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/pathmap"
 	"github.com/zerlok/hermod/internal/relay/relaytest"
-	"github.com/zerlok/hermod/internal/secret"
 	"github.com/zerlok/hermod/internal/shell"
 	"github.com/zerlok/hermod/internal/worker"
 	"github.com/zerlok/hermod/internal/worker/workertest"
@@ -70,7 +70,6 @@ type fake struct {
 	syncs        map[string]*mutagenSession
 	sessions     map[string]*tmuxSession
 	dirs         map[string]map[string]string // the workers' directories under the remote home
-	probe        string                       // what the agent program says of the conversation
 	listFails    bool                         // Mutagen cannot list its sessions
 	attach       ending
 	signal       context.CancelFunc   // stops the session when a joined terminal signals
@@ -78,7 +77,8 @@ type fake struct {
 	exitCode     int                  // a one-shot call's exit status
 	convs        []agent.Conversation // the conversations the agent program has, by remote directory
 	queryFails   bool                 // the agent program's listing and lookup fail
-	queryGarbled bool                 // the agent program's listing and lookup print what cannot be read
+	queryGarbled bool                 // the agent program's listing and lookup answer what cannot be read
+	hooked       [][]agent.Hook       // the hooks each start of the agent's rewrote, as the Launch's function left them
 	workersFail  bool                 // tmux cannot list its sessions
 	streamWaits  bool                 // a joined line stream serves until it is stopped, rather than ending at once
 	adapterSays  string               // what a joined line stream's process wrote to its stderr
@@ -226,11 +226,7 @@ func (f *fake) list(rest []string, out, errOut io.Writer) error {
 func (f *fake) onRemote(words []string, port string) play {
 	switch {
 	case len(words) == 5 && words[0] == "sh" && words[2] == `exec "$SHELL" -lc "$1"`:
-		inner := workertest.Words(words[4])
-		if len(inner) == 2 && (inner[0] == agentList || inner[0] == agentLocate) {
-			return f.query(inner[0], inner[1])
-		}
-		return f.oneShot(inner)
+		return f.oneShot(workertest.Words(words[4]))
 	}
 	switch c, isWorker := workertest.Read(words); {
 	case isWorker && c.Script == "act":
@@ -256,37 +252,6 @@ func (f *fake) oneShot(words []string) play {
 		f.record(append([]string{"run in", words[4]}, words[5:]...)...)
 		if f.exitCode != 0 {
 			return exitError(f.exitCode)
-		}
-		return nil
-	}
-}
-
-// The commands fakeAgent declares for its listing and its lookup.
-const (
-	agentList   = "agent-list"
-	agentLocate = "agent-locate"
-)
-
-// query answers the agent program's listing of a directory, every
-// conversation in it or under it, or its lookup of one conversation, a line
-// "ID DIR STATE" for each.
-func (f *fake) query(verb, arg string) play {
-	return func(_ context.Context, _ io.Reader, out, errOut io.Writer) error {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		if f.queryFails {
-			_, _ = fmt.Fprintln(errOut, "claude: command not found")
-			return exitError(127)
-		}
-		if f.queryGarbled {
-			_, _ = fmt.Fprintln(out, "garbled")
-			return nil
-		}
-		for _, c := range f.convs {
-			_, under := pathmap.Under(c.Dir, arg)
-			if (verb == agentList && under) || (verb == agentLocate && c.ID == arg) {
-				_, _ = fmt.Fprintf(out, "%s %s %s\n", c.ID, c.Dir, c.State)
-			}
 		}
 		return nil
 	}
@@ -401,9 +366,6 @@ func (f *fake) act(c workertest.Command) play {
 				}
 			}
 			_, _ = fmt.Fprintln(out, "out")
-			if c.Look.Line != "" {
-				_, _ = io.WriteString(out, f.probe)
-			}
 		case "port":
 			_, _ = fmt.Fprintln(out, c.Ports[0])
 		case "close":
@@ -497,86 +459,98 @@ func dead(s worker.State) string {
 	return "0"
 }
 
-// fakeAgent answers the agent's questions from what a test gave it.
+// fakeAgent answers from the conversations of its fake remote, and starts a
+// conversation by executing its arguments, mapped, on the executor it is
+// handed, with the variables named AGENT_*, after its hooks went through the
+// Launch's function.
 type fakeAgent struct {
-	call      agent.Call
-	needs     agent.Needs
-	handshake agent.Handshake
+	f          *fake
+	invocation agent.Invocation
+	id         string
+	stateRoot  string       // where it keeps every directory's conversations
+	hooks      []agent.Hook // its settings' hooks
+	handshake  agent.Handshake
+	startFails error
 }
 
-func (a fakeAgent) Parse([]string) agent.Call { return a.call }
+func (a fakeAgent) Classify([]string) (agent.Invocation, string) { return a.invocation, a.id }
 
-// Run gives a one-shot call its arguments mapped word by word and declares
-// the variables named AGENT_*, as an agent's one-shot needs differ from its
-// arguments.
-func (a fakeAgent) Run(call agent.Call, paths pathmap.Map) (agent.Needs, error) {
-	if !call.OneShot() {
-		return a.needs, nil
+// conversations are the conversations the program has that keep accepts.
+func (a fakeAgent) conversations(keep func(agent.Conversation) bool) ([]agent.Conversation, error) {
+	a.f.mu.Lock()
+	defer a.f.mu.Unlock()
+	switch {
+	case a.f.queryFails:
+		return nil, errors.New("claude: command not found")
+	case a.f.queryGarbled:
+		return nil, errors.New("unreadable answer")
 	}
-	var command []string
-	for _, word := range call.Args() {
-		command = append(command, paths.ToRemote(word))
-	}
-	return agent.NewNeeds(command).WithVars(func(key string) bool { return strings.HasPrefix(key, "AGENT_") }), nil
-}
-
-func (a fakeAgent) Adapter(pathmap.Map) (agent.Needs, error) { return agent.Needs{}, nil }
-
-func (a fakeAgent) Probe(id string) agent.Probe {
-	return agent.NewProbe(id, []string{"probe", id}, func(out []byte) (agent.State, error) {
-		switch strings.TrimSpace(string(out)) {
-		case "running":
-			return agent.Running, nil
-		case "stopped":
-			return agent.Stopped, nil
-		}
-		return agent.Stopped, fmt.Errorf("unreadable %q", out)
-	})
-}
-
-func (a fakeAgent) Connect() agent.Handshake { return a.handshake }
-
-func (a fakeAgent) List(dir string) agent.Listing {
-	return agent.NewListing(dir, []string{agentList, dir}, readConversations)
-}
-
-func (a fakeAgent) Locate(id string) agent.Lookup {
-	return agent.NewLookup(id, []string{agentLocate, id}, func(out []byte) (agent.Conversation, bool, error) {
-		found, err := readConversations(out)
-		if err != nil || len(found) == 0 {
-			return agent.Conversation{}, false, err
-		}
-		return found[0], true, nil
-	})
-}
-
-// readConversations reads the fake program's lines "ID DIR STATE".
-func readConversations(out []byte) ([]agent.Conversation, error) {
 	var found []agent.Conversation
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
+	for _, c := range a.f.convs {
+		if keep(c) {
+			found = append(found, c)
 		}
-		if len(fields) != 3 {
-			return nil, fmt.Errorf("unreadable %q", line)
-		}
-		c := agent.Conversation{ID: fields[0], Dir: fields[1]}
-		switch fields[2] {
-		case agent.Running.String():
-			c.State = agent.Running
-		case agent.Stopped.String():
-			c.State = agent.Stopped
-		default:
-			return nil, fmt.Errorf("unreadable state %q", fields[2])
-		}
-		found = append(found, c)
 	}
 	return found, nil
 }
 
-// Hooks stamps the port and the token on the document, so a test reads what
-// the worker's settings carry.
-func (a fakeAgent) Hooks(document secret.Token, port int, token secret.Token) (secret.Token, error) {
-	return secret.FromString(fmt.Sprintf("%s port=%d token=%s", document.Reveal(), port, token.Reveal())), nil
+func (a fakeAgent) List(_ context.Context, dir string) ([]agent.Conversation, error) {
+	return a.conversations(func(c agent.Conversation) bool {
+		_, under := pathmap.Under(c.Dir, dir)
+		return under
+	})
 }
+
+func (a fakeAgent) Lookup(_ context.Context, id string) (agent.Conversation, error) {
+	found, err := a.conversations(func(c agent.Conversation) bool { return c.ID == id })
+	if err != nil {
+		return agent.Conversation{}, err
+	}
+	if len(found) == 0 {
+		return agent.Conversation{}, agent.ErrUnknown
+	}
+	return found[0], nil
+}
+
+func (a fakeAgent) StateDir(_ context.Context, dir string) (string, error) {
+	return path.Join(a.stateRoot, strings.ReplaceAll(dir, "/", "-")), nil
+}
+
+func (a fakeAgent) Start(ctx context.Context, ex shell.Executor, l agent.Launch) error {
+	if a.startFails != nil {
+		return a.startFails
+	}
+	var hooked []agent.Hook
+	for _, h := range a.hooks {
+		if l.Hook != nil {
+			var keep bool
+			if h, keep = l.Hook(h); !keep {
+				continue
+			}
+		}
+		hooked = append(hooked, h)
+	}
+	a.f.mu.Lock()
+	a.f.hooked = append(a.f.hooked, hooked)
+	a.f.mu.Unlock()
+	var args []string
+	for _, word := range l.Args {
+		args = append(args, l.Paths.ToRemote(word))
+	}
+	return a.run(ctx, ex, args, l)
+}
+
+func (a fakeAgent) Adapter(ctx context.Context, ex shell.Executor, l agent.Launch) error {
+	return a.run(ctx, ex, []string{"adapter"}, l)
+}
+
+func (a fakeAgent) run(ctx context.Context, ex shell.Executor, args []string, l agent.Launch) error {
+	_, err := shell.Run(ctx, ex, shell.Command{
+		Args: args,
+		Dir:  l.Paths.ToRemote(l.Dir),
+		Env:  l.Environ.Select(func(key string) bool { return strings.HasPrefix(key, "AGENT_") }),
+	})
+	return err
+}
+
+func (a fakeAgent) Connect() agent.Handshake { return a.handshake }

@@ -1,7 +1,6 @@
 package claude
 
 import (
-	"reflect"
 	"strings"
 	"testing"
 
@@ -14,121 +13,57 @@ const (
 	fork  = "5d6e1e2a-3b4c-4c8e-9d6f-0b7e5f3c2a41"
 )
 
-// form is what a parsed call asks for, as a test names it.
-type form int
-
-const (
-	command form = iota
-	oneShot
-	conversation
-)
-
-func formOf(c agent.Call) form {
-	if _, ok := c.ID(); ok {
-		return conversation
-	}
-	if c.OneShot() {
-		return oneShot
-	}
-	return command
-}
-
-func TestParse(t *testing.T) {
+func TestClassify(t *testing.T) {
 	cases := []struct {
 		name   string
 		argv   string // split on spaces; "" is an empty argv
-		want   form
+		want   agent.Invocation
 		wantID string // "" when the call is no conversation
 	}{
-		{"subcommand", "claude auth status", oneShot, ""},
-		{"mcp subcommand", "claude mcp list", oneShot, ""},
-		{"subcommand with a session flag", "claude agents --json --session-id " + uuid, oneShot, ""},
-		{"version", "claude --version", oneShot, ""},
-		{"short version", "claude -v", oneShot, ""},
-		{"help", "claude --help", oneShot, ""},
-		{"help with a session", "claude --session-id " + uuid + " -h", oneShot, ""},
-		{"settings read", "claude -p --input-format stream-json --output-format stream-json --verbose", oneShot, ""},
-		{"print long form", "claude --print hello", oneShot, ""},
-		{"print with a resume picker", "claude -p --resume", oneShot, ""},
-		{"print fork with no new session", "claude -p --resume " + uuid + " --fork-session", oneShot, ""},
-		{"by path", "/usr/local/bin/claude --version", oneShot, ""},
+		{"subcommand", "claude auth status", agent.InvokesOneShot, ""},
+		{"mcp subcommand", "claude mcp list", agent.InvokesOneShot, ""},
+		{"subcommand with a session flag", "claude agents --json --session-id " + uuid, agent.InvokesOneShot, ""},
+		{"version", "claude --version", agent.InvokesOneShot, ""},
+		{"short version", "claude -v", agent.InvokesOneShot, ""},
+		{"help", "claude --help", agent.InvokesOneShot, ""},
+		{"help with a session", "claude --session-id " + uuid + " -h", agent.InvokesOneShot, ""},
+		{"settings read", "claude -p --input-format stream-json --output-format stream-json --verbose", agent.InvokesOneShot, ""},
+		{"print long form", "claude --print hello", agent.InvokesOneShot, ""},
+		{"print with a resume picker", "claude -p --resume", agent.InvokesOneShot, ""},
+		{"print fork with no new session", "claude -p --resume " + uuid + " --fork-session", agent.InvokesOneShot, ""},
+		{"by path", "/usr/local/bin/claude --version", agent.InvokesOneShot, ""},
 
-		{"stream-json session", "claude --output-format stream-json --input-format stream-json --session-id=" + uuid, conversation, uuid},
-		{"stream-json resume", "claude --input-format=stream-json --resume=" + uuid, conversation, uuid},
-		{"print with a session", "claude -p --input-format stream-json --session-id " + uuid, conversation, uuid},
-		{"terminal resume", "claude --resume " + uuid + " --settings /tmp/s.json", conversation, uuid},
-		{"terminal new", "claude --session-id " + uuid + " --settings /tmp/s.json", conversation, uuid},
-		{"short resume", "claude -r " + uuid, conversation, uuid},
-		{"upper-case UUID", "claude --session-id " + upper, conversation, upper},
-		{"fork keyed by its new session", "claude --resume " + uuid + " --fork-session --session-id " + fork, conversation, fork},
-		{"fork with the new session first", "claude --session-id=" + fork + " --fork-session --resume=" + uuid, conversation, fork},
+		{"stream-json session", "claude --output-format stream-json --input-format stream-json --session-id=" + uuid, agent.InvokesConversation, uuid},
+		{"stream-json resume", "claude --input-format=stream-json --resume=" + uuid, agent.InvokesConversation, uuid},
+		{"print with a session", "claude -p --input-format stream-json --session-id " + uuid, agent.InvokesConversation, uuid},
+		{"terminal resume", "claude --resume " + uuid + " --settings /tmp/s.json", agent.InvokesConversation, uuid},
+		{"terminal new", "claude --session-id " + uuid + " --settings /tmp/s.json", agent.InvokesConversation, uuid},
+		{"short resume", "claude -r " + uuid, agent.InvokesConversation, uuid},
+		{"upper-case UUID", "claude --session-id " + upper, agent.InvokesConversation, upper},
+		{"fork keyed by its new session", "claude --resume " + uuid + " --fork-session --session-id " + fork, agent.InvokesConversation, fork},
+		{"fork with the new session first", "claude --session-id=" + fork + " --fork-session --resume=" + uuid, agent.InvokesConversation, fork},
 
-		{"plain claude", "claude --model opus", command, ""},
-		{"bare claude", "claude", command, ""},
-		{"resume picker", "claude --resume", command, ""},
-		{"resume search term", "claude --resume fix-login", command, ""},
-		{"continue", "claude -c", command, ""},
-		{"fork with no new session", "claude --resume " + uuid + " --fork-session", command, ""},
-		{"malformed session id", "claude --session-id not-a-uuid", command, ""},
-		{"session id missing value", "claude --session-id", command, ""},
-		{"path traversal as an ID", "claude --session-id ../../../../../../../../../etc/passw", command, ""},
-		{"subcommand word later is a prompt", "claude --model opus auth", command, ""},
-		{"flags after -- are prompt text", "claude -- --version --session-id " + uuid, command, ""},
-		{"session id consumes its value", "claude --session-id --version", command, ""},
-		{"not claude", "htop -d 5", command, ""},
-		{"claude-like name", "claude-code --version", command, ""},
-		{"empty argv", "", command, ""},
+		{"plain claude", "claude --model opus", agent.InvokesCommand, ""},
+		{"bare claude", "claude", agent.InvokesCommand, ""},
+		{"resume picker", "claude --resume", agent.InvokesCommand, ""},
+		{"resume search term", "claude --resume fix-login", agent.InvokesCommand, ""},
+		{"continue", "claude -c", agent.InvokesCommand, ""},
+		{"fork with no new session", "claude --resume " + uuid + " --fork-session", agent.InvokesCommand, ""},
+		{"malformed session id", "claude --session-id not-a-uuid", agent.InvokesCommand, ""},
+		{"session id missing value", "claude --session-id", agent.InvokesCommand, ""},
+		{"path traversal as an ID", "claude --session-id ../../../../../../../../../etc/passw", agent.InvokesCommand, ""},
+		{"subcommand word later is a prompt", "claude --model opus auth", agent.InvokesCommand, ""},
+		{"flags after -- are prompt text", "claude -- --version --session-id " + uuid, agent.InvokesCommand, ""},
+		{"session id consumes its value", "claude --session-id --version", agent.InvokesCommand, ""},
+		{"not claude", "htop -d 5", agent.InvokesCommand, ""},
+		{"claude-like name", "claude-code --version", agent.InvokesCommand, ""},
+		{"empty argv", "", agent.InvokesCommand, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			argv := strings.Fields(tc.argv)
-			call := Agent{}.Parse(argv)
-			if got := formOf(call); got != tc.want {
-				t.Errorf("form = %v, want %v", got, tc.want)
-			}
-			if id, ok := call.ID(); id != tc.wantID || ok != (tc.wantID != "") {
-				t.Errorf("ID() = %q, %v, want %q", id, ok, tc.wantID)
-			}
-			if got := call.Args(); !reflect.DeepEqual(got, argvOrNil(argv)) {
-				t.Errorf("Args() = %q, want %q", got, argv)
-			}
-		})
-	}
-}
-
-func argvOrNil(argv []string) []string {
-	if len(argv) == 0 {
-		return nil
-	}
-	return argv
-}
-
-var agentsArgv = []string{"claude", "agents", "--json"}
-
-func TestProbe(t *testing.T) {
-	cases := []struct {
-		name        string
-		id          string
-		out         string
-		wantCommand []string
-		want        agent.State
-		wantErr     bool
-	}{
-		{"listed", uuid, `[{"pid":1,"cwd":"/x","kind":"interactive","sessionId":"` + uuid + `","status":"busy"}]`, agentsArgv, agent.Running, false},
-		{"asked in upper case", upper, `[{"sessionId":"` + uuid + `"}]`, agentsArgv, agent.Running, false},
-		{"another conversation", uuid, `[{"sessionId":"` + fork + `"}]`, agentsArgv, agent.Stopped, false},
-		{"none running", uuid, `[]`, agentsArgv, agent.Stopped, false},
-		{"not JSON", uuid, `error: unknown command`, agentsArgv, agent.Stopped, true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			probe := Agent{}.Probe(tc.id)
-			if got := probe.Command(); !reflect.DeepEqual(got, tc.wantCommand) {
-				t.Errorf("Command() = %q, want %q", got, tc.wantCommand)
-			}
-			got, err := probe.Read([]byte(tc.out))
-			if got != tc.want || (err != nil) != tc.wantErr {
-				t.Errorf("Read() = %v, %v, want %v, error %v", got, err, tc.want, tc.wantErr)
+			got, id := Agent{}.Classify(strings.Fields(tc.argv))
+			if got != tc.want || id != tc.wantID {
+				t.Errorf("Classify() = %v, %q, want %v, %q", got, id, tc.want, tc.wantID)
 			}
 		})
 	}

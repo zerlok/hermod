@@ -2,8 +2,9 @@
 // the only package that decides from states: what to do for a pair of an
 // agent's and a worker's states, and where a chat's message goes. It reaches
 // relays and workers only through workspace, and an agent only through
-// agent.Agent, whose questions it answers by running the agent's commands on
-// the remote. It keeps nothing past the process.
+// agent.Agent and agent.ACP, whose operations the agent performs itself; a
+// start is handed the workspace's Host, so the agent runs and the workspace
+// hosts. It keeps nothing past the process.
 package session
 
 import (
@@ -14,15 +15,16 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"maps"
-	"slices"
+	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/env"
+	"github.com/zerlok/hermod/internal/pathmap"
 	"github.com/zerlok/hermod/internal/relay"
 	"github.com/zerlok/hermod/internal/secret"
+	"github.com/zerlok/hermod/internal/shell"
 	"github.com/zerlok/hermod/internal/worker"
 	"github.com/zerlok/hermod/internal/workspace"
 )
@@ -34,8 +36,16 @@ type Request struct {
 	Dir    string             // the local directory the session works in, absolute
 	Tree   workspace.Worktree // the linked git worktree Dir lies in; zero for none
 
-	// Agent reads Args; nil runs them as a command no agent runs.
+	// Agent classifies Args, looks a conversation up and starts it, answering
+	// for the remote; nil runs Args as a command no agent runs.
 	Agent agent.Agent
+	// LocalAgent is the same program answering for this workstation, asked
+	// only where it keeps a directory's conversations, so those of the
+	// directory reach the remote before Agent starts one.
+	LocalAgent agent.Agent
+	// IsHook tells the client's hook endpoint by a hook's URL; nil aims no
+	// hook at the client.
+	IsHook func(u *url.URL) bool
 	// Args is the command, program first; none runs the remote user's login
 	// shell.
 	Args []string
@@ -80,11 +90,20 @@ func (i Identity) vars() []env.Pair {
 	return pairs
 }
 
-func (r Request) logger() *log.Logger {
-	if r.Log == nil {
+// record is the record of a worker that is given the developer's git
+// identity and nothing else.
+func (i Identity) record() workspace.Record {
+	return workspace.Record{Vars: env.New(i.vars()...)}
+}
+
+func (r Request) logger() *log.Logger { return orDiscardLog(r.Log) }
+
+// orDiscardLog is l, or a logger that discards when l is nil.
+func orDiscardLog(l *log.Logger) *log.Logger {
+	if l == nil {
 		return log.New(io.Discard, "", 0)
 	}
-	return r.Log
+	return l
 }
 
 func (r Request) random() io.Reader {
@@ -101,12 +120,14 @@ type ExitStatus int
 
 func (e ExitStatus) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
 
-// The files of a hooked worker's directory that keep its Net relay's port and
-// token for as long as the worker exists: its agent's settings carry both,
-// and every session that attaches it later serves the same ones.
+// The files of a hooked worker's directory that keep its Net relay's port,
+// its token and the routes its hooks call for as long as the worker exists:
+// its agent's settings carry the first two, and every session that attaches
+// it later serves the same ones.
 const (
-	portFile  = "hook-port"
-	tokenFile = "hook-token"
+	portFile   = "hook-port"
+	tokenFile  = "hook-token"
+	routesFile = "hook-routes"
 )
 
 // Hook ports are drawn below Linux's default ephemeral range (32768–60999),
@@ -118,21 +139,31 @@ const (
 )
 
 // Attach runs one session: it opens the workspace the directory belongs to,
-// reads the worker's and the agent's states in one call on the remote, decides
-// from them, starts the worker when the decision says so, attaches the client
-// to it and detaches the workspace when the attach ends. A one-shot call runs
-// on the remote instead, with no workspace. A detach that the client caused,
-// by leaving, a signal or the worker's end, returns nil, so the caller exits
-// at once and nothing has to kill it.
+// reads the worker's and the agent's states, decides from them, starts the
+// worker when the decision says so, attaches the client to it and detaches
+// the workspace when the attach ends. A one-shot call runs on the remote
+// instead, with no workspace. A detach that the client caused, by leaving, a
+// signal or the worker's end, returns nil, so the caller exits at once and
+// nothing has to kill it.
 func Attach(ctx context.Context, req Request) error {
-	call := agent.NewCommand(req.Args)
+	invocation, id := agent.InvokesCommand, ""
 	if req.Agent != nil {
-		call = req.Agent.Parse(req.Args)
+		invocation, id = req.Agent.Classify(req.Args)
 	}
-	if call.OneShot() {
-		return oneShot(ctx, req, call)
+	var (
+		key worker.Key
+		err error
+	)
+	switch invocation {
+	case agent.InvokesOneShot:
+		return oneShot(ctx, req)
+	case agent.InvokesConversation:
+		key, err = workspace.ConversationKey(id)
+	case agent.InvokesCommand:
+		key, err = worker.NewKey(req.Name)
+	default:
+		return fmt.Errorf("session: unhandled invocation %s", invocation)
 	}
-	key, err := keyOf(req, call)
 	if err != nil {
 		return err
 	}
@@ -143,39 +174,29 @@ func Attach(ctx context.Context, req Request) error {
 	for _, p := range ws.Nested() {
 		req.logger().Printf("workspace %s holds the workspace of %s, whose files are now carried twice", ws.Root(), p.Local)
 	}
-	err = run(ctx, req, ws, call, key)
+	err = run(ctx, req, ws, id, key)
 	return errors.Join(err, ws.Detach(ctx))
 }
 
-// keyOf is the key of the call's worker: the conversation's, or the name the
-// caller gave a command no agent runs.
-func keyOf(req Request, call agent.Call) (worker.Key, error) {
-	if id, ok := call.ID(); ok {
-		return workspace.ConversationKey(id)
-	}
-	return worker.NewKey(req.Name)
-}
-
-// run is a session on an opened workspace, up to the end of its attach.
-func run(ctx context.Context, req Request, ws *workspace.Workspace, call agent.Call, key worker.Key) error {
-	id, conversation := call.ID()
-	var (
-		probe agent.Probe
-		look  []string
-	)
-	if conversation {
-		probe = req.Agent.Probe(id)
-		look = probe.Command()
-	}
-	seen, err := ws.Look(ctx, key, look, portFile, tokenFile)
+// run is a session on an opened workspace, up to the end of its attach; id is
+// the conversation's, "" for a command no agent runs.
+func run(ctx context.Context, req Request, ws *workspace.Workspace, id string, key worker.Key) error {
+	seen, err := ws.Look(ctx, key, portFile, tokenFile, routesFile)
 	if err != nil {
 		return err
 	}
 	st := states{worker: seen.State}
-	if conversation {
+	if id != "" {
 		st.runsAgent = true
-		if st.agent, err = probe.Read(seen.Out); err != nil {
+		conv, err := req.Agent.Lookup(ctx, id)
+		switch {
+		case errors.Is(err, agent.ErrUnknown):
+			// A conversation the program does not have has not started yet.
+			st.agent = agent.Stopped
+		case err != nil:
 			return err
+		default:
+			st.agent = conv.State
 		}
 	}
 	act, err := decide(st)
@@ -184,40 +205,38 @@ func run(ctx context.Context, req Request, ws *workspace.Workspace, call agent.C
 	}
 	req.logger().Printf("worker %s: %s", key, act)
 
-	needs := agent.NewNeeds(call.Args())
-	if conversation {
-		if needs, err = req.Agent.Run(call, ws.PathMap()); err != nil {
-			return err
-		}
-	}
-	if err := apply(ctx, req, ws, key, act, needs, seen, worker.Terminal); err != nil {
+	var aimed *hooks
+	err = carryOut(ctx, ws, key, act, func() error {
+		var err error
+		aimed, err = startWorker(ctx, req, ws, key, id)
+		return err
+	})
+	if err != nil {
 		return err
 	}
+	if act == join && id != "" {
+		aimed = rejoinHooks(ctx, req, ws, seen)
+	}
+	addNets(ctx, req, ws, aimed)
 	return left(ctx, ws.Attach(ctx, key, worker.Terminal, req.Streams))
 }
 
-// apply carries out what was decided for the worker a look saw: it ends the
-// worker to replace and starts it again, or starts an absent one with its
-// stdio in form, then adds the session's Net relays.
-func apply(ctx context.Context, req Request, ws *workspace.Workspace, key worker.Key, act action, needs agent.Needs, seen worker.Look, form worker.Form) error {
-	hook, hooked := readHook(seen)
+// carryOut carries out a decision on the worker of key: a join leaves it as it
+// runs, a replace ends it and then starts it with begin, and a start starts it
+// with begin.
+func carryOut(ctx context.Context, ws *workspace.Workspace, key worker.Key, act action, begin func() error) error {
 	switch act {
 	case join:
+		return nil
 	case replace:
 		if err := ws.End(ctx, key); err != nil {
 			return err
 		}
-		fallthrough
+		return begin()
 	case start:
-		var err error
-		if hook, hooked, err = startWorker(ctx, req, ws, key, needs, form); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("session: unhandled action %s", act)
+		return begin()
 	}
-	addNets(ctx, req, ws, needs, hook, hooked)
-	return nil
+	return fmt.Errorf("session: unhandled action %s", act)
 }
 
 // left is nil for an attach that ended because the client left, the worker's
@@ -232,109 +251,107 @@ func left(ctx context.Context, err error) error {
 	return err
 }
 
-// hook is a hooked worker's Net relay: the remote port its agent's hooks call
-// and the token they carry.
-type hook struct {
-	port  int
-	token secret.Token
+// startWorker starts the worker of key in req.Dir on a terminal. For a
+// conversation it first adds the FS relay between the local and the remote
+// agent's state directories, connected and flushed so the agent finds the
+// conversation's transcripts, then has the agent start it on the workspace's
+// Host, its hooks aimed at the client; a command no agent runs is executed on
+// the Host as given. It returns the hooks the agent's settings call, nil for
+// none.
+func startWorker(ctx context.Context, req Request, ws *workspace.Workspace, key worker.Key, id string) (*hooks, error) {
+	dir := ws.PathMap().ToRemote(req.Dir)
+	if id == "" {
+		host := ws.Host(key, worker.Terminal, identityRecord(req.Identity))
+		return nil, host.Exec(ctx, shell.Command{Args: req.Args, Dir: dir}).Wait()
+	}
+	if req.LocalAgent == nil {
+		return nil, errors.New("session: a conversation needs the agent of this workstation too")
+	}
+	local, err := req.LocalAgent.StateDir(ctx, req.Dir)
+	if err != nil {
+		return nil, err
+	}
+	remote, err := req.Agent.StateDir(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := ws.AddFS(ctx, pathmap.Place{Local: local, Remote: remote}); err != nil {
+		return nil, err
+	}
+	client, err := clientOf(ctx, req, ws)
+	if err != nil {
+		return nil, err
+	}
+	a := newAimer(req, client, func() (workerHook, error) { return newWorkerHook(ctx, req, ws) })
+	host := ws.Host(key, worker.Terminal, a.record)
+	if err := req.Agent.Start(ctx, host, launch(req, ws, a.aim)); err != nil {
+		return nil, err
+	}
+	return a.aimed(), nil
+}
+
+// rejoinHooks are the hooks of a running worker its directory records, aimed
+// at the client's endpoint the caller's settings name now: the client's
+// address and token change with every run of the client, while the worker's
+// settings keep the port, token and routes they were started with. A worker
+// that records none, or settings that cannot be read now, run without the
+// hooks' Net relay.
+func rejoinHooks(ctx context.Context, req Request, ws *workspace.Workspace, seen worker.Look) *hooks {
+	client, err := clientOf(ctx, req, ws)
+	if err != nil {
+		req.logger().Printf("no hooks: %v", err)
+		return nil
+	}
+	if client == nil {
+		return nil
+	}
+	rec, ok := readHook(seen)
+	if !ok {
+		req.logger().Printf("no hooks: %v", errNotRecorded)
+		return nil
+	}
+	return &hooks{recorded: rec, client: *client}
+}
+
+// errNotRecorded is a running worker whose directory records no hooks.
+var errNotRecorded = errors.New("the worker's directory records no hook port, token and routes")
+
+// launch is what the agent is given to start req's conversation in ws.
+func launch(req Request, ws *workspace.Workspace, hook func(agent.Hook) (agent.Hook, bool)) agent.Launch {
+	return agent.Launch{Args: req.Args, Dir: req.Dir, Paths: ws.PathMap(), Environ: req.Environ, Hook: hook}
+}
+
+// identityRecord is the record of a worker given the developer's git
+// identity and nothing else, as a Host reads it.
+func identityRecord(id Identity) func() (workspace.Record, error) {
+	return func() (workspace.Record, error) { return id.record(), nil }
 }
 
 // readHook is the hook a look found recorded in the worker's directory.
-func readHook(seen worker.Look) (hook, bool) {
+func readHook(seen worker.Look) (recorded, bool) {
 	portFound, okPort := seen.File(portFile)
 	tokenFound, okToken := seen.File(tokenFile)
-	if !okPort || !okToken {
-		return hook{}, false
+	routesFound, okRoutes := seen.File(routesFile)
+	if !okPort || !okToken || !okRoutes {
+		return recorded{}, false
 	}
 	port, err := strconv.Atoi(strings.TrimSpace(string(portFound.Content)))
 	token := secret.FromString(string(tokenFound.Content))
-	if err != nil || port <= 0 || token.IsZero() {
-		return hook{}, false
+	routes := strings.Fields(string(routesFound.Content))
+	if err != nil || port <= 0 || token.IsZero() || len(routes) == 0 {
+		return recorded{}, false
 	}
-	return hook{port: port, token: token}, true
-}
-
-// startWorker starts the worker in req.Dir with its stdio in form: first the
-// FS relays its agent requires, connected and flushed so the agent finds their
-// files, then the worker's directory and the worker. A hooked agent's settings are aimed at a port
-// picked free on the remote and carry a token generated for the worker, both
-// recorded in its directory.
-func startWorker(ctx context.Context, req Request, ws *workspace.Workspace, key worker.Key, needs agent.Needs, form worker.Form) (hook, bool, error) {
-	for _, place := range needs.Places() {
-		if err := ws.AddFS(ctx, place); err != nil {
-			return hook{}, false, err
-		}
-	}
-	contents := needs.Files()
-	if contents == nil {
-		contents = map[string]secret.Token{}
-	}
-	var (
-		h      hook
-		hooked bool
-	)
-	if file, document, ok := needs.Settings(); ok {
-		if _, _, _, ok := needs.Hooks(); ok {
-			var err error
-			if h, err = newHook(ctx, req, ws); err != nil {
-				return hook{}, false, err
-			}
-			if document, err = req.Agent.Hooks(document, h.port, h.token); err != nil {
-				return hook{}, false, err
-			}
-			hooked = true
-			contents[portFile] = secret.FromString(strconv.Itoa(h.port) + "\n")
-			contents[tokenFile] = h.token
-		}
-		contents[file] = document
-	}
-	var files []worker.File
-	for _, name := range slices.Sorted(maps.Keys(contents)) {
-		files = append(files, worker.File{Name: name, Content: []byte(contents[name].Reveal())})
-	}
-	_, err := ws.Start(ctx, worker.Spec{
-		Key:     key,
-		Dir:     ws.PathMap().ToRemote(req.Dir),
-		Command: needs.Command(),
-		Files:   files,
-		Vars:    needs.Vars(req.Environ).With(req.Identity.vars()...),
-		Form:    form,
-	})
-	return h, hooked, err
-}
-
-// newHook picks the worker's hook port free on the remote and generates its
-// token.
-func newHook(ctx context.Context, req Request, ws *workspace.Workspace) (hook, error) {
-	raw := make([]byte, 2*hookPortCandidates)
-	if _, err := io.ReadFull(req.random(), raw); err != nil {
-		return hook{}, fmt.Errorf("pick hook ports: %w", err)
-	}
-	candidates := make([]int, hookPortCandidates)
-	for i := range candidates {
-		candidates[i] = hookPortMin + int(binary.BigEndian.Uint16(raw[2*i:]))%(hookPortMax-hookPortMin+1)
-	}
-	port, err := ws.FreePort(ctx, portFile, candidates)
-	if err != nil {
-		return hook{}, err
-	}
-	token, err := secret.NewToken(req.random())
-	if err != nil {
-		return hook{}, err
-	}
-	return hook{port: port, token: token}, nil
+	return recorded{workerHook: workerHook{port: port, token: token}, routes: routes}, true
 }
 
 // addNets adds the session's Net relays: the hooks' through their filter, and
 // the user's own. A relay that cannot be added costs only what it carries,
 // such as a port another process took on the remote: the session runs without
 // it, and the next session tries the same port again.
-func addNets(ctx context.Context, req Request, ws *workspace.Workspace, needs agent.Needs, h hook, hooked bool) {
+func addNets(ctx context.Context, req Request, ws *workspace.Workspace, h *hooks) {
 	logger := req.logger()
-	if address, routes, client, ok := needs.Hooks(); ok {
-		if !hooked {
-			logger.Printf("no hooks: the worker's directory records no hook port and token")
-		} else if err := ws.AddNet(ctx, h.port, address, newHookFilter(h.token, routes, client, ws.PathMap())); err != nil {
+	if h != nil {
+		if err := ws.AddNet(ctx, h.port, h.client.address, h.filter(ws.PathMap())); err != nil {
 			logger.Printf("no hooks: remote port %d: %v", h.port, err)
 		}
 	}
@@ -343,4 +360,26 @@ func addNets(ctx context.Context, req Request, ws *workspace.Workspace, needs ag
 			logger.Printf("no relay from remote port %d to %s: %v", f.Port, f.Address, err)
 		}
 	}
+}
+
+// newWorkerHook picks the worker's hook port free on the remote and
+// generates its token.
+func newWorkerHook(ctx context.Context, req Request, ws *workspace.Workspace) (workerHook, error) {
+	raw := make([]byte, 2*hookPortCandidates)
+	if _, err := io.ReadFull(req.random(), raw); err != nil {
+		return workerHook{}, fmt.Errorf("pick hook ports: %w", err)
+	}
+	candidates := make([]int, hookPortCandidates)
+	for i := range candidates {
+		candidates[i] = hookPortMin + int(binary.BigEndian.Uint16(raw[2*i:]))%(hookPortMax-hookPortMin+1)
+	}
+	port, err := ws.FreePort(ctx, portFile, candidates)
+	if err != nil {
+		return workerHook{}, err
+	}
+	token, err := secret.NewToken(req.random())
+	if err != nil {
+		return workerHook{}, err
+	}
+	return workerHook{port: port, token: token}, nil
 }

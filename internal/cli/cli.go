@@ -7,6 +7,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -103,12 +105,39 @@ func Run() int {
 		local: shell.NewLocal(), dryRun: shell.NewDryRun,
 		cwd: os.Getwd, home: os.UserHomeDir, hostname: os.Hostname,
 		lookupEnv: os.LookupEnv, environ: os.Environ, executable: os.Executable,
-		readFile: os.ReadFile,
+		readFile: readOnce(os.ReadFile),
 		terminal: func() bool { return isTerminal(os.Stdin) && isTerminal(os.Stdout) },
 		openLog:  openLog,
 		stdin:    os.Stdin, stdout: os.Stdout, stderr: os.Stderr,
 	}
 	return exitCode(execute(ctx, a, os.Args), os.Stderr)
+}
+
+// readOnce is read with each file's first answer kept for the process. A
+// session reads the caller's settings and MCP files more than once, finding
+// the client's hook endpoint before the agent's start rewrites them; a file
+// such as a pipe gives its bytes to one read only, and one the client rewrites
+// in between would name another endpoint, so every read sees the first.
+func readOnce(read func(name string) ([]byte, error)) func(name string) ([]byte, error) {
+	type answer struct {
+		content []byte
+		err     error
+	}
+	var (
+		mu      sync.Mutex
+		answers = map[string]answer{}
+	)
+	return func(name string) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		got, ok := answers[name]
+		if !ok {
+			got.content, got.err = read(name)
+			answers[name] = got
+		}
+		// A copy, so a caller that changes its bytes changes no later read's.
+		return bytes.Clone(got.content), got.err
+	}
 }
 
 // execute dispatches on the program name in argv[0]: started as claude, the
