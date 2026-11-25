@@ -31,8 +31,10 @@ type Adapters struct {
 	// holds a local directory, with that worktree's root; ok is false for a
 	// directory in no linked worktree.
 	MainWorktree func(ctx context.Context, dir string) (main, root string, ok bool)
-	// Connect is the connection to an adapter over its output and its input.
-	Connect func(fromAdapter io.Reader, toAdapter io.Writer) Channel
+	// Connect is the connection to the adapter of the workspace rooted at
+	// root, over the adapter's output and its input. started is whether this
+	// attach started the adapter, rather than joined one that runs on.
+	Connect func(root Path, started bool, fromAdapter io.Reader, toAdapter io.Writer) Channel
 
 	// Errors opens the log of what the adapter of key writes to its stderr.
 	// nil, or a log that cannot be opened, leaves those lines to Log.
@@ -103,12 +105,13 @@ func (a Adapters) attach(ctx context.Context, ws *workspace.Workspace, dir strin
 		_ = fromAdapter.CloseWithError(err)
 		_ = toAdapter.CloseWithError(err)
 	}()
+	root, started := Path(ws.Root()), act != join
 	return Attachment{
 		Workspace: ws,
-		Root:      Path(ws.Root()),
+		Root:      root,
 		Paths:     NewPathMap(ws.PathMap()),
-		Adapter:   a.Connect(output, input),
-		Started:   act != join,
+		Adapter:   a.Connect(root, started, output, input),
+		Started:   started,
 	}, nil
 }
 

@@ -141,7 +141,7 @@ func (r *router) close(ctx context.Context, stop context.CancelFunc) error {
 func (r *router) fromClient(ctx context.Context, msg Message) error {
 	switch msg.Kind() {
 	case Connect:
-		r.connect = msg.WithoutClientCapabilities()
+		r.connect = msg
 		return r.req.Client.Send(msg.Reply(HandshakeResult{Handshake: r.req.ACP.Connect()}))
 
 	case List:
@@ -150,7 +150,7 @@ func (r *router) fromClient(ctx context.Context, msg Message) error {
 	case Cancel:
 		dir, ok := r.pending[msg.ID()]
 		if !ok {
-			r.req.Log.Printf("dropped a cancel of %q, which no session holds", msg.ID())
+			r.req.Log.Printf("dropped a cancel of %s, which no session holds", msg.ID())
 			return nil
 		}
 		return r.handle(ctx, dir, msg)
@@ -161,7 +161,7 @@ func (r *router) fromClient(ctx context.Context, msg Message) error {
 			return err
 		}
 		if !live {
-			r.req.Log.Printf("dropped an answer to %q, whose session detached", msg.ID())
+			r.req.Log.Printf("dropped an answer to %s, whose session detached", msg.ID())
 			return nil
 		}
 		return r.handle(ctx, dir, answer)
@@ -184,7 +184,7 @@ func (r *router) fromClient(ctx context.Context, msg Message) error {
 	case Pass:
 		dir, ok := r.deps.shared.owners[msg.Chat()]
 		if !ok || msg.Chat() == "" {
-			if msg.ID() == "" {
+			if msg.ID().IsZero() {
 				return nil
 			}
 			return r.req.Client.Send(msg.Fail(fmt.Errorf("hermod: no chat %q is open", msg.Chat())))
@@ -192,7 +192,7 @@ func (r *router) fromClient(ctx context.Context, msg Message) error {
 		return r.request(ctx, dir, msg)
 
 	case Question:
-		return fmt.Errorf("session: a question from the client: %q", msg.ID())
+		return fmt.Errorf("session: a question from the client: %s", msg.ID())
 	}
 	return fmt.Errorf("session: unhandled message kind %s", msg.Kind())
 }
@@ -210,7 +210,7 @@ func (r *router) forChat(ctx context.Context, msg Message) error {
 		// A stopped chat keeps nothing running to suspend: attaching for it
 		// would start an adapter that no Close ever ends.
 		if msg.Kind() == Suspend && conv.State == agent.Stopped {
-			if msg.ID() == "" {
+			if msg.ID().IsZero() {
 				return nil
 			}
 			return r.req.Client.Send(msg.Reply(EmptyResult{}))
@@ -234,7 +234,7 @@ func (r *router) forChat(ctx context.Context, msg Message) error {
 // fail answers a request the router could not route with err; a notification
 // has no answer, so its failure is only logged.
 func (r *router) fail(msg Message, err error) error {
-	if msg.ID() == "" {
+	if msg.ID().IsZero() {
 		r.req.Log.Printf("dropped a %s of chat %q: %v", msg.Kind(), msg.Chat(), err)
 		return nil
 	}
@@ -300,7 +300,7 @@ func (r *router) session(ctx context.Context, dir Path) (*SessionControl, error)
 // that the session passes to its adapter, so a Cancel of it finds the session.
 // A Suspend is answered by the session and never reaches an adapter.
 func (r *router) request(ctx context.Context, dir Path, msg Message) error {
-	if msg.ID() != "" && msg.Kind() != Suspend {
+	if !msg.ID().IsZero() && msg.Kind() != Suspend {
 		r.pending[msg.ID()] = dir
 	}
 	return r.handle(ctx, dir, msg)

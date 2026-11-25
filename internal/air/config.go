@@ -1,7 +1,7 @@
 // Package air holds JetBrains Air's own facts: the acp.json document that
 // makes a remote an agent in Air's chat, the stand-in link Air's terminal
-// starts as its claude, Air's hook endpoint, and what Air's own ACP methods
-// mean to a session.
+// starts as its claude, Air's hook endpoint, and Air's own ACP messages, which
+// its Serializer reads beside ACP's standard ones.
 package air
 
 import (

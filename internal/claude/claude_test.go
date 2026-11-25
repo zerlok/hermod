@@ -77,7 +77,7 @@ func TestConnect(t *testing.T) {
 		want    bool
 	}{
 		{"claude-agent-acp's answer", acpVersion, acpCapabilities, true},
-		{"the same, spaced and ordered otherwise", 1, `{"sessionCapabilities":{"resume":{},"list":{},"fork":{},"close":{}},"mcpCapabilities":{"sse":true,"http":true},"promptCapabilities":{"embeddedContext":true,"image":true},"loadSession":true}`, true},
+		{"the same, spaced and ordered otherwise", 1, `{"sessionCapabilities":{"resume":{},"list":{},"close":{}},"mcpCapabilities":{"sse":true,"http":true},"promptCapabilities":{"embeddedContext":true,"image":true},"loadSession":true}`, true},
 		{"another version", 2, acpCapabilities, false},
 		{"no session loading", 1, `{"loadSession":false}`, false},
 	}

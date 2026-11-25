@@ -114,6 +114,8 @@ func (a app) runChat(ctx context.Context, host string) error {
 		return err
 	}
 	logger := log.New(a.stderr, "", 0)
+	serializer := air.NewSerializer()
+	connections := acp.NewAdapters[session.Path](serializer, logger)
 	ag := a.remoteAgent(host)
 	adapters := session.Adapters{
 		Remote:  remote,
@@ -127,13 +129,13 @@ func (a app) runChat(ctx context.Context, host string) error {
 		MainWorktree: func(ctx context.Context, dir string) (string, string, bool) {
 			return git.MainWorktree(ctx, a.local, dir)
 		},
-		Connect: func(fromAdapter io.Reader, toAdapter io.Writer) session.Channel {
-			return acp.NewAdapter(fromAdapter, toAdapter)
+		Connect: func(root session.Path, started bool, fromAdapter io.Reader, toAdapter io.Writer) session.Channel {
+			return connections.Connect(root, started, fromAdapter, toAdapter)
 		},
 		Errors: a.adapterLog(l.home),
 		Log:    logger,
 	}
-	client := acp.NewClient(a.stdin, a.stdout, air.Methods())
+	client := acp.NewClient(a.stdin, a.stdout, serializer, logger)
 	defer func() { _ = client.Close() }()
 	return a.chat(ctx, session.ChatRequest{
 		Client: client,

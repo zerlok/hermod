@@ -41,13 +41,13 @@ type opening struct {
 }
 
 // optionalID is a request ID that may be unset. A notification has no ID and
-// no answer, so an empty one is never set: it would match every notification.
+// no answer, so a zero one is never set: it would match every notification.
 type optionalID struct {
 	id  MessageID
 	set bool
 }
 
-func someID(id MessageID) optionalID { return optionalID{id: id, set: id != ""} }
+func someID(id MessageID) optionalID { return optionalID{id: id, set: !id.IsZero()} }
 
 func (o optionalID) is(id MessageID) bool { return o.set && o.id == id }
 
@@ -172,8 +172,10 @@ func (st sessionAttached) HandleClientMessage(ctx context.Context, sm SessionSM,
 		if err != nil {
 			return false, err
 		}
-		if err := s.toClient(msg.Reply(EmptyResult{})); err != nil {
-			return false, err
+		if !msg.ID().IsZero() {
+			if err := s.toClient(msg.Reply(EmptyResult{})); err != nil {
+				return false, err
+			}
 		}
 		st = st.left(waited)
 		sm.SetState(st)
@@ -415,14 +417,14 @@ func (s *sessionContext) runsConversation(ctx context.Context) (bool, error) {
 // from what the agent declared, which the client was answered with.
 func (s *sessionContext) compareHandshake(msg Message) {
 	declared := s.acp.Connect()
-	got, ok := msg.Handshake()
+	got, ok := msg.Result().(HandshakeResult)
 	switch {
 	case !ok:
 		s.log.Printf("session %s: the adapter's answer to the connection start is no handshake", s.dir)
-	case got.Version() != declared.Version():
-		s.log.Printf("session %s: the adapter speaks protocol version %d, the client was answered %d", s.dir, got.Version(), declared.Version())
-	case !got.Equal(declared):
-		s.log.Printf("session %s: the adapter offers capabilities %s, the client was answered %s", s.dir, got.Capabilities(), declared.Capabilities())
+	case got.Handshake.Version() != declared.Version():
+		s.log.Printf("session %s: the adapter speaks protocol version %d, the client was answered %d", s.dir, got.Handshake.Version(), declared.Version())
+	case !got.Handshake.Equal(declared):
+		s.log.Printf("session %s: the adapter offers capabilities %s, the client was answered %s", s.dir, got.Handshake.Capabilities(), declared.Capabilities())
 	}
 }
 
@@ -441,7 +443,7 @@ func (s *sessionContext) toClient(msg Message) error {
 	case Cancel:
 		id, ok := s.shared.requests.asked(s.dir, msg.ID())
 		if !ok {
-			s.log.Printf("session %s: dropped a cancel of %q, a question the client was not asked", s.dir, msg.ID())
+			s.log.Printf("session %s: dropped a cancel of %s, a question the client was not asked", s.dir, msg.ID())
 			return nil
 		}
 		msg = msg.WithID(id)
@@ -476,7 +478,7 @@ func newRequests() *requests {
 
 func (r *requests) ask(dir Path, msg Message) Message {
 	r.next++
-	id := MessageID(fmt.Sprintf("hermod-%d", r.next))
+	id := TextID(fmt.Sprintf("hermod-%d", r.next))
 	r.pending[id] = asked{dir: dir, id: msg.ID()}
 	return msg.WithID(id)
 }
@@ -489,7 +491,7 @@ func (r *requests) asked(dir Path, id MessageID) (MessageID, bool) {
 			return ours, true
 		}
 	}
-	return "", false
+	return MessageID{}, false
 }
 
 // answer is the session that asked, and the answer under the adapter's own ID;
@@ -502,7 +504,7 @@ func (r *requests) answer(msg Message) (dir Path, answer Message, live bool, err
 	}
 	a, ok := r.pending[msg.ID()]
 	if !ok {
-		return "", nil, false, fmt.Errorf("session: answer to an unknown request %q", msg.ID())
+		return "", nil, false, fmt.Errorf("session: answer to an unknown request %s", msg.ID())
 	}
 	delete(r.pending, msg.ID())
 	return a.dir, msg.WithID(a.id), true, nil

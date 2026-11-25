@@ -28,9 +28,6 @@ type fakeMsg struct {
 	// is none.
 	version int
 	caps    string
-	// kept is a Connect without the client capabilities on the client's
-	// workstation.
-	kept bool
 }
 
 func (m fakeMsg) Kind() Kind                  { return m.kind }
@@ -40,10 +37,6 @@ func (m fakeMsg) Dir() Path                   { return m.dir }
 func (m fakeMsg) WithID(id MessageID) Message { m.id = id; return m }
 func (m fakeMsg) Reply(r Result) Message      { return fakeMsg{id: m.id, result: describe(r)} }
 func (m fakeMsg) Fail(error) Message          { return fakeMsg{id: m.id, failed: true} }
-func (m fakeMsg) WithoutClientCapabilities() Message {
-	m.kept = true
-	return m
-}
 
 func (m fakeMsg) Mapped(path func(Path) Path) Message {
 	if m.dir != "" {
@@ -52,12 +45,15 @@ func (m fakeMsg) Mapped(path func(Path) Path) Message {
 	return m
 }
 
-func (m fakeMsg) Handshake() (agent.Handshake, bool) {
+func (m fakeMsg) Result() Result {
 	if m.caps == "" {
-		return agent.Handshake{}, false
+		return nil
 	}
 	h, err := agent.NewHandshake(m.version, []byte(m.caps))
-	return h, err == nil
+	if err != nil {
+		return nil
+	}
+	return HandshakeResult{Handshake: h}
 }
 
 // describe writes a result as a table states it.
@@ -77,30 +73,39 @@ func describe(r Result) string {
 	return fmt.Sprintf("unknown result %T", r)
 }
 
+// fid is the ID a table writes as text; "" is none.
+func fid(id string) MessageID {
+	if id == "" {
+		return MessageID{}
+	}
+	return TextID(id)
+}
+
 // The messages of the tables, by what they are.
-func connectReq(id MessageID) fakeMsg              { return fakeMsg{kind: Connect, id: id} }
-func keptConnect(id MessageID) fakeMsg             { return fakeMsg{kind: Connect, id: id, kept: true} }
-func listReq(id MessageID, dir string) fakeMsg     { return fakeMsg{kind: List, id: id, dir: Path(dir)} }
-func cancelReq(id MessageID) fakeMsg               { return fakeMsg{kind: Cancel, id: id} }
-func openIn(id MessageID, dir string) fakeMsg      { return fakeMsg{kind: Open, id: id, dir: Path(dir)} }
-func reopen(id MessageID, chat ChatID) fakeMsg     { return fakeMsg{kind: Open, id: id, chat: chat} }
-func suspendReq(id MessageID, chat ChatID) fakeMsg { return fakeMsg{kind: Suspend, id: id, chat: chat} }
-func closeReq(id MessageID, chat ChatID) fakeMsg   { return fakeMsg{kind: Close, id: id, chat: chat} }
-func ask(id MessageID, chat ChatID) fakeMsg        { return fakeMsg{kind: Question, id: id, chat: chat} }
-func reply(id MessageID) fakeMsg                   { return fakeMsg{kind: Answer, id: id} }
-func failure(id MessageID) fakeMsg                 { return fakeMsg{id: id, failed: true} }
-func result(id MessageID, r string) fakeMsg        { return fakeMsg{id: id, result: r} }
-func update(chat ChatID) fakeMsg                   { return fakeMsg{chat: chat} }
+func connectReq(id string) fakeMsg          { return fakeMsg{kind: Connect, id: fid(id)} }
+func listReq(id string, dir string) fakeMsg { return fakeMsg{kind: List, id: fid(id), dir: Path(dir)} }
+func cancelReq(id string) fakeMsg           { return fakeMsg{kind: Cancel, id: fid(id)} }
+func openIn(id string, dir string) fakeMsg  { return fakeMsg{kind: Open, id: fid(id), dir: Path(dir)} }
+func reopen(id string, chat ChatID) fakeMsg { return fakeMsg{kind: Open, id: fid(id), chat: chat} }
+func suspendReq(id string, chat ChatID) fakeMsg {
+	return fakeMsg{kind: Suspend, id: fid(id), chat: chat}
+}
+func closeReq(id string, chat ChatID) fakeMsg { return fakeMsg{kind: Close, id: fid(id), chat: chat} }
+func ask(id string, chat ChatID) fakeMsg      { return fakeMsg{kind: Question, id: fid(id), chat: chat} }
+func reply(id string) fakeMsg                 { return fakeMsg{kind: Answer, id: fid(id)} }
+func failure(id string) fakeMsg               { return fakeMsg{id: fid(id), failed: true} }
+func result(id string, r string) fakeMsg      { return fakeMsg{id: fid(id), result: r} }
+func update(chat ChatID) fakeMsg              { return fakeMsg{chat: chat} }
 
 // prompt is a request of the client's in a chat, or an adapter's answer that
 // names the chat, such as the answer to an Open of a new chat.
-func prompt(id MessageID, chat ChatID) fakeMsg { return fakeMsg{id: id, chat: chat} }
+func prompt(id string, chat ChatID) fakeMsg { return fakeMsg{id: fid(id), chat: chat} }
 
 // done is an adapter's answer that names no chat.
-func done(id MessageID) fakeMsg { return fakeMsg{id: id} }
+func done(id string) fakeMsg { return fakeMsg{id: fid(id)} }
 
-func handshakeAnswer(id MessageID, version int, caps string) fakeMsg {
-	return fakeMsg{id: id, version: version, caps: caps}
+func handshakeAnswer(id string, version int, caps string) fakeMsg {
+	return fakeMsg{id: fid(id), version: version, caps: caps}
 }
 
 // fakeChannel is one side's connection: what a test hands in arrives on in,

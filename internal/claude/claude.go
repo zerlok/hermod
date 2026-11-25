@@ -215,13 +215,15 @@ func readAgents(out []byte) (map[string]running, error) {
 const acpVersion = 1
 
 // acpCapabilities are the agent capabilities claude-agent-acp answers
-// `initialize` with: images and embedded context in prompts, MCP servers over
-// HTTP and SSE, and loading, listing, resuming, forking and closing sessions.
+// `initialize` with, of those ACP declares: images and embedded context in
+// prompts, MCP servers over HTTP and SSE, and loading, listing, resuming and
+// closing sessions. Its forking is left out: session/fork is no method of
+// ACP's, and a chat client's connection carries only ACP's and the client's own.
 const acpCapabilities = `{
   "loadSession": true,
   "promptCapabilities": {"image": true, "embeddedContext": true},
   "mcpCapabilities": {"http": true, "sse": true},
-  "sessionCapabilities": {"close": {}, "fork": {}, "list": {}, "resume": {}}
+  "sessionCapabilities": {"close": {}, "list": {}, "resume": {}}
 }`
 
 // Connect is claude-agent-acp's own answer to a connection start, so a client

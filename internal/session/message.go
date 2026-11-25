@@ -2,6 +2,7 @@ package session
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/pathmap"
@@ -16,8 +17,7 @@ const (
 	// the zero Kind, so a message nobody classified is only carried.
 	Pass Kind = iota
 	// Connect is the client starting its connection. session answers it from
-	// the agent and keeps it, WithoutClientCapabilities, for every adapter it
-	// starts.
+	// the agent and keeps it for every adapter it starts.
 	Connect
 	// List is the client asking for the chats of a directory. session answers
 	// it from the agent program.
@@ -63,9 +63,50 @@ func (k Kind) String() string {
 	return fmt.Sprintf("kind(%d)", int(k))
 }
 
-// MessageID is a request's ID on one connection; empty for a message that is
-// no request and answers none.
-type MessageID string
+// MessageID is a request's ID on one connection, as the side that made the
+// request wrote it: a number or a text. The two never equal each other, even
+// when they read alike, because a side matches an answer to its request by the
+// ID exactly as it wrote it. The zero MessageID is none: the ID of a message
+// that is no request and answers none.
+type MessageID struct {
+	form   idForm
+	number int64
+	text   string
+}
+
+type idForm uint8
+
+const (
+	noID idForm = iota
+	numberID
+	textID
+)
+
+// NumberID is the ID n, written as a number.
+func NumberID(n int64) MessageID { return MessageID{form: numberID, number: n} }
+
+// TextID is the ID s, written as a text; the empty text is an ID too.
+func TextID(s string) MessageID { return MessageID{form: textID, text: s} }
+
+// Number is the ID's number, when it was written as one.
+func (id MessageID) Number() (int64, bool) { return id.number, id.form == numberID }
+
+// Text is the ID's text, when it was written as one.
+func (id MessageID) Text() (string, bool) { return id.text, id.form == textID }
+
+// IsZero reports whether the ID is none.
+func (id MessageID) IsZero() bool { return id.form == noID }
+
+// String is the ID for a log line: a number as its digits, a text quoted.
+func (id MessageID) String() string {
+	switch id.form {
+	case numberID:
+		return strconv.FormatInt(id.number, 10)
+	case textID:
+		return strconv.Quote(id.text)
+	}
+	return "none"
+}
 
 // ChatID is a chat's ID, the agent program's own ID of the conversation.
 type ChatID string
@@ -89,23 +130,19 @@ type Message interface {
 	// Mapped is the same message with every path in it taken through path.
 	Mapped(path func(Path) Path) Message
 	// Reply is the answer to this request with result, for a request session
-	// answers itself.
+	// answers itself. Only a request has an answer: session replies to a
+	// message only when its ID is not zero.
 	Reply(result Result) Message
-	// Fail is an error answer to this request.
+	// Result is the Result this answer carries; nil for a message that is no
+	// answer, or whose answer is none of the Results.
+	Result() Result
+	// Fail is an error answer to this request, as Reply is.
 	Fail(err error) Message
-	// WithoutClientCapabilities is the same Connect without the client
-	// capabilities that act on the client's own workstation, its files and
-	// its terminals: the agent runs on the remote, and what it reads, writes
-	// or runs must be there too.
-	WithoutClientCapabilities() Message
-	// Handshake is what an answer to a Connect says of the protocol version
-	// and the capabilities; ok is false for any other message, or an answer
-	// that cannot be read as one.
-	Handshake() (h agent.Handshake, ok bool)
 }
 
-// Result is what session answers a request with. It is closed: EmptyResult,
-// HandshakeResult and ListResult are all there is.
+// Result is what session answers a request with, or reads from an answer: a
+// plain value, which the channel writes in its protocol's terms. It is closed:
+// EmptyResult, HandshakeResult and ListResult are all there is.
 type Result interface{ isResult() }
 
 // EmptyResult answers a request that has nothing to return, such as a Suspend.

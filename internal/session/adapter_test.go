@@ -42,10 +42,13 @@ func (c nullChannel) Receive() <-chan Message { return c.received }
 func (nullChannel) Err() error                { return nil }
 func (nullChannel) Send(Message) error        { return nil }
 
-// adapterConn is what Connect was handed: the adapter's output and its input.
+// adapterConn is what Connect was handed: the workspace root, whether the
+// adapter was started, and the adapter's output and its input.
 type adapterConn struct {
-	from io.Reader
-	to   io.Writer
+	root    Path
+	started bool
+	from    io.Reader
+	to      io.Writer
 }
 
 // TestAdaptersAttach checks that attaching a directory's workspace starts its
@@ -110,8 +113,8 @@ func TestAdaptersAttach(t *testing.T) {
 				Remote: f.remote(), Local: local, Agent: fakeAgent{f: f},
 				Identity:     func(context.Context, string) Identity { return Identity{} },
 				MainWorktree: func(context.Context, string) (string, string, bool) { return "", "", false },
-				Connect: func(from io.Reader, to io.Writer) Channel {
-					conns = append(conns, adapterConn{from: from, to: to})
+				Connect: func(root Path, started bool, from io.Reader, to io.Writer) Channel {
+					conns = append(conns, adapterConn{root: root, started: started, from: from, to: to})
 					return nullChannel{received: make(chan Message)}
 				},
 			}
@@ -164,6 +167,9 @@ func TestAdaptersAttach(t *testing.T) {
 			}
 			if att.Started != tc.wantStarted || att.Root != Path(api) {
 				t.Errorf("started, root = %v, %q, want %v, %q", att.Started, att.Root, tc.wantStarted, api)
+			}
+			if conns[0].started != tc.wantStarted || conns[0].root != Path(api) {
+				t.Errorf("connected with started, root = %v, %q, want %v, %q", conns[0].started, conns[0].root, tc.wantStarted, api)
 			}
 			if !tc.waits {
 				// A read to the end returns only once the connection has
@@ -223,8 +229,8 @@ func TestAdaptersErrors(t *testing.T) {
 				Remote: f.remote(), Local: testLocal(t), Agent: fakeAgent{f: f},
 				Identity:     func(context.Context, string) Identity { return Identity{} },
 				MainWorktree: func(context.Context, string) (string, string, bool) { return "", "", false },
-				Connect: func(from io.Reader, to io.Writer) Channel {
-					conns = append(conns, adapterConn{from: from, to: to})
+				Connect: func(root Path, started bool, from io.Reader, to io.Writer) Channel {
+					conns = append(conns, adapterConn{root: root, started: started, from: from, to: to})
 					return nullChannel{received: make(chan Message)}
 				},
 				Log: log.New(&logged, "", 0),
