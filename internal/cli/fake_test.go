@@ -183,8 +183,8 @@ func newApp(t *testing.T, s setup) (app, *recorder) {
 		},
 		chat: func(_ context.Context, req session.ChatRequest) error {
 			r.chats = append(r.chats, req)
-			for msg := range req.Client.Receive() {
-				r.received = append(r.received, msg.Kind())
+			for in := range req.Client.Receive() {
+				r.received = append(r.received, in.Message.Kind())
 			}
 			return nil
 		},

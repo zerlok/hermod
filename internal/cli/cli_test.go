@@ -818,12 +818,12 @@ func TestHookWiring(t *testing.T) {
 	}
 }
 
-// TestChatSerializer checks that the chat's client connection reads stdin
-// and answers on stdout with Air's serializer: Air's own messages arrive by
-// what they mean, and a method neither serializer knows never reaches the
-// core, a request being answered with method not found and a notification
-// only logged.
-func TestChatSerializer(t *testing.T) {
+// TestChatRegistry checks that the chat's client connection reads stdin and
+// answers on stdout with ACP's methods and Air's: Air's own messages arrive
+// by what they mean, and a method neither registers never reaches the core, a
+// request being answered with method not found and a notification only
+// logged.
+func TestChatRegistry(t *testing.T) {
 	cases := []struct {
 		name    string
 		line    string
@@ -850,12 +850,12 @@ func TestChatSerializer(t *testing.T) {
 			name:    "a request of an unknown method",
 			line:    `{"jsonrpc":"2.0","id":1,"method":"_other/thing","params":{}}`,
 			wantOut: `{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found: no request \"_other/thing\" from the client"}}` + "\n",
-			wantLog: `dropped a line from the client: acp: method not found: no request "_other/thing" from the client` + "\n",
+			wantLog: `acp: dropped a message from the client: method not found: no request "_other/thing" from the client` + "\n",
 		},
 		{
 			name:    "a notification of an unknown method",
 			line:    `{"jsonrpc":"2.0","method":"_other/thing","params":{}}`,
-			wantLog: `dropped a line from the client: acp: no notification "_other/thing" from the client` + "\n",
+			wantLog: `acp: dropped a message from the client: method not found: no notification "_other/thing" from the client` + "\n",
 		},
 	}
 	for _, tc := range cases {

@@ -12,8 +12,6 @@ import (
 // shows, or at a URL. It is tied to a chat, and then perhaps to one of its
 // tool calls, or to a request.
 type CreateElicitationParams struct {
-	asks
-	noDir
 	Message string          `json:"message"`
 	Mode    ElicitationMode `json:"mode"`
 	// RequestedSchema is the form's, for the form mode.
@@ -23,11 +21,9 @@ type CreateElicitationParams struct {
 	URL           *string    `json:"url,omitzero"`
 	SessionID     *SessionID `json:"sessionId,omitzero"`
 	ToolCallID    *string    `json:"toolCallId,omitzero"`
-	RequestID     *requestID `json:"requestId,omitzero"`
-	Meta          Meta       `json:"_meta,omitzero"`
+	RequestID     Value      `json:"requestId,omitzero"`
+	Extensible
 }
-
-func (CreateElicitationParams) Method() string { return "elicitation/create" }
 
 func (p CreateElicitationParams) Chat() session.ChatID {
 	if p.SessionID == nil {
@@ -41,24 +37,27 @@ type ElicitationMode string
 
 func (m *ElicitationMode) UnmarshalJSON(b []byte) error { return decodeEnum(b, m, "form", "url") }
 
-// UnmarshalJSON checks that the params hold what their mode and their scope
-// need, which ACP writes in one object.
-func (p *CreateElicitationParams) UnmarshalJSON(b []byte) error {
-	type plain CreateElicitationParams
-	if err := decode(b, (*plain)(p)); err != nil {
-		return err
-	}
+// Validate checks that the params hold what their mode and their scope need,
+// which ACP writes in one object.
+func (p CreateElicitationParams) Validate() error {
 	switch {
+	case p.Message == "" || p.Mode == "":
+		return errors.New("an elicitation has a message and a mode")
 	case p.Mode == "form" && p.RequestedSchema == nil:
 		return errors.New("a form elicitation has a requestedSchema")
 	case p.Mode == "url" && (p.ElicitationID == nil || p.URL == nil):
 		return errors.New("a URL elicitation has an elicitationId and a url")
-	case (p.SessionID == nil) == (p.RequestID == nil):
+	case (p.SessionID == nil) == (p.RequestID.IsZero() || p.RequestID.value == nil):
 		return errors.New("an elicitation is tied to a sessionId or to a requestId")
 	case p.ToolCallID != nil && p.SessionID == nil:
 		return errors.New("an elicitation's toolCallId is in a sessionId")
 	}
-	return nil
+	return opt("requestedSchema", p.RequestedSchema)
+}
+
+func (p *CreateElicitationParams) mapPaths(m mapper) {
+	mapOpt(m, &p.RequestedSchema)
+	m.meta(&p.Meta)
 }
 
 // ElicitationSchema is a form: the properties it asks for.
@@ -68,19 +67,27 @@ type ElicitationSchema struct {
 	Properties  map[string]ElicitationPropertySchema `json:"properties,omitzero"`
 	Required    []string                             `json:"required,omitzero"`
 	Description *string                              `json:"description,omitzero"`
-	Meta        Meta                                 `json:"_meta,omitzero"`
+	Extensible
 }
 
-// UnmarshalJSON accepts only an object schema, the one ACP declares.
-func (s *ElicitationSchema) UnmarshalJSON(b []byte) error {
-	type plain ElicitationSchema
-	if err := decode(b, (*plain)(s)); err != nil {
-		return err
-	}
+// Validate accepts only an object schema, the one ACP declares.
+func (s ElicitationSchema) Validate() error {
 	if s.Type != nil && *s.Type != "object" {
 		return fmt.Errorf("an elicitation's schema is an object, not %q", *s.Type)
 	}
 	return nil
+}
+
+func (s *ElicitationSchema) mapPaths(m mapper) {
+	if s.Properties != nil {
+		properties := make(map[string]ElicitationPropertySchema, len(s.Properties))
+		for name, p := range s.Properties {
+			p.mapPaths(m)
+			properties[name] = p
+		}
+		s.Properties = properties
+	}
+	m.meta(&s.Meta)
 }
 
 // ElicitationPropertySchema is one property of a form.
@@ -92,13 +99,36 @@ type ElicitationPropertySchema struct {
 	Array   *MultiSelectPropertySchema
 }
 
-func (s *ElicitationPropertySchema) UnmarshalJSON(b []byte) error {
-	*s = ElicitationPropertySchema{}
-	return decodeTagged(b, "type", variants{"string": &s.String, "number": &s.Number, "integer": &s.Integer, "boolean": &s.Boolean, "array": &s.Array})
+func (u *ElicitationPropertySchema) arms() []arm {
+	return []arm{
+		armOf("string", &u.String),
+		armOf("number", &u.Number),
+		armOf("integer", &u.Integer),
+		armOf("boolean", &u.Boolean),
+		armOf("array", &u.Array),
+	}
 }
 
-func (s ElicitationPropertySchema) MarshalJSON() ([]byte, error) {
-	return encodeTagged("type", variants{"string": s.String, "number": s.Number, "integer": s.Integer, "boolean": s.Boolean, "array": s.Array})
+func (u *ElicitationPropertySchema) UnmarshalJSON(b []byte) error {
+	*u = ElicitationPropertySchema{}
+	return decodeUnion(b, "type", u.arms())
+}
+
+func (u ElicitationPropertySchema) MarshalJSON() ([]byte, error) {
+	return encodeUnion("type", u.arms())
+}
+
+func (u ElicitationPropertySchema) Validate() error {
+	_, err := heldArm(u.arms())
+	return err
+}
+
+func (u *ElicitationPropertySchema) mapPaths(m mapper) {
+	mapOpt(m, &u.String)
+	mapOpt(m, &u.Number)
+	mapOpt(m, &u.Integer)
+	mapOpt(m, &u.Boolean)
+	mapOpt(m, &u.Array)
 }
 
 // StringPropertySchema is a text property, or a choice of one of its values.
@@ -112,7 +142,14 @@ type StringPropertySchema struct {
 	Default     *string       `json:"default,omitzero"`
 	Enum        []string      `json:"enum,omitzero"`
 	OneOf       []EnumOption  `json:"oneOf,omitzero"`
-	Meta        Meta          `json:"_meta,omitzero"`
+	Extensible
+}
+
+func (s StringPropertySchema) Validate() error { return each("oneOf", s.OneOf) }
+
+func (s *StringPropertySchema) mapPaths(m mapper) {
+	mapEach(m, &s.OneOf)
+	m.meta(&s.Meta)
 }
 
 // StringFormat is the format a text property's value takes.
@@ -127,7 +164,11 @@ type EnumOption struct {
 	Const       string  `json:"const"`
 	Title       string  `json:"title"`
 	Description *string `json:"description,omitzero"`
-	Meta        Meta    `json:"_meta,omitzero"`
+	Extensible
+}
+
+func (o EnumOption) Validate() error {
+	return check(need(o.Const != "", "const"), need(o.Title != "", "title"))
 }
 
 // NumberPropertySchema is a number property.
@@ -137,7 +178,7 @@ type NumberPropertySchema struct {
 	Minimum     *float64 `json:"minimum,omitzero"`
 	Maximum     *float64 `json:"maximum,omitzero"`
 	Default     *float64 `json:"default,omitzero"`
-	Meta        Meta     `json:"_meta,omitzero"`
+	Extensible
 }
 
 // IntegerPropertySchema is an integer property.
@@ -147,7 +188,7 @@ type IntegerPropertySchema struct {
 	Minimum     *int64  `json:"minimum,omitzero"`
 	Maximum     *int64  `json:"maximum,omitzero"`
 	Default     *int64  `json:"default,omitzero"`
-	Meta        Meta    `json:"_meta,omitzero"`
+	Extensible
 }
 
 // BooleanPropertySchema is a boolean property.
@@ -155,7 +196,7 @@ type BooleanPropertySchema struct {
 	Title       *string `json:"title,omitzero"`
 	Description *string `json:"description,omitzero"`
 	Default     *bool   `json:"default,omitzero"`
-	Meta        Meta    `json:"_meta,omitzero"`
+	Extensible
 }
 
 // MultiSelectPropertySchema is a choice of several values.
@@ -166,7 +207,16 @@ type MultiSelectPropertySchema struct {
 	MaxItems    *int64           `json:"maxItems,omitzero"`
 	Items       MultiSelectItems `json:"items"`
 	Default     []string         `json:"default,omitzero"`
-	Meta        Meta             `json:"_meta,omitzero"`
+	Extensible
+}
+
+func (s MultiSelectPropertySchema) Validate() error {
+	return in("items", s.Items.Validate())
+}
+
+func (s *MultiSelectPropertySchema) mapPaths(m mapper) {
+	s.Items.mapPaths(m)
+	m.meta(&s.Meta)
 }
 
 // MultiSelectItems are the values of a choice of several: plain, or titled,
@@ -176,44 +226,59 @@ type MultiSelectItems struct {
 	Titled *TitledMultiSelectItems
 }
 
+func (u *MultiSelectItems) arms() []arm {
+	return []arm{
+		armOf("string", &u.Plain),
+		armOf("", &u.Titled),
+	}
+}
+
+func (u *MultiSelectItems) UnmarshalJSON(b []byte) error {
+	*u = MultiSelectItems{}
+	return decodeUnion(b, "type", u.arms())
+}
+
+func (u MultiSelectItems) MarshalJSON() ([]byte, error) { return encodeUnion("type", u.arms()) }
+
+func (u MultiSelectItems) Validate() error {
+	_, err := heldArm(u.arms())
+	return err
+}
+
+func (u *MultiSelectItems) mapPaths(m mapper) {
+	mapOpt(m, &u.Plain)
+	mapOpt(m, &u.Titled)
+}
+
 // StringMultiSelectItems are plain values.
 type StringMultiSelectItems struct {
 	Enum []string `json:"enum"`
-	Meta Meta     `json:"_meta,omitzero"`
+	Extensible
 }
+
+func (i StringMultiSelectItems) Validate() error { return need(i.Enum != nil, "enum") }
 
 // TitledMultiSelectItems are titled values.
 type TitledMultiSelectItems struct {
 	AnyOf []EnumOption `json:"anyOf"`
-	Meta  Meta         `json:"_meta,omitzero"`
+	Extensible
 }
 
-func (i *MultiSelectItems) UnmarshalJSON(b []byte) error {
-	*i = MultiSelectItems{}
-	typed, err := has(b, "type")
-	if err != nil {
-		return err
-	}
-	if !typed {
-		return decodeInto(b, &i.Titled)
-	}
-	return decodeTagged(b, "type", variants{"string": &i.Plain})
+func (i TitledMultiSelectItems) Validate() error {
+	return check(need(i.AnyOf != nil, "anyOf"), each("anyOf", i.AnyOf))
 }
 
-func (i MultiSelectItems) MarshalJSON() ([]byte, error) {
-	if i.Titled != nil && i.Plain == nil {
-		return marshal(i.Titled)
-	}
-	return encodeTagged("type", variants{"string": i.Plain})
+func (i *TitledMultiSelectItems) mapPaths(m mapper) {
+	mapEach(m, &i.AnyOf)
+	m.meta(&i.Meta)
 }
 
 // CreateElicitationResult is the user's answer: the form's content when they
 // accepted, or that they declined or cancelled.
 type CreateElicitationResult struct {
-	noChat
 	Action  ElicitationAction           `json:"action"`
 	Content map[string]ElicitationValue `json:"content,omitzero"`
-	Meta    Meta                        `json:"_meta,omitzero"`
+	Extensible
 }
 
 // ElicitationAction is what the user did.
@@ -223,11 +288,10 @@ func (a *ElicitationAction) UnmarshalJSON(b []byte) error {
 	return decodeEnum(b, a, "accept", "decline", "cancel")
 }
 
-// UnmarshalJSON accepts content only with an accept.
-func (r *CreateElicitationResult) UnmarshalJSON(b []byte) error {
-	type plain CreateElicitationResult
-	if err := decode(b, (*plain)(r)); err != nil {
-		return err
+// Validate accepts content only with an accept.
+func (r CreateElicitationResult) Validate() error {
+	if r.Action == "" {
+		return errors.New("action is required")
 	}
 	if r.Content != nil && r.Action != "accept" {
 		return fmt.Errorf("an elicitation the user did not accept has no content, and %q does", r.Action)
@@ -235,6 +299,8 @@ func (r *CreateElicitationResult) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// mapPaths maps the result's _meta; the form's content is what the user
+// typed.
 // ElicitationValue is one value of a form's content: a string, a number, a
 // boolean, or a list of strings.
 type ElicitationValue struct{ value any }
@@ -263,11 +329,10 @@ func (v ElicitationValue) MarshalJSON() ([]byte, error) { return marshal(v.value
 
 // CompleteElicitationParams says a URL elicitation is done.
 type CompleteElicitationParams struct {
-	passes
-	noChat
-	noDir
 	ElicitationID string `json:"elicitationId"`
-	Meta          Meta   `json:"_meta,omitzero"`
+	Extensible
 }
 
-func (CompleteElicitationParams) Method() string { return "elicitation/complete" }
+func (p CompleteElicitationParams) Validate() error {
+	return need(p.ElicitationID != "", "elicitationId")
+}

@@ -1,48 +1,47 @@
 package acp
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"reflect"
-	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/zerlok/hermod/internal/session"
 )
 
-// asked is the lookup of a side that sent, or received, one request, method,
-// under any ID; "" for none.
-func asked(method string) func(session.MessageID) (string, bool) {
-	return func(session.MessageID) (string, bool) { return method, method != "" }
-}
-
-// read is the message the standard serializer reads from line.
-func read(t *testing.T, from Peer, method, line string) session.Message {
+// read is the message the standard registry reads from doc, the params of
+// method or, when result, the result of its answer.
+func read(t *testing.T, method string, result bool, doc string) session.Message {
 	t.Helper()
-	msg, err := NewStandard().Decode([]byte(line), from, asked(method))
+	m, ok := Standard().methods[method]
+	if !ok {
+		t.Fatalf("no method %s", method)
+	}
+	readDoc := m.params
+	if result {
+		readDoc = m.result
+	}
+	msg, err := readDoc([]byte(doc))
 	if err != nil {
-		t.Fatalf("Decode(%s): %v", line, err)
+		t.Fatalf("read %s: %v", doc, err)
 	}
 	return msg
 }
 
-// written is the line the standard serializer writes for msg, on a side that
-// received no request.
+// written is msg's params or result as a Conn writes them.
 func written(t *testing.T, msg session.Message) string {
 	t.Helper()
-	return answering(t, "", msg)
-}
-
-// answering is the line the standard serializer writes for msg, on a side that
-// received one request, method, under any ID.
-func answering(t *testing.T, method string, msg session.Message) string {
-	t.Helper()
-	line, err := NewStandard().Encode(msg, asked(method))
+	b, err := marshal(msg.(wire).params())
 	if err != nil {
-		t.Fatalf("Encode: %v", err)
+		t.Fatalf("write: %v", err)
 	}
-	return string(line)
+	return string(b)
 }
 
 // sameJSON reports whether two documents say the same, however spaced.
@@ -55,19 +54,119 @@ func sameJSON(t *testing.T, got, want string) bool {
 	return json.Unmarshal([]byte(got), &a) == nil && reflect.DeepEqual(a, b)
 }
 
-// num and text are the IDs a table writes.
-func num(n int64) session.MessageID   { return session.NumberID(n) }
-func text(s string) session.MessageID { return session.TextID(s) }
-
-// lines is the lines of written, without their newlines.
-func lines(written string) []string {
-	var out []string
-	for line := range strings.SplitSeq(written, "\n") {
-		if line != "" {
-			out = append(out, line)
-		}
-	}
-	return out
+// safeBuffer is a log the connection's reader writes while a test reads it.
+type safeBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
 }
 
-func discard() *log.Logger { return log.New(io.Discard, "", 0) }
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// farEnd is the other side of a Conn: it writes the lines the Conn reads,
+// and receives the lines the Conn writes.
+type farEnd struct {
+	conn  *Conn
+	w     *io.PipeWriter
+	lines chan string
+	log   *safeBuffer
+}
+
+// dial is a Conn to peer, of the standard registry, and its far end.
+func dial(t *testing.T, peer Peer) *farEnd {
+	t.Helper()
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	e := &farEnd{w: inW, lines: make(chan string, 64), log: &safeBuffer{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	e.conn = NewConn(ctx, inR, outW, Standard(), peer, log.New(e.log, "", 0))
+	go func() {
+		sc := bufio.NewScanner(outR)
+		for sc.Scan() {
+			e.lines <- sc.Text()
+		}
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = inW.Close()
+		_ = outW.Close()
+	})
+	return e
+}
+
+// returned is what a Call returned.
+type returned struct {
+	msg session.Message
+	err error
+}
+
+// call calls msg on the Conn under ctx; what it returns arrives on the
+// channel.
+func (e *farEnd) call(t *testing.T, ctx context.Context, msg session.Message) <-chan returned {
+	t.Helper()
+	done := make(chan returned, 1)
+	if err := e.conn.Call(ctx, msg, func(m session.Message, err error) { done <- returned{m, err} }); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	return done
+}
+
+// send writes line to the Conn.
+func (e *farEnd) send(t *testing.T, line string) {
+	t.Helper()
+	if _, err := io.WriteString(e.w, line+"\n"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+}
+
+// next is the next line the Conn wrote.
+func (e *farEnd) next(t *testing.T) string {
+	t.Helper()
+	select {
+	case line := <-e.lines:
+		return line
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connection wrote nothing")
+		return ""
+	}
+}
+
+// inbound is the next message the Conn delivered.
+func (e *farEnd) inbound(t *testing.T) session.Inbound {
+	t.Helper()
+	select {
+	case in, ok := <-e.conn.Receive():
+		if !ok {
+			t.Fatalf("the connection ended: %v", e.conn.Err())
+		}
+		return in
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connection delivered nothing")
+		return session.Inbound{}
+	}
+}
+
+// frameOf reads a line the Conn wrote.
+func frameOf(t *testing.T, line string) frame {
+	t.Helper()
+	var f frame
+	if err := json.Unmarshal([]byte(line), &f); err != nil {
+		t.Fatalf("not JSON-RPC: %s", line)
+	}
+	return f
+}
+
+type discardWriter struct{}
+
+func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+func testLogger() *log.Logger { return log.New(io.Discard, "", 0) }

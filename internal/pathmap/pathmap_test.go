@@ -256,3 +256,36 @@ func TestAbsolute(t *testing.T) {
 		})
 	}
 }
+
+// TestValue maps every string of a decoded JSON value, at any depth, and
+// leaves keys and every other value as they are.
+func TestValue(t *testing.T) {
+	m, err := New(Place{Local: "/home/me/dev/api", Remote: "/home/u/dev/api"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name    string
+		toLocal bool
+		in      any
+		want    any
+	}{
+		{"a string", false, "/home/me/dev/api/a", "/home/u/dev/api/a"},
+		{"nested strings, keys and numbers untouched", true,
+			map[string]any{"/home/u/dev/api": []any{"/home/u/dev/api/b", 1.5, true, nil, map[string]any{"p": "/home/u/dev/api"}}},
+			map[string]any{"/home/u/dev/api": []any{"/home/me/dev/api/b", 1.5, true, nil, map[string]any{"p": "/home/me/dev/api"}}}},
+		{"a string under no root", false, "/etc/hosts", "/etc/hosts"},
+		{"no string", true, 7.0, 7.0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mapString := m.ToRemote
+			if tc.toLocal {
+				mapString = m.ToLocal
+			}
+			if got := Value(tc.in, mapString); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("Value = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}

@@ -1,7 +1,6 @@
 package acp
 
 import (
-	"errors"
 	"fmt"
 	"time"
 
@@ -9,103 +8,127 @@ import (
 	"github.com/zerlok/hermod/internal/session"
 )
 
-// The parts of a type of params or result that say nothing to a session.
-type (
-	passes struct{}
-	noChat struct{}
-	noDir  struct{}
-)
-
-func (passes) Kind() session.Kind   { return session.Pass }
-func (noChat) Chat() session.ChatID { return "" }
-func (noDir) Dir() session.Path     { return "" }
-
 // SessionID is ACP's ID of a session, which session calls a chat.
 type SessionID string
 
 func (id SessionID) chat() session.ChatID { return session.ChatID(id) }
 
-// standardMethods are ACP's methods, by who sends them.
-func standardMethods() []Method {
-	return []Method{
-		RequestOf[InitializeParams, InitializeResult](Client),
-		RequestOf[AuthenticateParams, AuthenticateResult](Client),
-		RequestOf[LogoutParams, LogoutResult](Client),
-		RequestOf[NewSessionParams, NewSessionResult](Client),
-		RequestOf[LoadSessionParams, LoadSessionResult](Client),
-		RequestOf[ListSessionsParams, ListSessionsResult](Client),
-		RequestOf[DeleteSessionParams, DeleteSessionResult](Client),
-		RequestOf[ResumeSessionParams, ResumeSessionResult](Client),
-		RequestOf[CloseSessionParams, CloseSessionResult](Client),
-		RequestOf[SetSessionModeParams, SetSessionModeResult](Client),
-		RequestOf[SetSessionConfigOptionParams, SetSessionConfigOptionResult](Client),
-		RequestOf[PromptParams, PromptResult](Client),
-		NotificationOf[CancelParams](Client),
-		NotificationOf[CancelRequestParams](Client, Agent),
+// Standard is a registry of ACP's own methods.
+func Standard() *Registry {
+	r := NewRegistry()
+	Request[InitializeParams, InitializeResult](r, "initialize", Client)
+	Request[AuthenticateParams, AuthenticateResult](r, "authenticate", Client)
+	Request[LogoutParams, LogoutResult](r, "logout", Client)
+	Request[NewSessionParams, NewSessionResult](r, "session/new", Client)
+	Request[LoadSessionParams, LoadSessionResult](r, "session/load", Client)
+	Request[ResumeSessionParams, ResumeSessionResult](r, "session/resume", Client)
+	Request[ListSessionsParams, ListSessionsResult](r, "session/list", Client)
+	Request[DeleteSessionParams, DeleteSessionResult](r, "session/delete", Client)
+	Request[CloseSessionParams, CloseSessionResult](r, "session/close", Client)
+	Request[SetSessionModeParams, SetSessionModeResult](r, "session/set_mode", Client)
+	Request[SetSessionConfigOptionParams, SetSessionConfigOptionResult](r, "session/set_config_option", Client)
+	Request[PromptParams, PromptResult](r, "session/prompt", Client)
+	Notification[CancelParams](r, "session/cancel", Client)
 
-		RequestOf[ReadTextFileParams, ReadTextFileResult](Agent),
-		RequestOf[WriteTextFileParams, WriteTextFileResult](Agent),
-		RequestOf[RequestPermissionParams, RequestPermissionResult](Agent),
-		RequestOf[CreateTerminalParams, CreateTerminalResult](Agent),
-		RequestOf[TerminalOutputParams, TerminalOutputResult](Agent),
-		RequestOf[ReleaseTerminalParams, ReleaseTerminalResult](Agent),
-		RequestOf[WaitForTerminalExitParams, WaitForTerminalExitResult](Agent),
-		RequestOf[KillTerminalParams, KillTerminalResult](Agent),
-		RequestOf[CreateElicitationParams, CreateElicitationResult](Agent),
-		NotificationOf[SessionNotification](Agent),
-		NotificationOf[CompleteElicitationParams](Agent),
+	Request[ReadTextFileParams, ReadTextFileResult](r, "fs/read_text_file", Agent)
+	Request[WriteTextFileParams, WriteTextFileResult](r, "fs/write_text_file", Agent)
+	Request[RequestPermissionParams, RequestPermissionResult](r, "session/request_permission", Agent)
+	Request[CreateTerminalParams, CreateTerminalResult](r, "terminal/create", Agent)
+	Request[TerminalOutputParams, TerminalOutputResult](r, "terminal/output", Agent)
+	Request[ReleaseTerminalParams, ReleaseTerminalResult](r, "terminal/release", Agent)
+	Request[WaitForTerminalExitParams, WaitForTerminalExitResult](r, "terminal/wait_for_exit", Agent)
+	Request[KillTerminalParams, KillTerminalResult](r, "terminal/kill", Agent)
+	Request[CreateElicitationParams, CreateElicitationResult](r, "elicitation/create", Agent)
+	Notification[SessionNotification](r, "session/update", Agent)
+	Notification[CompleteElicitationParams](r, "elicitation/complete", Agent)
+	return r
+}
+
+// fromSession is a Result of session's in ACP's terms: what a request session
+// answers itself is answered with.
+func fromSession(r session.Result) (any, error) {
+	switch r := r.(type) {
+	case session.EmptyResult:
+		return struct{}{}, nil
+	case session.HandshakeResult:
+		var caps AgentCapabilities
+		if err := decode(r.Handshake.Capabilities(), &caps); err != nil {
+			return nil, fmt.Errorf("hermod: the agent's capabilities: %w", err)
+		}
+		return InitializeResult{ProtocolVersion: r.Handshake.Version(), AgentCapabilities: &caps, AuthMethods: []AuthMethod{}}, nil
+	case session.ListResult:
+		// A conversation's state is the agent program's own and has no place
+		// in ACP's list.
+		sessions := make([]SessionInfo, 0, len(r.Conversations))
+		for _, c := range r.Conversations {
+			info := SessionInfo{SessionID: SessionID(c.ID), Cwd: c.Dir}
+			if c.Title != "" {
+				info.Title = &c.Title
+			}
+			if !c.Updated.IsZero() {
+				updated := c.Updated.UTC().Format(time.RFC3339)
+				info.UpdatedAt = &updated
+			}
+			sessions = append(sessions, info)
+		}
+		return ListSessionsResult{Sessions: sessions}, nil
 	}
+	return nil, fmt.Errorf("hermod: no answer of ACP's is a %T", r)
 }
 
 // InitializeParams starts a client's connection.
 type InitializeParams struct {
-	noChat
-	noDir
 	ProtocolVersion    int                 `json:"protocolVersion"`
 	ClientCapabilities *ClientCapabilities `json:"clientCapabilities,omitzero"`
 	ClientInfo         *Implementation     `json:"clientInfo,omitzero"`
-	Meta               Meta                `json:"_meta,omitzero"`
+	Extensible
 }
 
-func (InitializeParams) Method() string     { return "initialize" }
 func (InitializeParams) Kind() session.Kind { return session.Connect }
 
+// Validate requires a protocol version, which ACP counts from 1.
+func (p InitializeParams) Validate() error {
+	return check(need(p.ProtocolVersion > 0, "protocolVersion"), opt("clientInfo", p.ClientInfo))
+}
+
+func (p *InitializeParams) mapPaths(m mapper) {
+	mapOpt(m, &p.ClientCapabilities)
+	mapOpt(m, &p.ClientInfo)
+	m.meta(&p.Meta)
+}
+
 // withoutClientCapabilities is an initialize without the client capabilities
-// that act on the client's own workstation, and any other message as it is.
-func withoutClientCapabilities(msg session.Message) session.Message {
-	init, ok := msg.(Request[InitializeParams, InitializeResult])
-	if !ok || init.Params.ClientCapabilities == nil {
-		return msg
+// that act on the client's own workstation.
+func withoutClientCapabilities(m message[InitializeParams]) message[InitializeParams] {
+	if m.value.ClientCapabilities == nil {
+		return m
 	}
-	caps := *init.Params.ClientCapabilities
+	caps := *m.value.ClientCapabilities
 	caps.FS, caps.Terminal = nil, nil
-	init.Params.ClientCapabilities = &caps
-	return init
+	m.value.ClientCapabilities = &caps
+	return m
 }
 
 // InitializeResult answers an initialize. Hermod asks for no authentication of
 // its own: an adapter that needs one is started on the remote, where its
 // credentials are.
 type InitializeResult struct {
-	noChat
 	ProtocolVersion   int                `json:"protocolVersion"`
 	AgentCapabilities *AgentCapabilities `json:"agentCapabilities,omitzero"`
 	AuthMethods       []AuthMethod       `json:"authMethods,omitzero"`
 	AgentInfo         *Implementation    `json:"agentInfo,omitzero"`
-	Meta              Meta               `json:"_meta,omitzero"`
+	Extensible
 }
 
-// FromSession writes a HandshakeResult in ACP's terms.
-func (InitializeResult) FromSession(r session.Result) (InitializeResult, error) {
-	h, ok := r.(session.HandshakeResult)
-	if !ok {
-		return InitializeResult{}, fmt.Errorf("hermod: initialize is not answered with a %T", r)
-	}
-	var caps AgentCapabilities
-	if err := decode(h.Handshake.Capabilities(), &caps); err != nil {
-		return InitializeResult{}, fmt.Errorf("hermod: the agent's capabilities: %w", err)
-	}
-	return InitializeResult{ProtocolVersion: h.Handshake.Version(), AgentCapabilities: &caps, AuthMethods: []AuthMethod{}}, nil
+func (r InitializeResult) Validate() error {
+	return check(need(r.ProtocolVersion > 0, "protocolVersion"), opt("agentInfo", r.AgentInfo))
+}
+
+func (r *InitializeResult) mapPaths(m mapper) {
+	mapOpt(m, &r.AgentCapabilities)
+	mapEach(m, &r.AuthMethods)
+	mapOpt(m, &r.AgentInfo)
+	m.meta(&r.Meta)
 }
 
 // toSession reads the answer as a handshake. ACP lets an agent leave out its
@@ -128,116 +151,150 @@ func (r InitializeResult) toSession() (session.Result, bool) {
 
 // AuthenticateParams authenticates the client with one of the agent's methods.
 type AuthenticateParams struct {
-	passes
-	noChat
-	noDir
 	MethodID string `json:"methodId"`
-	Meta     Meta   `json:"_meta,omitzero"`
+	Extensible
 }
 
-func (AuthenticateParams) Method() string { return "authenticate" }
+func (p AuthenticateParams) Validate() error { return need(p.MethodID != "", "methodId") }
 
 // AuthenticateResult answers an authenticate.
-type AuthenticateResult struct {
-	noChat
-	Meta Meta `json:"_meta,omitzero"`
-}
+type AuthenticateResult struct{ EmptyResult }
 
 // LogoutParams ends the client's authentication.
 type LogoutParams struct {
-	passes
-	noChat
-	noDir
-	Meta Meta `json:"_meta,omitzero"`
+	Extensible
 }
-
-func (LogoutParams) Method() string { return "logout" }
 
 // LogoutResult answers a logout.
-type LogoutResult struct {
-	noChat
-	Meta Meta `json:"_meta,omitzero"`
-}
+type LogoutResult struct{ EmptyResult }
 
 // NewSessionParams opens a new chat in a directory.
 type NewSessionParams struct {
-	noChat
-	Cwd                   string        `json:"cwd" acp:"path"`
-	AdditionalDirectories []string      `json:"additionalDirectories,omitzero" acp:"path"`
+	Cwd                   string        `json:"cwd"`
+	AdditionalDirectories []string      `json:"additionalDirectories,omitzero"`
 	MCPServers            []MCPServer   `json:"mcpServers"`
 	SystemPrompt          *SystemPrompt `json:"systemPrompt,omitzero"`
-	Meta                  Meta          `json:"_meta,omitzero"`
+	Extensible
 }
 
-func (NewSessionParams) Method() string      { return "session/new" }
 func (NewSessionParams) Kind() session.Kind  { return session.Open }
 func (p NewSessionParams) Dir() session.Path { return session.Path(p.Cwd) }
+
+func (p NewSessionParams) Validate() error {
+	return check(need(p.Cwd != "", "cwd"), need(p.MCPServers != nil, "mcpServers"), opt("systemPrompt", p.SystemPrompt))
+}
+
+func (p *NewSessionParams) mapPaths(m mapper) {
+	m.path(&p.Cwd)
+	m.paths(&p.AdditionalDirectories)
+	mapEach(m, &p.MCPServers)
+	mapOpt(m, &p.SystemPrompt)
+	m.meta(&p.Meta)
+}
 
 // NewSessionResult answers a session/new with the chat it made.
 type NewSessionResult struct {
 	SessionID     SessionID             `json:"sessionId"`
 	Modes         *SessionModeState     `json:"modes,omitzero"`
 	ConfigOptions []SessionConfigOption `json:"configOptions,omitzero"`
-	Meta          Meta                  `json:"_meta,omitzero"`
+	Extensible
 }
 
 func (r NewSessionResult) Chat() session.ChatID { return r.SessionID.chat() }
 
+func (r NewSessionResult) Validate() error {
+	return check(need(r.SessionID != "", "sessionId"), opt("modes", r.Modes), each("configOptions", r.ConfigOptions))
+}
+
+func (r *NewSessionResult) mapPaths(m mapper) {
+	mapOpt(m, &r.Modes)
+	mapEach(m, &r.ConfigOptions)
+	m.meta(&r.Meta)
+}
+
 // LoadSessionParams opens a chat again, its history replayed.
 type LoadSessionParams struct {
 	SessionID             SessionID     `json:"sessionId"`
-	Cwd                   string        `json:"cwd" acp:"path"`
-	AdditionalDirectories []string      `json:"additionalDirectories,omitzero" acp:"path"`
+	Cwd                   string        `json:"cwd"`
+	AdditionalDirectories []string      `json:"additionalDirectories,omitzero"`
 	MCPServers            []MCPServer   `json:"mcpServers"`
 	SystemPrompt          *SystemPrompt `json:"systemPrompt,omitzero"`
-	Meta                  Meta          `json:"_meta,omitzero"`
+	Extensible
 }
 
-func (LoadSessionParams) Method() string         { return "session/load" }
 func (LoadSessionParams) Kind() session.Kind     { return session.Open }
 func (p LoadSessionParams) Chat() session.ChatID { return p.SessionID.chat() }
 func (p LoadSessionParams) Dir() session.Path    { return session.Path(p.Cwd) }
 
-// LoadSessionResult answers a session/load.
-type LoadSessionResult struct {
-	noChat
+func (p LoadSessionParams) Validate() error {
+	return check(need(p.SessionID != "", "sessionId"), need(p.Cwd != "", "cwd"), need(p.MCPServers != nil, "mcpServers"), opt("systemPrompt", p.SystemPrompt))
+}
+
+func (p *LoadSessionParams) mapPaths(m mapper) {
+	m.path(&p.Cwd)
+	m.paths(&p.AdditionalDirectories)
+	mapEach(m, &p.MCPServers)
+	mapOpt(m, &p.SystemPrompt)
+	m.meta(&p.Meta)
+}
+
+// OpenedSession is what the answer to a session/load or a session/resume
+// holds: the chat's modes and options.
+type OpenedSession struct {
 	Modes         *SessionModeState     `json:"modes,omitzero"`
 	ConfigOptions []SessionConfigOption `json:"configOptions,omitzero"`
-	Meta          Meta                  `json:"_meta,omitzero"`
+	Extensible
 }
+
+func (r OpenedSession) Validate() error {
+	return check(opt("modes", r.Modes), each("configOptions", r.ConfigOptions))
+}
+
+func (r *OpenedSession) mapPaths(m mapper) {
+	mapOpt(m, &r.Modes)
+	mapEach(m, &r.ConfigOptions)
+	m.meta(&r.Meta)
+}
+
+// LoadSessionResult answers a session/load.
+type LoadSessionResult struct{ OpenedSession }
 
 // ResumeSessionParams opens a chat again without replaying its history.
 type ResumeSessionParams struct {
 	SessionID             SessionID     `json:"sessionId"`
-	Cwd                   string        `json:"cwd" acp:"path"`
-	AdditionalDirectories []string      `json:"additionalDirectories,omitzero" acp:"path"`
+	Cwd                   string        `json:"cwd"`
+	AdditionalDirectories []string      `json:"additionalDirectories,omitzero"`
 	MCPServers            []MCPServer   `json:"mcpServers,omitzero"`
 	SystemPrompt          *SystemPrompt `json:"systemPrompt,omitzero"`
-	Meta                  Meta          `json:"_meta,omitzero"`
+	Extensible
 }
 
-func (ResumeSessionParams) Method() string         { return "session/resume" }
 func (ResumeSessionParams) Kind() session.Kind     { return session.Open }
 func (p ResumeSessionParams) Chat() session.ChatID { return p.SessionID.chat() }
 func (p ResumeSessionParams) Dir() session.Path    { return session.Path(p.Cwd) }
 
-// ResumeSessionResult answers a session/resume.
-type ResumeSessionResult struct {
-	noChat
-	Modes         *SessionModeState     `json:"modes,omitzero"`
-	ConfigOptions []SessionConfigOption `json:"configOptions,omitzero"`
-	Meta          Meta                  `json:"_meta,omitzero"`
+func (p ResumeSessionParams) Validate() error {
+	return check(need(p.SessionID != "", "sessionId"), need(p.Cwd != "", "cwd"), opt("systemPrompt", p.SystemPrompt))
 }
+
+func (p *ResumeSessionParams) mapPaths(m mapper) {
+	m.path(&p.Cwd)
+	m.paths(&p.AdditionalDirectories)
+	mapEach(m, &p.MCPServers)
+	mapOpt(m, &p.SystemPrompt)
+	m.meta(&p.Meta)
+}
+
+// ResumeSessionResult answers a session/resume.
+type ResumeSessionResult struct{ OpenedSession }
 
 // ListSessionsParams asks for the chats of a directory.
 type ListSessionsParams struct {
-	noChat
-	Cwd    *string `json:"cwd,omitzero" acp:"path"`
+	Cwd    *string `json:"cwd,omitzero"`
 	Cursor *string `json:"cursor,omitzero"`
-	Meta   Meta    `json:"_meta,omitzero"`
+	Extensible
 }
 
-func (ListSessionsParams) Method() string     { return "session/list" }
 func (ListSessionsParams) Kind() session.Kind { return session.List }
 
 func (p ListSessionsParams) Dir() session.Path {
@@ -247,233 +304,165 @@ func (p ListSessionsParams) Dir() session.Path {
 	return session.Path(*p.Cwd)
 }
 
-// ListSessionsResult answers a session/list.
-type ListSessionsResult struct {
-	noChat
-	Sessions   []SessionInfo `json:"sessions"`
-	NextCursor *string       `json:"nextCursor,omitzero"`
-	Meta       Meta          `json:"_meta,omitzero"`
+func (p *ListSessionsParams) mapPaths(m mapper) {
+	m.optPath(&p.Cwd)
+	m.meta(&p.Meta)
 }
 
-// FromSession writes a ListResult in ACP's terms. A conversation's state is
-// the agent program's own and has no place in it.
-func (ListSessionsResult) FromSession(r session.Result) (ListSessionsResult, error) {
-	l, ok := r.(session.ListResult)
-	if !ok {
-		return ListSessionsResult{}, fmt.Errorf("hermod: session/list is not answered with a %T", r)
-	}
-	sessions := make([]SessionInfo, 0, len(l.Conversations))
-	for _, c := range l.Conversations {
-		info := SessionInfo{SessionID: SessionID(c.ID), Cwd: c.Dir}
-		if c.Title != "" {
-			info.Title = &c.Title
-		}
-		if !c.Updated.IsZero() {
-			updated := c.Updated.UTC().Format(time.RFC3339)
-			info.UpdatedAt = &updated
-		}
-		sessions = append(sessions, info)
-	}
-	return ListSessionsResult{Sessions: sessions}, nil
+// ListSessionsResult answers a session/list.
+type ListSessionsResult struct {
+	Sessions   []SessionInfo `json:"sessions"`
+	NextCursor *string       `json:"nextCursor,omitzero"`
+	Extensible
+}
+
+func (r ListSessionsResult) Validate() error {
+	return check(need(r.Sessions != nil, "sessions"), each("sessions", r.Sessions))
+}
+
+func (r *ListSessionsResult) mapPaths(m mapper) {
+	mapEach(m, &r.Sessions)
+	m.meta(&r.Meta)
 }
 
 // SessionInfo is one chat a session/list answers with.
 type SessionInfo struct {
 	SessionID             SessionID `json:"sessionId"`
-	Cwd                   string    `json:"cwd" acp:"path"`
-	AdditionalDirectories []string  `json:"additionalDirectories,omitzero" acp:"path"`
+	Cwd                   string    `json:"cwd"`
+	AdditionalDirectories []string  `json:"additionalDirectories,omitzero"`
 	Title                 *string   `json:"title,omitzero"`
 	UpdatedAt             *string   `json:"updatedAt,omitzero"`
-	Meta                  Meta      `json:"_meta,omitzero"`
+	Extensible
+}
+
+func (i SessionInfo) Validate() error {
+	return check(need(i.SessionID != "", "sessionId"), need(i.Cwd != "", "cwd"))
+}
+
+func (i *SessionInfo) mapPaths(m mapper) {
+	m.path(&i.Cwd)
+	m.paths(&i.AdditionalDirectories)
+	m.meta(&i.Meta)
+}
+
+// ChatParams are what the params of a message that names a chat and nothing
+// else hold, such as session/delete's.
+type ChatParams struct {
+	SessionID SessionID `json:"sessionId"`
+	Extensible
+}
+
+func (p ChatParams) Chat() session.ChatID { return p.SessionID.chat() }
+func (p ChatParams) Validate() error      { return need(p.SessionID != "", "sessionId") }
+func (p *ChatParams) mapPaths(m mapper)   { m.meta(&p.Meta) }
+
+// EmptyResult is what the result of an answer that returns nothing but its
+// _meta holds.
+type EmptyResult struct {
+	Extensible
 }
 
 // DeleteSessionParams deletes a chat.
-type DeleteSessionParams struct {
-	passes
-	noDir
-	SessionID SessionID `json:"sessionId"`
-	Meta      Meta      `json:"_meta,omitzero"`
-}
-
-func (DeleteSessionParams) Method() string         { return "session/delete" }
-func (p DeleteSessionParams) Chat() session.ChatID { return p.SessionID.chat() }
+type DeleteSessionParams struct{ ChatParams }
 
 // DeleteSessionResult answers a session/delete.
-type DeleteSessionResult struct {
-	noChat
-	Meta Meta `json:"_meta,omitzero"`
-}
+type DeleteSessionResult struct{ EmptyResult }
 
 // CloseSessionParams closes a chat: ACP's agent then ends it.
-type CloseSessionParams struct {
-	passes
-	noDir
-	SessionID SessionID `json:"sessionId"`
-	Meta      Meta      `json:"_meta,omitzero"`
-}
+type CloseSessionParams struct{ ChatParams }
 
-func (CloseSessionParams) Method() string         { return "session/close" }
-func (p CloseSessionParams) Chat() session.ChatID { return p.SessionID.chat() }
+// Kind is Suspend: a client such as Air sends session/close for every tab it
+// closes and at an IDE quit, so it only hides the chat, and an adapter never
+// receives it.
+func (CloseSessionParams) Kind() session.Kind { return session.Suspend }
 
 // CloseSessionResult answers a session/close.
-type CloseSessionResult struct {
-	noChat
-	Meta Meta `json:"_meta,omitzero"`
-}
+type CloseSessionResult struct{ EmptyResult }
+
+// CancelParams cancels the turn under way in a chat.
+type CancelParams struct{ ChatParams }
 
 // SetSessionModeParams sets a chat's mode.
 type SetSessionModeParams struct {
-	passes
-	noDir
 	SessionID SessionID `json:"sessionId"`
 	ModeID    string    `json:"modeId"`
-	Meta      Meta      `json:"_meta,omitzero"`
+	Extensible
 }
 
-func (SetSessionModeParams) Method() string         { return "session/set_mode" }
 func (p SetSessionModeParams) Chat() session.ChatID { return p.SessionID.chat() }
 
+func (p SetSessionModeParams) Validate() error {
+	return check(need(p.SessionID != "", "sessionId"), need(p.ModeID != "", "modeId"))
+}
+
 // SetSessionModeResult answers a session/set_mode.
-type SetSessionModeResult struct {
-	noChat
-	Meta Meta `json:"_meta,omitzero"`
-}
+type SetSessionModeResult struct{ EmptyResult }
 
-// SetSessionConfigOptionParams sets one of a chat's options: a boolean, or the
-// ID of one of the option's values.
+// SetSessionConfigOptionParams sets one of a chat's options to a value its
+// type allows. ACP leaves out the type of a select's.
 type SetSessionConfigOptionParams struct {
-	passes
-	noDir
-	SessionID SessionID
-	ConfigID  string
-	Boolean   *bool
-	ValueID   *string
-	Meta      Meta
+	SessionID SessionID         `json:"sessionId"`
+	ConfigID  string            `json:"configId"`
+	Type      *ConfigOptionType `json:"type,omitzero"`
+	Value     Value             `json:"value"`
+	Extensible
 }
 
-func (SetSessionConfigOptionParams) Method() string         { return "session/set_config_option" }
 func (p SetSessionConfigOptionParams) Chat() session.ChatID { return p.SessionID.chat() }
 
-type setBoolean struct {
-	SessionID SessionID `json:"sessionId"`
-	ConfigID  string    `json:"configId"`
-	Type      string    `json:"type"`
-	Value     bool      `json:"value"`
-	Meta      Meta      `json:"_meta,omitzero"`
-}
-
-type setValueID struct {
-	SessionID SessionID `json:"sessionId"`
-	ConfigID  string    `json:"configId"`
-	Value     string    `json:"value"`
-	Meta      Meta      `json:"_meta,omitzero"`
-}
-
-// UnmarshalJSON reads a boolean when the params say so by their type, and a
-// value ID otherwise: ACP reads any other type as a value ID too.
-func (p *SetSessionConfigOptionParams) UnmarshalJSON(b []byte) error {
-	tag, _, err := tagOf(b, "type")
-	if err != nil {
-		return err
+func (p SetSessionConfigOptionParams) Validate() error {
+	t := ConfigSelect
+	if p.Type != nil {
+		t = *p.Type
 	}
-	if tag == "boolean" {
-		var v setBoolean
-		if err := decode(b, &v); err != nil {
-			return err
-		}
-		*p = SetSessionConfigOptionParams{SessionID: v.SessionID, ConfigID: v.ConfigID, Boolean: &v.Value, Meta: v.Meta}
-		return nil
-	}
-	var v setValueID
-	if err := decode(b, &v); err != nil {
-		return err
-	}
-	*p = SetSessionConfigOptionParams{SessionID: v.SessionID, ConfigID: v.ConfigID, ValueID: &v.Value, Meta: v.Meta}
-	return nil
-}
-
-func (p SetSessionConfigOptionParams) MarshalJSON() ([]byte, error) {
-	switch {
-	case p.Boolean != nil && p.ValueID == nil:
-		return marshal(setBoolean{SessionID: p.SessionID, ConfigID: p.ConfigID, Type: "boolean", Value: *p.Boolean, Meta: p.Meta})
-	case p.ValueID != nil && p.Boolean == nil:
-		return marshal(setValueID{SessionID: p.SessionID, ConfigID: p.ConfigID, Value: *p.ValueID, Meta: p.Meta})
-	}
-	return nil, errNoVariant
+	return check(need(p.SessionID != "", "sessionId"), need(p.ConfigID != "", "configId"), t.check("value", p.Value))
 }
 
 // SetSessionConfigOptionResult answers a session/set_config_option with every
 // option of the chat.
 type SetSessionConfigOptionResult struct {
-	noChat
 	ConfigOptions []SessionConfigOption `json:"configOptions"`
-	Meta          Meta                  `json:"_meta,omitzero"`
+	Extensible
+}
+
+func (r SetSessionConfigOptionResult) Validate() error {
+	return check(need(r.ConfigOptions != nil, "configOptions"), each("configOptions", r.ConfigOptions))
+}
+
+func (r *SetSessionConfigOptionResult) mapPaths(m mapper) {
+	mapEach(m, &r.ConfigOptions)
+	m.meta(&r.Meta)
 }
 
 // PromptParams is the client's prompt in a chat.
 type PromptParams struct {
-	passes
-	noDir
 	SessionID SessionID      `json:"sessionId"`
 	Prompt    []ContentBlock `json:"prompt"`
-	Meta      Meta           `json:"_meta,omitzero"`
+	Extensible
 }
 
-func (PromptParams) Method() string         { return "session/prompt" }
 func (p PromptParams) Chat() session.ChatID { return p.SessionID.chat() }
+
+func (p PromptParams) Validate() error {
+	return check(need(p.SessionID != "", "sessionId"), need(p.Prompt != nil, "prompt"))
+}
+
+func (p *PromptParams) mapPaths(m mapper) {
+	mapEach(m, &p.Prompt)
+	m.meta(&p.Meta)
+}
 
 // PromptResult answers a prompt once its turn ends.
 type PromptResult struct {
-	noChat
 	StopReason StopReason `json:"stopReason"`
-	Meta       Meta       `json:"_meta,omitzero"`
+	Extensible
 }
+
+func (r PromptResult) Validate() error { return need(r.StopReason != "", "stopReason") }
 
 // StopReason is why a prompt's turn ended.
 type StopReason string
 
 func (r *StopReason) UnmarshalJSON(b []byte) error {
 	return decodeEnum(b, r, "end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled")
-}
-
-// CancelParams cancels the turn under way in a chat.
-type CancelParams struct {
-	passes
-	noDir
-	SessionID SessionID `json:"sessionId"`
-	Meta      Meta      `json:"_meta,omitzero"`
-}
-
-func (CancelParams) Method() string         { return "session/cancel" }
-func (p CancelParams) Chat() session.ChatID { return p.SessionID.chat() }
-
-// CancelRequestParams cancels one of its sender's requests, which either side
-// may send.
-type CancelRequestParams struct {
-	noChat
-	noDir
-	RequestID requestID `json:"requestId"`
-	Meta      Meta      `json:"_meta,omitzero"`
-}
-
-func (CancelRequestParams) Method() string     { return "$/cancel_request" }
-func (CancelRequestParams) Kind() session.Kind { return session.Cancel }
-
-func (p CancelRequestParams) cancels() session.MessageID { return session.MessageID(p.RequestID) }
-
-func (p CancelRequestParams) cancelling(id session.MessageID) CancelRequestParams {
-	p.RequestID = requestID(id)
-	return p
-}
-
-// UnmarshalJSON rejects a cancel of no request: JSON-RPC's null ID names none.
-func (p *CancelRequestParams) UnmarshalJSON(b []byte) error {
-	type plain CancelRequestParams
-	if err := decode(b, (*plain)(p)); err != nil {
-		return err
-	}
-	if session.MessageID(p.RequestID).IsZero() {
-		return errors.New("requestId: null names no request")
-	}
-	return nil
 }

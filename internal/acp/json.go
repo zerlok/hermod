@@ -5,15 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
+	"net/url"
 	"slices"
 	"strings"
+
+	"github.com/zerlok/hermod/internal/pathmap"
 )
 
-// decode parses b fully into v: every member's type is checked by v's type,
-// and every member ACP requires must be there and not null. encoding/json
+// validator is a type that checks the members ACP requires of it. encoding/json
 // reads a missing member as its zero value, which would let a message that
 // lacks, say, its cwd pass as one naming the empty directory.
+type validator interface{ Validate() error }
+
+// decode reads b into v and checks it with v's own Validate, when it has one.
 func decode(b []byte, v any) error {
 	if isNull(b) {
 		return errors.New("null where a value is required")
@@ -21,150 +25,62 @@ func decode(b []byte, v any) error {
 	if err := json.Unmarshal(b, v); err != nil {
 		return err
 	}
-	return required(b, reflect.TypeOf(v).Elem())
+	if x, ok := v.(validator); ok {
+		return x.Validate()
+	}
+	return nil
 }
 
-var unmarshaler = reflect.TypeFor[json.Unmarshaler]()
+// check is the first of errs that is not nil.
+func check(errs ...error) error {
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-// required checks b, a document v's type t parsed, for the members t requires:
-// a struct's field whose json tag has neither omitempty nor omitzero. A type
-// with its own UnmarshalJSON checks its own members.
-func required(b []byte, t reflect.Type) error {
-	if reflect.PointerTo(t).Implements(unmarshaler) || isNull(b) {
+// need rejects a required member, named member, that is missing.
+func need(present bool, member string) error {
+	if present {
 		return nil
 	}
-	switch t.Kind() {
-	case reflect.Pointer:
-		return required(b, t.Elem())
-	case reflect.Slice:
-		var items []json.RawMessage
-		if err := json.Unmarshal(b, &items); err != nil {
-			return err
-		}
-		for i, item := range items {
-			if err := required(item, t.Elem()); err != nil {
-				return fmt.Errorf("[%d]: %w", i, err)
-			}
-		}
-	case reflect.Map:
-		var members map[string]json.RawMessage
-		if err := json.Unmarshal(b, &members); err != nil {
-			return err
-		}
-		for key, member := range members {
-			if err := required(member, t.Elem()); err != nil {
-				return fmt.Errorf("%s: %w", key, err)
-			}
-		}
-	case reflect.Struct:
-		var members map[string]json.RawMessage
-		if err := json.Unmarshal(b, &members); err != nil {
-			return err
-		}
-		if err := exactNames(members, t); err != nil {
-			return err
-		}
-		return requiredFields(members, t)
+	return fmt.Errorf("%s is required", member)
+}
+
+// in is err, from checking member, prefixed with its name.
+func in(member string, err error) error {
+	if err != nil {
+		return fmt.Errorf("%s: %w", member, err)
 	}
 	return nil
 }
 
-// requiredFields checks the members of an object of struct type t for the
-// fields t requires, and each member's own.
-func requiredFields(members map[string]json.RawMessage, t reflect.Type) error {
-	for i := range t.NumField() {
-		f := t.Field(i)
-		if embedded(f) {
-			if err := requiredFields(members, f.Type); err != nil {
-				return err
-			}
-			continue
-		}
-		name, optional, ok := jsonName(f)
-		if !ok {
-			continue
-		}
-		member, present := members[name]
-		if !present || isNull(member) {
-			if optional {
-				continue
-			}
-			return fmt.Errorf("%s is required", name)
-		}
-		if err := required(member, f.Type); err != nil {
-			return fmt.Errorf("%s: %w", name, err)
-		}
+// valid checks v, a value of one of ACP's types, when the type has a Validate.
+func valid(v any) error {
+	if x, ok := v.(validator); ok {
+		return x.Validate()
 	}
 	return nil
 }
 
-// embedded reports whether f is an embedded struct whose members encoding/json
-// writes as its container's own.
-func embedded(f reflect.StructField) bool {
-	return f.Anonymous && f.IsExported() && f.Tag.Get("json") == "" && f.Type.Kind() == reflect.Struct
-}
-
-// exactMembers rejects a member of the object b whose name differs from one
-// struct type t declares only by case.
-func exactMembers(b []byte, t reflect.Type) error {
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(b, &members); err != nil {
-		return err
+// opt checks the member at p, when it is given.
+func opt[T any](member string, p *T) error {
+	if p == nil {
+		return nil
 	}
-	return exactNames(members, t)
+	return in(member, valid(*p))
 }
 
-// exactNames rejects a member whose name differs from one t declares only by
-// case. encoding/json matches names regardless of case, so such a member,
-// which no type declares, would otherwise overwrite the declared one.
-func exactNames(members map[string]json.RawMessage, t reflect.Type) error {
-	declared := declaredNames(t)
-	for key := range members {
-		if slices.Contains(declared, key) {
-			continue
-		}
-		for _, name := range declared {
-			if strings.EqualFold(key, name) {
-				return fmt.Errorf("%s is not %s", key, name)
-			}
+// each checks every item of the list member.
+func each[T any](member string, items []T) error {
+	for i, item := range items {
+		if err := valid(item); err != nil {
+			return fmt.Errorf("%s[%d]: %w", member, i, err)
 		}
 	}
 	return nil
-}
-
-// declaredNames are the members struct type t is written with.
-func declaredNames(t reflect.Type) []string {
-	var names []string
-	for i := range t.NumField() {
-		f := t.Field(i)
-		if embedded(f) {
-			names = append(names, declaredNames(f.Type)...)
-			continue
-		}
-		if name, _, ok := jsonName(f); ok {
-			names = append(names, name)
-		}
-	}
-	return names
-}
-
-// jsonName is the member a field is written as, and whether it may be left
-// out; ok is false for a field that is not written.
-func jsonName(f reflect.StructField) (name string, optional, ok bool) {
-	if !f.IsExported() {
-		return "", false, false
-	}
-	tag, hasTag := f.Tag.Lookup("json")
-	if !hasTag || tag == "-" {
-		return "", false, false
-	}
-	name, options, _ := strings.Cut(tag, ",")
-	for option := range strings.SplitSeq(options, ",") {
-		if option == "omitempty" || option == "omitzero" {
-			optional = true
-		}
-	}
-	return name, optional, true
 }
 
 func isNull(b []byte) bool { return bytes.Equal(bytes.TrimSpace(b), []byte("null")) }
@@ -181,6 +97,20 @@ func marshal(v any) ([]byte, error) {
 	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
 }
 
+// decodeNumbers reads b into v keeping each number's digits: a float64 would
+// round a large integer, and the other side gets back what it wrote.
+func decodeNumbers(b []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if dec.More() {
+		return errors.New("more than one JSON value")
+	}
+	return nil
+}
+
 // decodeEnum reads b as one of the values ACP declares for T.
 func decodeEnum[T ~string](b []byte, v *T, known ...T) error {
 	var s string
@@ -194,45 +124,55 @@ func decodeEnum[T ~string](b []byte, v *T, known ...T) error {
 	return nil
 }
 
-// variants are the members of a union, by the value of the member that names
-// each: the union's field for that variant to write it, and a pointer to the
-// field to read it.
-type variants map[string]any
+// A union of ACP's is an object one member of which, its tag, names the
+// variant it is; its Go type has a pointer field for each variant, one of them
+// set, and lists its arms once for reading, writing and checking it. A
+// variant is checked as it is read, so a list of a union needs no check of
+// its items.
 
-// decodeTagged parses b into the variant that its member key names, and
-// rejects a variant the union does not have.
-func decodeTagged(b []byte, key string, union variants) error {
+// arm is one variant of a union: the tag that names it, "" for the variant
+// ACP writes with no tag, how to read it into its field, and the field's
+// value when the union holds it.
+type arm struct {
+	tag   string
+	read  func(b []byte) error
+	value any
+}
+
+// armOf is the arm tag of the variant held in field.
+func armOf[T any](tag string, field **T) arm {
+	a := arm{tag: tag, read: func(b []byte) error {
+		v := new(T)
+		if err := decode(b, v); err != nil {
+			return err
+		}
+		*field = v
+		return nil
+	}}
+	if *field != nil {
+		a.value = *field
+	}
+	return a
+}
+
+// decodeUnion reads b into the arm its member key names, or the arm of no tag
+// when it has none, and rejects a variant the union does not have: ACP
+// reserves other values for its future variants and for extensions, whose
+// members no type here declares.
+func decodeUnion(b []byte, key string, arms []arm) error {
 	tag, ok, err := tagOf(b, key)
 	if err != nil {
 		return err
 	}
+	for _, a := range arms {
+		if a.tag == tag {
+			return a.read(b)
+		}
+	}
 	if !ok {
 		return fmt.Errorf("%s is required", key)
 	}
-	field, known := union[tag]
-	if !known {
-		return unknownVariant(key, tag)
-	}
-	return decodeInto(b, field)
-}
-
-// unknownVariant rejects a variant of a union that Hermod does not have: ACP
-// reserves other values for its future variants and for extensions, whose
-// members no type here declares.
-func unknownVariant(key, tag string) error {
 	return fmt.Errorf("%s %q is not one Hermod reads", key, tag)
-}
-
-// decodeInto parses b into a new value for field, a pointer to a pointer
-// field of a union.
-func decodeInto(b []byte, field any) error {
-	target := reflect.ValueOf(field).Elem()
-	value := reflect.New(target.Type().Elem())
-	if err := decode(b, value.Interface()); err != nil {
-		return err
-	}
-	target.Set(value)
-	return nil
 }
 
 // tagOf is the string member key of the object b; ok is false when b has none.
@@ -251,50 +191,34 @@ func tagOf(b []byte, key string) (tag string, ok bool, err error) {
 	return tag, true, nil
 }
 
-// has reports whether the object b has member key.
-func has(b []byte, key string) (bool, error) {
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(b, &members); err != nil {
-		return false, err
-	}
-	_, ok := members[key]
-	return ok, nil
-}
-
-// encodeTagged writes the one variant a union holds, with its member key
-// naming it. union maps each name to the union's field for it.
-func encodeTagged(key string, union variants) ([]byte, error) {
-	tag, value, err := heldVariant(union)
-	if err != nil {
-		return nil, err
-	}
-	return withTag(key, tag, value)
-}
-
-var errNoVariant = errors.New("a union holds no variant, or more than one")
-
-// heldVariant is the one variant of union that is set.
-func heldVariant(union variants) (tag string, value any, err error) {
-	found := 0
-	for name, field := range union {
-		if v := reflect.ValueOf(field); !v.IsNil() {
-			tag, value = name, field
-			found++
+// heldArm is the one arm whose variant the union holds; a union that holds
+// none, such as a required union member left out, or more than one is
+// invalid.
+func heldArm(arms []arm) (arm, error) {
+	var found []arm
+	for _, a := range arms {
+		if a.value != nil {
+			found = append(found, a)
 		}
 	}
-	if found != 1 {
-		return "", nil, errNoVariant
+	if len(found) != 1 {
+		return arm{}, errors.New("a union holds no variant, or more than one")
 	}
-	return tag, value, nil
+	return found[0], nil
 }
 
-// withTag writes v, an object, with member key set to tag first.
-func withTag(key, tag string, v any) ([]byte, error) {
-	body, err := marshal(v)
+// encodeUnion writes the variant the union holds, with its member key naming
+// it first, unless it is the variant of no tag.
+func encodeUnion(key string, arms []arm) ([]byte, error) {
+	a, err := heldArm(arms)
 	if err != nil {
 		return nil, err
 	}
-	head, err := marshal(map[string]string{key: tag})
+	body, err := marshal(a.value)
+	if err != nil || a.tag == "" {
+		return body, err
+	}
+	head, err := marshal(map[string]string{key: a.tag})
 	if err != nil {
 		return nil, err
 	}
@@ -306,20 +230,20 @@ func withTag(key, tag string, v any) ([]byte, error) {
 	return slices.Concat(head[:len(head)-1], []byte(","), body[1:]), nil
 }
 
-// one writes the one variant of union that is set, with no member naming it.
-func one(union variants) ([]byte, error) {
-	_, value, err := heldVariant(union)
-	if err != nil {
-		return nil, err
-	}
-	return marshal(value)
-}
-
 // Meta is ACP's _meta, which every type of ACP's declares: an object whose
 // members ACP leaves to the two sides, such as Air's jetbrains.air. It is
 // carried whole, every string in it mapped, since an extension may name a
 // path in any member.
 type Meta map[string]any
+
+// Extensible is embedded by every type of ACP's, to declare its _meta: as an
+// untagged embedded field, its _meta is a member of the type's own object, and
+// its mapPaths maps it for a type that declares no path of its own.
+type Extensible struct {
+	Meta Meta `json:"_meta,omitzero"`
+}
+
+func (e *Extensible) mapPaths(m mapper) { m.meta(&e.Meta) }
 
 func (m *Meta) UnmarshalJSON(b []byte) error {
 	var members map[string]any
@@ -328,13 +252,6 @@ func (m *Meta) UnmarshalJSON(b []byte) error {
 	}
 	*m = members
 	return nil
-}
-
-func (m Meta) mapStrings(mapString func(string) string) any {
-	if m == nil {
-		return m
-	}
-	return Meta(mapAny(map[string]any(m), mapString).(map[string]any))
 }
 
 // Value is a JSON value whose shape ACP leaves open, such as a tool's raw
@@ -356,49 +273,6 @@ func (v *Value) UnmarshalJSON(b []byte) error {
 
 func (v Value) MarshalJSON() ([]byte, error) { return marshal(v.value) }
 
-func (v Value) mapStrings(mapString func(string) string) any {
-	if !v.set {
-		return v
-	}
-	return Value{value: mapAny(v.value, mapString), set: true}
-}
-
-// decodeNumbers parses b into v keeping each number's digits: a float64 would
-// round a large integer, and the other side gets back what it wrote.
-func decodeNumbers(b []byte, v any) error {
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.UseNumber()
-	if err := dec.Decode(v); err != nil {
-		return err
-	}
-	if dec.More() {
-		return errors.New("more than one JSON value")
-	}
-	return nil
-}
-
-// mapAny is v, a value encoding/json reads into an interface, with every
-// string in it taken through mapString; objects and arrays are new.
-func mapAny(v any, mapString func(string) string) any {
-	switch v := v.(type) {
-	case string:
-		return mapString(v)
-	case []any:
-		out := make([]any, len(v))
-		for i, item := range v {
-			out[i] = mapAny(item, mapString)
-		}
-		return out
-	case map[string]any:
-		out := make(map[string]any, len(v))
-		for key, member := range v {
-			out[key] = mapAny(member, mapString)
-		}
-		return out
-	}
-	return v
-}
-
 // Nullable is a member ACP reads three ways: left out keeps what the other
 // side holds, null clears it, and a value replaces it.
 type Nullable[T any] struct {
@@ -414,32 +288,20 @@ const (
 	given
 )
 
-// Given is a Nullable holding v.
-func Given[T any](v T) Nullable[T] { return Nullable[T]{value: v, state: given} }
-
-// Null is a Nullable written as null.
-func Null[T any]() Nullable[T] { return Nullable[T]{state: null} }
-
-// Get is the value, when one was given.
-func (n Nullable[T]) Get() (T, bool) { return n.value, n.state == given }
-
-// IsNull reports whether the member was written as null.
-func (n Nullable[T]) IsNull() bool { return n.state == null }
-
 // IsZero reports whether the member was left out, which omitzero writes as no
 // member at all.
 func (n Nullable[T]) IsZero() bool { return n.state == leftOut }
 
 func (n *Nullable[T]) UnmarshalJSON(b []byte) error {
 	if isNull(b) {
-		*n = Null[T]()
+		*n = Nullable[T]{state: null}
 		return nil
 	}
 	var v T
 	if err := decode(b, &v); err != nil {
 		return err
 	}
-	*n = Given(v)
+	*n = Nullable[T]{value: v, state: given}
 	return nil
 }
 
@@ -450,11 +312,120 @@ func (n Nullable[T]) MarshalJSON() ([]byte, error) {
 	return marshal(n.value)
 }
 
-func (n Nullable[T]) mapWith(w walker) any {
-	if n.state != given {
-		return n
+// pather is a type of ACP's that maps the fields it declares as paths, and
+// its _meta and any other field ACP leaves free-form. Mapped hands it a copy of
+// a message, which it maps in place; each field it maps gets a new value, so
+// the message it was copied from keeps its own. A text that only mentions a
+// path, such as a prompt or a title, says what its writer wrote and is not
+// mapped.
+type pather interface{ mapPaths(m mapper) }
+
+// mapper is the path function Mapped is handed.
+type mapper func(string) string
+
+// path maps a field that holds an absolute path.
+func (m mapper) path(p *string) { *p = m(*p) }
+
+func (m mapper) optPath(p **string) {
+	if *p != nil {
+		s := m(**p)
+		*p = &s
 	}
-	// NOTE: walk returns a value of the type it was given.
-	n.value = w.walk(reflect.ValueOf(&n.value).Elem(), w.mode).Interface().(T)
-	return n
+}
+
+func (m mapper) paths(p *[]string) {
+	if *p == nil {
+		return
+	}
+	out := make([]string, len(*p))
+	for i, s := range *p {
+		out[i] = m(s)
+	}
+	*p = out
+}
+
+// uri maps a field that holds a URI, which names a file by a file URI.
+func (m mapper) uri(p *string) { *p = mapFileURI(*p, m) }
+
+func (m mapper) optURI(p **string) {
+	if *p != nil {
+		s := mapFileURI(**p, m)
+		*p = &s
+	}
+}
+
+// meta maps every string of a _meta.
+func (m mapper) meta(p *Meta) {
+	if *p == nil {
+		return
+	}
+	// NOTE: pathmap.Value returns a map[string]any for one, so the assertion
+	// holds.
+	*p = pathmap.Value(map[string]any(*p), m.anyString).(map[string]any)
+}
+
+// value maps every string of a free-form value.
+func (m mapper) value(p *Value) { p.value = pathmap.Value(p.value, m.anyString) }
+
+// anyString maps a string of a free-form value: a file URI as one, and any
+// other string as a path, which the path map leaves as it is unless it lies
+// under a root.
+func (m mapper) anyString(s string) string {
+	if strings.HasPrefix(s, fileScheme+"://") {
+		return mapFileURI(s, m)
+	}
+	return m(s)
+}
+
+// mapOpt maps an optional field into a new value.
+func mapOpt[T any, P interface {
+	*T
+	pather
+}](m mapper, p **T) {
+	if *p == nil {
+		return
+	}
+	v := **p
+	P(&v).mapPaths(m)
+	*p = &v
+}
+
+// mapEach maps every item of a list into a new list.
+func mapEach[T any, P interface {
+	*T
+	pather
+}](m mapper, items *[]T) {
+	if *items == nil {
+		return
+	}
+	out := slices.Clone(*items)
+	for i := range out {
+		P(&out[i]).mapPaths(m)
+	}
+	*items = out
+}
+
+// mapNullable maps a Nullable's value when it is given.
+func mapNullable[T any](n *Nullable[T], mapValue func(*T)) {
+	if n.state == given {
+		mapValue(&n.value)
+	}
+}
+
+const fileScheme = "file"
+
+// mapFileURI maps the path of a file URI on this workstation; a URI of another
+// scheme, one that does not parse, or one naming another host is left as
+// written.
+func mapFileURI(s string, path func(string) string) string {
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme != fileScheme || (u.Host != "" && u.Host != "localhost") {
+		return s
+	}
+	mapped := path(u.Path)
+	if mapped == u.Path {
+		return s
+	}
+	u.Path, u.RawPath = mapped, ""
+	return u.String()
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -14,28 +15,22 @@ import (
 	"github.com/zerlok/hermod/internal/workspace"
 )
 
-// fakeMsg is a chat message as a Channel would give it, comparable so that a
-// table states what each side receives.
+// fakeMsg is a chat message as a Channel would give it. name tells a table's
+// messages apart: a request's answers and calls are written under it.
 type fakeMsg struct {
-	kind   Kind
-	id     MessageID
-	chat   ChatID
-	dir    Path
-	result string // the result of a reply session made, as describe writes it
-	failed bool   // an error answer
+	name string
+	kind Kind
+	chat ChatID
+	dir  Path
 	// The handshake an adapter's answer to a Connect gives; no capabilities
 	// is none.
 	version int
 	caps    string
 }
 
-func (m fakeMsg) Kind() Kind                  { return m.kind }
-func (m fakeMsg) ID() MessageID               { return m.id }
-func (m fakeMsg) Chat() ChatID                { return m.chat }
-func (m fakeMsg) Dir() Path                   { return m.dir }
-func (m fakeMsg) WithID(id MessageID) Message { m.id = id; return m }
-func (m fakeMsg) Reply(r Result) Message      { return fakeMsg{id: m.id, result: describe(r)} }
-func (m fakeMsg) Fail(error) Message          { return fakeMsg{id: m.id, failed: true} }
+func (m fakeMsg) Kind() Kind   { return m.kind }
+func (m fakeMsg) Chat() ChatID { return m.chat }
+func (m fakeMsg) Dir() Path    { return m.dir }
 
 func (m fakeMsg) Mapped(path func(Path) Path) Message {
 	if m.dir != "" {
@@ -55,6 +50,19 @@ func (m fakeMsg) Result() Result {
 	return HandshakeResult{Handshake: h}
 }
 
+// String writes a message as a table states it: its name, its chat and its
+// directory.
+func (m fakeMsg) String() string {
+	parts := []string{m.name}
+	if m.chat != "" {
+		parts = append(parts, "chat="+string(m.chat))
+	}
+	if m.dir != "" {
+		parts = append(parts, "dir="+string(m.dir))
+	}
+	return strings.Join(parts, " ")
+}
+
 // describe writes a result as a table states it.
 func describe(r Result) string {
 	switch r := r.(type) {
@@ -72,71 +80,193 @@ func describe(r Result) string {
 	return fmt.Sprintf("unknown result %T", r)
 }
 
-// fid is the ID a table writes as text; "" is none.
-func fid(id string) MessageID {
-	if id == "" {
-		return MessageID{}
-	}
-	return TextID(id)
-}
-
 // The messages of the tables, by what they are.
-func connectReq(id string) fakeMsg          { return fakeMsg{kind: Connect, id: fid(id)} }
-func listReq(id string, dir string) fakeMsg { return fakeMsg{kind: List, id: fid(id), dir: Path(dir)} }
-func cancelReq(id string) fakeMsg           { return fakeMsg{kind: Cancel, id: fid(id)} }
-func openIn(id string, dir string) fakeMsg  { return fakeMsg{kind: Open, id: fid(id), dir: Path(dir)} }
-func reopen(id string, chat ChatID) fakeMsg { return fakeMsg{kind: Open, id: fid(id), chat: chat} }
-func suspendReq(id string, chat ChatID) fakeMsg {
-	return fakeMsg{kind: Suspend, id: fid(id), chat: chat}
+func connectReq(name string) fakeMsg { return fakeMsg{name: name, kind: Connect} }
+func listReq(name, dir string) fakeMsg {
+	return fakeMsg{name: name, kind: List, dir: Path(dir)}
 }
-func closeReq(id string, chat ChatID) fakeMsg { return fakeMsg{kind: Close, id: fid(id), chat: chat} }
-func ask(id string, chat ChatID) fakeMsg      { return fakeMsg{kind: Question, id: fid(id), chat: chat} }
-func reply(id string) fakeMsg                 { return fakeMsg{kind: Answer, id: fid(id)} }
-func failure(id string) fakeMsg               { return fakeMsg{id: fid(id), failed: true} }
-func result(id string, r string) fakeMsg      { return fakeMsg{id: fid(id), result: r} }
-func update(chat ChatID) fakeMsg              { return fakeMsg{chat: chat} }
+func openIn(name, dir string) fakeMsg         { return fakeMsg{name: name, kind: Open, dir: Path(dir)} }
+func reopen(name string, chat ChatID) fakeMsg { return fakeMsg{name: name, kind: Open, chat: chat} }
+func suspendReq(name string, chat ChatID) fakeMsg {
+	return fakeMsg{name: name, kind: Suspend, chat: chat}
+}
+func closeReq(name string, chat ChatID) fakeMsg { return fakeMsg{name: name, kind: Close, chat: chat} }
 
-// prompt is a request of the client's in a chat, or an adapter's answer that
-// names the chat, such as the answer to an Open of a new chat.
-func prompt(id string, chat ChatID) fakeMsg { return fakeMsg{id: fid(id), chat: chat} }
+// msg is a message of a chat, or of none, that session only passes: a
+// request, a notification, a question or an answer.
+func msg(name string, chat ChatID) fakeMsg { return fakeMsg{name: name, chat: chat} }
 
-// done is an adapter's answer that names no chat.
-func done(id string) fakeMsg { return fakeMsg{id: fid(id)} }
-
-func handshakeAnswer(id string, version int, caps string) fakeMsg {
-	return fakeMsg{id: fid(id), version: version, caps: caps}
+func handshakeAnswer(version int, caps string) fakeMsg {
+	return fakeMsg{name: "handshake", version: version, caps: caps}
 }
 
-// fakeChannel is one side's connection: what a test hands in arrives on in,
-// and what session sends is recorded.
+// fakeAnswer answers one request, written to what its side received.
+type fakeAnswer struct {
+	side *fakeChannel
+	name string
+}
+
+func (a fakeAnswer) Return(m Message) error {
+	return a.side.record(fmt.Sprintf("return %s: %v", a.name, m))
+}
+func (a fakeAnswer) Reply(r Result) error {
+	return a.side.record(fmt.Sprintf("reply %s: %s", a.name, describe(r)))
+}
+func (a fakeAnswer) Fail(error) error { return a.side.record("fail " + a.name) }
+
+// callResult is what a test hands a call it answers.
+type callResult struct {
+	msg Message
+	err error
+}
+
+// fakeCall is a call waiting on a fake connection for the test to answer it.
+type fakeCall struct{ returned func(Message, error) }
+
+// fakeChannel is one side's connection. What session sends it, and how
+// session answers what it sent, is recorded in order; a call waits until the
+// test answers it, its context ends, or the connection does.
 type fakeChannel struct {
-	in     chan Message
-	err    error // why the connection ended
-	notify chan Message
+	in    chan Inbound
+	err   error // why the connection ended
+	fails bool  // every send and answer fails
 
-	mu   sync.Mutex
-	sent []Message
+	mu       sync.Mutex
+	changed  *sync.Cond // broadcast on every line recorded
+	got      []string
+	calls    map[string]*fakeCall // waiting, by the name of their message
+	requests map[string]context.CancelFunc
 }
 
 func newFakeChannel() *fakeChannel {
-	return &fakeChannel{in: make(chan Message), notify: make(chan Message, 64)}
+	c := &fakeChannel{
+		in:       make(chan Inbound),
+		calls:    map[string]*fakeCall{},
+		requests: map[string]context.CancelFunc{},
+	}
+	c.changed = sync.NewCond(&c.mu)
+	return c
 }
 
-func (c *fakeChannel) Receive() <-chan Message { return c.in }
-func (c *fakeChannel) Err() error              { return c.err }
+var errSend = errors.New("send failed")
 
-func (c *fakeChannel) Send(msg Message) error {
+func (c *fakeChannel) record(line string) error {
 	c.mu.Lock()
-	c.sent = append(c.sent, msg)
-	c.mu.Unlock()
-	c.notify <- msg
+	defer c.mu.Unlock()
+	c.recordLocked(line)
+	if c.fails {
+		return errSend
+	}
 	return nil
 }
 
-func (c *fakeChannel) messages() []Message {
+func (c *fakeChannel) recordLocked(line string) {
+	c.got = append(c.got, line)
+	c.changed.Broadcast()
+}
+
+func (c *fakeChannel) recorded() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]Message(nil), c.sent...)
+	return append([]string(nil), c.got...)
+}
+
+// await waits until the connection records line.
+func (c *fakeChannel) await(line string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for !slices.Contains(c.got, line) {
+		c.changed.Wait()
+	}
+}
+
+func (c *fakeChannel) Receive() <-chan Inbound { return c.in }
+func (c *fakeChannel) Err() error              { return c.err }
+
+func (c *fakeChannel) Notify(m Message) error { return c.record(fmt.Sprintf("notify %v", m)) }
+
+// Call records the call and keeps it until the test answers it, or its
+// context ends.
+func (c *fakeChannel) Call(ctx context.Context, m Message, returned func(Message, error)) error {
+	name := m.(fakeMsg).name
+	call := &fakeCall{returned: returned}
+	c.mu.Lock()
+	c.recordLocked(fmt.Sprintf("call %v", m))
+	c.calls[name] = call
+	c.mu.Unlock()
+	context.AfterFunc(ctx, func() {
+		c.mu.Lock()
+		waiting := c.calls[name] == call
+		if waiting {
+			delete(c.calls, name)
+			c.recordLocked("cancelled " + name)
+		}
+		c.mu.Unlock()
+		if waiting {
+			returned(nil, ctx.Err())
+		}
+	})
+	return nil
+}
+
+// answer hands the call of name its result. The return goes on to the loop
+// the test runs, so it is handed over in a goroutine of its own.
+func (c *fakeChannel) answer(t *testing.T, name string, r callResult) {
+	t.Helper()
+	c.mu.Lock()
+	call, ok := c.calls[name]
+	delete(c.calls, name)
+	c.mu.Unlock()
+	if !ok {
+		t.Fatalf("no call %s waits for an answer", name)
+	}
+	go call.returned(r.msg, r.err)
+}
+
+// called waits until the call of name is made, and takes it to return.
+func (c *fakeChannel) called(name string) func(Message, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for c.calls[name] == nil {
+		c.changed.Wait()
+	}
+	call := c.calls[name]
+	delete(c.calls, name)
+	return call.returned
+}
+
+// end fails every call waiting, as a connection that ended does, and is how
+// many it failed.
+func (c *fakeChannel) end() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := len(c.calls)
+	for name, call := range c.calls {
+		delete(c.calls, name)
+		go call.returned(nil, errors.New("connection ended"))
+	}
+	return n
+}
+
+// inbound is m as it arrives on this side's connection: a request, whose
+// context the test may cancel, when ask, and a notification otherwise.
+func (c *fakeChannel) inbound(m fakeMsg, ask bool) Inbound {
+	if !ask {
+		return Inbound{Message: m}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.mu.Lock()
+	c.requests[m.name] = cancel
+	c.mu.Unlock()
+	return Inbound{Message: m, Context: ctx, Answer: fakeAnswer{side: c, name: m.name}}
+}
+
+// cancel cancels the request of name this side sent.
+func (c *fakeChannel) cancel(name string) {
+	c.mu.Lock()
+	cancel := c.requests[name]
+	c.mu.Unlock()
+	cancel()
 }
 
 // errRefused is an attach the test refuses.
@@ -157,15 +287,16 @@ type chatEnv struct {
 }
 
 func newChatEnv(t *testing.T) *chatEnv {
-	return &chatEnv{
+	e := &chatEnv{
 		f:        newFake(),
 		local:    testLocal(t),
-		client:   newFakeChannel(),
 		running:  map[string]bool{},
 		refuse:   map[string]bool{},
 		adapters: map[Path]*fakeChannel{},
 		names:    map[string]string{},
 	}
+	e.client = newFakeChannel()
+	return e
 }
 
 var testHandshake = mustHandshake(1, `{"loadSession":true}`)
@@ -230,6 +361,18 @@ func (e *chatEnv) attach(ctx context.Context, dir Path) (Attachment, error) {
 		Adapter:   e.adapter(dir),
 		Started:   !runs && !e.running[string(dir)],
 	}, nil
+}
+
+// settle runs the events that the calls of a step bring back into the
+// router's loop, one for each call the step returned.
+func (e *chatEnv) settle(r *router, returns int) error {
+	for range returns {
+		ev := <-r.events
+		if err := ev(r.running); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // changes are the fake's changes with each adapter worker named as a table

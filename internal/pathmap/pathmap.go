@@ -128,6 +128,29 @@ func JSON(doc []byte, mapPath func(string) string) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
+// Value is v, a value encoding/json decodes into an interface, with every
+// string in it taken through mapString. Object keys and every other value are
+// kept; objects and arrays are new, so v is left as it was.
+func Value(v any, mapString func(string) string) any {
+	switch v := v.(type) {
+	case string:
+		return mapString(v)
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = Value(item, mapString)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, member := range v {
+			out[key] = Value(member, mapString)
+		}
+		return out
+	}
+	return v
+}
+
 // mapLiteral maps one encoded JSON string, returning it byte for byte when it
 // does not change.
 func mapLiteral(lit []byte, mapPath func(string) string) ([]byte, error) {

@@ -12,50 +12,68 @@ import (
 // sessionContext is what a session's states work on besides the state itself.
 type sessionContext struct {
 	Attachment
-	dir    Path // the directory the session was made for: its key among the sessions
-	client Sender[Message]
-	agent  agent.Agent
-	acp    agent.ACP
-	log    *log.Logger
+	dir     Path // the directory the session was made for: its key among the sessions
+	self    *SessionControl
+	client  Caller // the client, paths mapped to the local ones and its answers back
+	adapter Caller // the adapter, paths mapped to the remote ones and its answers back
+	agent   agent.Agent
+	acp     agent.ACP
+	log     *log.Logger
+	call    callFunc
+	// clientReturns and adapterReturns bring a call's return back into the
+	// loop, in order with the messages of the connection it was made on.
+	clientReturns, adapterReturns func(event)
 
-	// A chat is found in the two ways a message names it: by the chat's ID,
-	// and, while it is being opened, by the client's request that opens it. A
-	// new chat has no ID until the adapter answers that request.
-	chats   map[ChatID]*ChatControl
-	opening map[MessageID]opening
-	// closing is the Close that left no chat waited on, whose answer the
-	// session waits for before it ends.
-	closing optionalID
-	// connect is the kept Connect this session sent its adapter first, whose
-	// answer is the adapter's and not the client's.
-	connect optionalID
-
-	shared *shared
+	chats map[ChatID]*ChatControl
+	// closing counts the Closes that left no chat waited on and whose calls
+	// have not returned: the session ends only after the last returns.
+	closing int
+	// connecting is while the kept Connect has not returned: what is for the
+	// adapter waits in queued, since ACP allows initialize only as a
+	// connection's first request.
+	connecting bool
+	queued     []returned
+	owners     map[ChatID]Path // shared with the router: chat ID → the directory of its session
 }
 
-// opening is a chat being opened: the chat, and the ID it already has when the
-// client returns to it.
-type opening struct {
+// callFunc passes a request on to as a call, and hands what it returns back
+// through back to the session s of dir, in the router's one loop.
+type callFunc func(dir Path, s *SessionControl, to Caller, ret returned, back func(event))
+
+// returned is a call a session made and what it returned: the call that passed
+// a request on, whose Answer it returns to, or the kept Connect.
+type returned struct {
+	call   sessionCall
+	in     Inbound
+	answer Message
+	err    error
+}
+
+// sessionCall is what a session acts on when one of its calls returns:
+// connectCall, openCall, closeCall or passCall.
+type sessionCall interface{ isSessionCall() }
+
+// connectCall is the kept Connect, called on an adapter the attach started.
+type connectCall struct{}
+
+// openCall passed the client's Open of chat on; id is the ID the chat has,
+// empty for a new chat.
+type openCall struct {
 	chat *ChatControl
 	id   ChatID
 }
 
-// optionalID is a request ID that may be unset. A notification has no ID and
-// no answer, so a zero one is never set: it would match every notification.
-type optionalID struct {
-	id  MessageID
-	set bool
-}
+// closeCall passed the client's Close on; decides is set when it left no chat
+// waited on, so its return decides whether the session ends.
+type closeCall struct{ decides bool }
 
-func someID(id MessageID) optionalID { return optionalID{id: id, set: !id.IsZero()} }
+// passCall passed a request on that the session only carries.
+type passCall struct{}
 
-func (o optionalID) is(id MessageID) bool { return o.set && o.id == id }
-
-// shared is what the router shares with every session.
-type shared struct {
-	owners   map[ChatID]Path // chat ID → the directory of its session
-	requests *requests       // what the adapters asked the client
-}
+func (connectCall) isSessionCall() {}
+func (openCall) isSessionCall()    {}
+func (closeCall) isSessionCall()   {}
+func (passCall) isSessionCall()    {}
 
 // SessionSM is the machine a session's state is handed with every event.
 type SessionSM = StateMachine[SessionState]
@@ -65,10 +83,12 @@ type SessionSM = StateMachine[SessionState]
 // they ended the session.
 type SessionState interface {
 	// HandleClientMessage: the client sent a message for this session.
-	HandleClientMessage(ctx context.Context, sm SessionSM, s *sessionContext, msg Message) (bool, error)
-	// HandleAdapterMessage: the adapter sent a message; nil says its
+	HandleClientMessage(ctx context.Context, sm SessionSM, s *sessionContext, in Inbound) (bool, error)
+	// HandleAdapterMessage: the adapter sent a message; a nil Message says its
 	// connection ended.
-	HandleAdapterMessage(ctx context.Context, sm SessionSM, s *sessionContext, msg Message) (bool, error)
+	HandleAdapterMessage(ctx context.Context, sm SessionSM, s *sessionContext, in Inbound) (bool, error)
+	// Returned: a call the session made returned.
+	Returned(ctx context.Context, sm SessionSM, s *sessionContext, ret returned) (bool, error)
 	// Located: the agent program reported a chat of this session's directory
 	// in state, for a client message that names it.
 	Located(sm SessionSM, s *sessionContext, id ChatID, state agent.State) error
@@ -83,52 +103,61 @@ type SessionControl struct {
 	session sessionContext
 }
 
-// newSession is the session of dir on att. An adapter att started has not
-// been told how the client connected, so the kept Connect is sent to it before
-// anything else; nil is none kept yet.
-func newSession(dir Path, att Attachment, deps sessionDeps, connect Message) (*SessionControl, error) {
-	c := &SessionControl{
-		sm: StateMachineImpl[SessionState]{state: sessionAttached{}},
-		session: sessionContext{
-			Attachment: att,
-			dir:        dir,
-			client:     deps.client,
-			agent:      deps.agent,
-			acp:        deps.acp,
-			log:        deps.log,
-			chats:      map[ChatID]*ChatControl{},
-			opening:    map[MessageID]opening{},
-			shared:     deps.shared,
-		},
-	}
-	if att.Started {
-		if connect == nil {
-			c.session.log.Printf("adapter of %s started before the client connected: it is sent no Connect", dir)
-		} else {
-			c.session.connect = someID(connect.ID())
-			if err := c.session.toAdapter(connect); err != nil {
-				return nil, err
-			}
-		}
-	}
-	return c, nil
-}
-
 // sessionDeps are what every session of one client connection is built with.
 type sessionDeps struct {
-	client Sender[Message]
-	agent  agent.Agent
-	acp    agent.ACP
-	log    *log.Logger
-	shared *shared
+	client  Caller
+	agent   agent.Agent
+	acp     agent.ACP
+	log     *log.Logger
+	owners  map[ChatID]Path
+	call    callFunc
+	post    func(event)     // the loop's own way in, which the client's returns take
+	running context.Context // the router's, which the kept Connect is called under
 }
 
-func (c *SessionControl) HandleClientMessage(ctx context.Context, msg Message) (bool, error) {
-	return fire(&c.sm, func(s SessionState) (bool, error) { return s.HandleClientMessage(ctx, &c.sm, &c.session, msg) })
+// newSession is the session of dir on att, whose adapter's returns come back
+// through adapterReturns. An adapter att started has not been told how the
+// client connected, so it is called with the kept Connect before anything
+// else; nil is none kept yet.
+func newSession(dir Path, att Attachment, deps sessionDeps, connect Message, adapterReturns func(event)) *SessionControl {
+	c := &SessionControl{sm: StateMachineImpl[SessionState]{state: sessionAttached{}}}
+	c.session = sessionContext{
+		Attachment:     att,
+		dir:            dir,
+		self:           c,
+		client:         mappedCaller{c: deps.client, out: att.Paths.ToLocal, back: att.Paths.ToRemote},
+		adapter:        mappedCaller{c: att.Adapter, out: att.Paths.ToRemote, back: att.Paths.ToLocal},
+		agent:          deps.agent,
+		acp:            deps.acp,
+		log:            deps.log,
+		call:           deps.call,
+		clientReturns:  deps.post,
+		adapterReturns: adapterReturns,
+		chats:          map[ChatID]*ChatControl{},
+		owners:         deps.owners,
+	}
+	s := &c.session
+	switch {
+	case !att.Started:
+	case connect == nil:
+		s.log.Printf("adapter of %s started before the client connected: it is sent no Connect", dir)
+	default:
+		s.connecting = true
+		s.call(dir, c, s.adapter, returned{call: connectCall{}, in: Inbound{Message: connect, Context: deps.running}}, adapterReturns)
+	}
+	return c
 }
 
-func (c *SessionControl) HandleAdapterMessage(ctx context.Context, msg Message) (bool, error) {
-	return fire(&c.sm, func(s SessionState) (bool, error) { return s.HandleAdapterMessage(ctx, &c.sm, &c.session, msg) })
+func (c *SessionControl) HandleClientMessage(ctx context.Context, in Inbound) (bool, error) {
+	return fire(&c.sm, func(s SessionState) (bool, error) { return s.HandleClientMessage(ctx, &c.sm, &c.session, in) })
+}
+
+func (c *SessionControl) HandleAdapterMessage(ctx context.Context, in Inbound) (bool, error) {
+	return fire(&c.sm, func(s SessionState) (bool, error) { return s.HandleAdapterMessage(ctx, &c.sm, &c.session, in) })
+}
+
+func (c *SessionControl) Returned(ctx context.Context, ret returned) (bool, error) {
+	return fire(&c.sm, func(s SessionState) (bool, error) { return s.Returned(ctx, &c.sm, &c.session, ret) })
 }
 
 func (c *SessionControl) Located(id ChatID, state agent.State) error {
@@ -148,20 +177,23 @@ type sessionAttached struct {
 	waiting int
 }
 
-func (st sessionAttached) HandleClientMessage(ctx context.Context, sm SessionSM, s *sessionContext, msg Message) (bool, error) {
+func (st sessionAttached) HandleClientMessage(ctx context.Context, sm SessionSM, s *sessionContext, in Inbound) (bool, error) {
+	msg := in.Message
 	switch msg.Kind() {
 	case Open:
+		if in.Answer == nil {
+			return false, errors.New("session: an open that is no request")
+		}
 		id := msg.Chat()
 		c, known := s.chats[id]
 		if id == "" || !known {
-			c = newChat(FuncSender[Message](s.toClient))
+			c = newChat(s.toClient)
 		}
-		if err := c.Open(msg.ID()); err != nil {
+		if err := c.Open(in.Answer); err != nil {
 			return false, err
 		}
-		s.opening[msg.ID()] = opening{chat: c, id: id}
 		sm.SetState(sessionAttached{waiting: st.waiting + 1})
-		return false, s.toAdapter(msg)
+		return false, s.toAdapter(returned{call: openCall{chat: c, id: id}, in: in})
 
 	case Suspend:
 		c, err := s.chat(msg)
@@ -172,18 +204,12 @@ func (st sessionAttached) HandleClientMessage(ctx context.Context, sm SessionSM,
 		if err != nil {
 			return false, err
 		}
-		if !msg.ID().IsZero() {
-			if err := s.toClient(msg.Reply(EmptyResult{})); err != nil {
+		if in.Answer != nil {
+			if err := in.Answer.Reply(EmptyResult{}); err != nil {
 				return false, err
 			}
 		}
-		st = st.left(waited)
-		sm.SetState(st)
-		// A Close still waiting for its answer decides the session's end.
-		if st.waiting > 0 || s.closing.set {
-			return false, nil
-		}
-		return st.ended(st.detach(ctx, sm, s))
+		return st.left(ctx, sm, s, waited, st.detach)
 
 	case Close:
 		c, err := s.chat(msg)
@@ -194,115 +220,118 @@ func (st sessionAttached) HandleClientMessage(ctx context.Context, sm SessionSM,
 		if err != nil {
 			return false, err
 		}
-		s.forgetChat(msg.Chat(), c)
-		if err := s.toAdapter(msg); err != nil {
+		s.forgetChat(msg.Chat())
+		// A Close sent as a notification gets no answer to wait for.
+		decides := in.Answer != nil && (st.waiting == 0 || (waited && st.waiting == 1))
+		if decides {
+			s.closing++
+		}
+		if err := s.toAdapter(returned{call: closeCall{decides: decides}, in: in}); err != nil {
 			return false, err
 		}
-		st = st.left(waited)
-		sm.SetState(st)
-		if st.waiting > 0 {
-			return false, nil
-		}
-		if id := someID(msg.ID()); id.set {
-			s.closing = id
-			return false, nil
-		}
-		// A Close sent as a notification gets no answer to wait for; an
-		// earlier Close that will be answered still decides.
-		if s.closing.set {
-			return false, nil
-		}
-		return st.ended(st.end(ctx, sm, s))
+		return st.left(ctx, sm, s, waited, st.end)
 
-	case Pass, Cancel, Answer:
-		return false, s.toAdapter(msg)
-
-	case Connect, List, Question:
-		return false, fmt.Errorf("session: a %s from the client is not a session's", msg.Kind())
+	case Pass:
+		return false, s.toAdapter(returned{call: passCall{}, in: in})
 	}
-	return false, fmt.Errorf("session: unhandled message kind %s", msg.Kind())
+	return false, fmt.Errorf("session: a %s from the client is not a session's", msg.Kind())
+}
+
+// left is the event of the client no longer showing a chat, which it waited
+// on or not. Waiting on none, the session ends by end, unless a Close still
+// waits for its answer, which then decides.
+func (st sessionAttached) left(ctx context.Context, sm SessionSM, s *sessionContext, waited bool,
+	end func(context.Context, SessionSM, *sessionContext) error) (bool, error) {
+	if waited {
+		st.waiting--
+	}
+	sm.SetState(st)
+	if st.waiting > 0 || s.closing > 0 {
+		return false, nil
+	}
+	return st.ended(end(ctx, sm, s))
 }
 
 // ended reports a session that gave its workspace up as ended. One whose
 // workspace could not be given up still holds it, and is not.
 func (sessionAttached) ended(err error) (bool, error) { return err == nil, err }
 
-// left is the state after the client stopped showing a chat, which it waited
-// on or not.
-func (st sessionAttached) left(waited bool) sessionAttached {
-	if waited {
-		st.waiting--
-	}
-	return st
-}
-
-func (st sessionAttached) HandleAdapterMessage(ctx context.Context, sm SessionSM, s *sessionContext, msg Message) (bool, error) {
-	if msg == nil { // the adapter is gone, and its chats with it
+func (st sessionAttached) HandleAdapterMessage(ctx context.Context, sm SessionSM, s *sessionContext, in Inbound) (bool, error) {
+	if in.Message == nil { // the adapter is gone, and its chats with it
 		return st.ended(st.detach(ctx, sm, s))
 	}
-	// The adapter numbers its own requests apart from the client's, so a
-	// question, or its cancel, may carry the ID of a request of the client's
-	// still waiting.
-	if !adapterOwn(msg) {
-		if s.connect.is(msg.ID()) {
-			s.connect = optionalID{}
-			s.compareHandshake(msg)
-			return false, nil
-		}
-		if o, ok := s.opening[msg.ID()]; ok {
-			delete(s.opening, msg.ID())
-			opened, err := o.chat.Answered(msg)
-			if err != nil || !opened {
-				// A chat suspended while it opened stays so, and the
-				// adapter replays it when the client returns.
+	if c, ok := s.chats[in.Message.Chat()]; ok && in.Message.Chat() != "" {
+		return false, c.Output(in)
+	}
+	return false, s.toClient(in) // a message of no chat the session holds
+}
+
+func (st sessionAttached) Returned(ctx context.Context, sm SessionSM, s *sessionContext, ret returned) (bool, error) {
+	switch call := ret.call.(type) {
+	case connectCall:
+		s.compareHandshake(ret.answer, ret.err)
+		s.connecting = false
+		queued := s.queued
+		s.queued = nil
+		for _, q := range queued {
+			if err := s.toAdapter(q); err != nil {
 				return false, err
 			}
-			id := msg.Chat()
-			if id == "" {
-				id = o.id
-			}
-			if id == "" {
-				// An answer that names no new chat, such as an error, leaves
-				// a chat nobody can name, so the client waits on it no more.
-				s.log.Printf("session %s: the answer to %s names no chat; the chat cannot be reached", s.dir, msg.ID())
-				st = st.left(true)
-				sm.SetState(st)
-				if st.waiting > 0 || s.closing.set {
-					return false, nil
-				}
-				return st.ended(st.detach(ctx, sm, s))
-			}
-			s.chats[id] = o.chat
-			s.shared.owners[id] = s.dir
+		}
+		return false, nil
+
+	case openCall:
+		opened, err := call.chat.Answered(ret.in.Answer, ret.answer, ret.err)
+		if err != nil {
+			return false, err
+		}
+		if !opened {
+			// A chat suspended or closed while it opened, or opened again
+			// since, stays as it is, and the client's request still gets its
+			// answer.
+			return false, answer(ret.in, ret.answer, ret.err)
+		}
+		id := call.id
+		if ret.err == nil && ret.answer.Chat() != "" {
+			id = ret.answer.Chat()
+		}
+		if id == "" {
+			// A new chat whose open failed has no ID the client could name,
+			// so the client waits on it no more.
+			s.log.Printf("session %s: the answer to an open names no chat; the chat cannot be reached", s.dir)
+			return st.left(ctx, sm, s, true, st.detach)
+		}
+		s.chats[id] = call.chat
+		s.owners[id] = s.dir
+		return false, nil
+
+	case closeCall:
+		if err := answer(ret.in, ret.answer, ret.err); err != nil {
+			return false, err
+		}
+		if !call.decides {
 			return false, nil
 		}
-		if s.closing.is(msg.ID()) {
-			s.closing = optionalID{}
-			if err := s.toClient(msg); err != nil {
-				return false, err
-			}
-			if st.waiting > 0 { // an Open came meanwhile
-				return false, nil
-			}
-			return st.ended(st.end(ctx, sm, s))
-		}
+		s.closing--
+		// An Open that came meanwhile has the session waiting on a chat.
+		return st.left(ctx, sm, s, false, st.end)
+
+	case passCall:
+		return false, answer(ret.in, ret.answer, ret.err)
 	}
-	if c, ok := s.chats[msg.Chat()]; ok && msg.Chat() != "" {
-		return false, c.Output(msg)
-	}
-	return false, s.toClient(msg) // a message of no chat the session holds
+	return false, fmt.Errorf("session: a return of unhandled call %T", ret.call)
 }
 
 func (st sessionAttached) Located(_ SessionSM, s *sessionContext, id ChatID, state agent.State) error {
 	if _, ok := s.chats[id]; ok {
 		return fmt.Errorf("session: chat %s located again in %s", id, s.dir)
 	}
-	c, err := newLocatedChat(id, state, FuncSender[Message](s.toClient))
+	c, err := newLocatedChat(id, state, s.toClient)
 	if err != nil {
 		return err
 	}
 	s.chats[id] = c
-	s.shared.owners[id] = s.dir
+	s.owners[id] = s.dir
 	return nil
 }
 
@@ -317,15 +346,13 @@ func (st sessionAttached) detach(ctx context.Context, sm SessionSM, s *sessionCo
 	if err := s.Workspace.Detach(ctx); err != nil {
 		return err
 	}
-	s.leave(sm)
-	return nil
+	return s.leave(sm)
 }
 
-// end ends the session after the last chat it waited on was closed. One
-// adapter runs every chat of the workspace, a subdirectory's included, so it
-// is closed only when the agent program runs no conversation in the root or
-// under it; a listing that cannot be read counts as one running, which never
-// ends something in use.
+// end ends the session once it waits on no chat. One adapter runs every chat
+// of the workspace, a subdirectory's included, so it is closed only when the
+// agent program runs no conversation in the root or under it; a listing that
+// cannot be read counts as one running, which never ends something in use.
 func (st sessionAttached) end(ctx context.Context, sm SessionSM, s *sessionContext) error {
 	running, err := s.runsConversation(ctx)
 	if err != nil {
@@ -341,21 +368,25 @@ func (st sessionAttached) end(ctx context.Context, sm SessionSM, s *sessionConte
 	if err := s.Workspace.Close(ctx, key); err != nil {
 		return err
 	}
-	s.leave(sm)
-	return nil
+	return s.leave(sm)
 }
 
 // sessionDetached: the leases are given up. The session takes nothing more;
 // a client that returns gets a new one.
 type sessionDetached struct{}
 
-func (sessionDetached) HandleClientMessage(_ context.Context, _ SessionSM, s *sessionContext, msg Message) (bool, error) {
-	return true, fmt.Errorf("session: a %s for the detached session of %s", msg.Kind(), s.dir)
+func (sessionDetached) HandleClientMessage(_ context.Context, _ SessionSM, s *sessionContext, in Inbound) (bool, error) {
+	return true, fmt.Errorf("session: a %s for the detached session of %s", in.Message.Kind(), s.dir)
 }
 
 // HandleAdapterMessage drops what was on its way when the session ended.
-func (sessionDetached) HandleAdapterMessage(context.Context, SessionSM, *sessionContext, Message) (bool, error) {
+func (sessionDetached) HandleAdapterMessage(context.Context, SessionSM, *sessionContext, Inbound) (bool, error) {
 	return true, nil
+}
+
+// Returned still answers the request a call passed on.
+func (sessionDetached) Returned(_ context.Context, _ SessionSM, _ *sessionContext, ret returned) (bool, error) {
+	return true, answer(ret.in, ret.answer, ret.err)
 }
 
 func (sessionDetached) Located(_ SessionSM, s *sessionContext, id ChatID, _ agent.State) error {
@@ -374,28 +405,27 @@ func (s *sessionContext) chat(msg Message) (*ChatControl, error) {
 }
 
 // forgetChat drops a closed chat, so what the adapter still sends of it goes to
-// the client as a message of no chat, the answer to a request that opened it
-// included.
-func (s *sessionContext) forgetChat(id ChatID, c *ChatControl) {
+// the client as a message of no chat.
+func (s *sessionContext) forgetChat(id ChatID) {
 	delete(s.chats, id)
-	delete(s.shared.owners, id)
-	for request, o := range s.opening {
-		if o.chat == c {
-			delete(s.opening, request)
-		}
-	}
+	delete(s.owners, id)
 }
 
-// leave drops what the session put into the shared maps, its chats and the
-// questions they hold, and switches it to Detached.
-func (s *sessionContext) leave(sm SessionSM) {
+// leave drops what the session put into the owners, and its chats with the
+// questions they hold, unanswered, and switches it to Detached. A request
+// still waiting for the kept Connect fails.
+func (s *sessionContext) leave(sm SessionSM) error {
 	for id := range s.chats {
-		delete(s.shared.owners, id)
+		delete(s.owners, id)
 	}
 	clear(s.chats)
-	clear(s.opening)
-	s.shared.requests.forget(s.dir)
 	sm.SetState(sessionDetached{})
+	var errs []error
+	for _, q := range s.queued {
+		errs = append(errs, answer(q.in, nil, fmt.Errorf("hermod: the session of %s ended", s.dir)))
+	}
+	s.queued = nil
+	return errors.Join(errs...)
 }
 
 // runsConversation asks the agent program whether a conversation of the
@@ -415,9 +445,13 @@ func (s *sessionContext) runsConversation(ctx context.Context) (bool, error) {
 
 // compareHandshake logs where the adapter's answer to the kept Connect differs
 // from what the agent declared, which the client was answered with.
-func (s *sessionContext) compareHandshake(msg Message) {
+func (s *sessionContext) compareHandshake(answer Message, err error) {
+	if err != nil {
+		s.log.Printf("session %s: the adapter refused the connection start: %v", s.dir, err)
+		return
+	}
 	declared := s.acp.Connect()
-	got, ok := msg.Result().(HandshakeResult)
+	got, ok := answer.Result().(HandshakeResult)
 	switch {
 	case !ok:
 		s.log.Printf("session %s: the adapter's answer to the connection start is no handshake", s.dir)
@@ -428,94 +462,26 @@ func (s *sessionContext) compareHandshake(msg Message) {
 	}
 }
 
-func (s *sessionContext) toAdapter(msg Message) error {
-	return s.Adapter.Send(msg.Mapped(s.Paths.ToRemote))
-}
-
-// toClient sends msg to the client with its paths mapped back, a question,
-// and the cancel of one, under the ID of the router's own the client knows it
-// by. A cancel of a question the client was never asked, one held in a
-// Suspended chat or already answered, has nothing to cancel on the client.
-func (s *sessionContext) toClient(msg Message) error {
-	switch msg.Kind() {
-	case Question:
-		msg = s.shared.requests.ask(s.dir, msg)
-	case Cancel:
-		id, ok := s.shared.requests.asked(s.dir, msg.ID())
-		if !ok {
-			s.log.Printf("session %s: dropped a cancel of %s, a question the client was not asked", s.dir, msg.ID())
-			return nil
-		}
-		msg = msg.WithID(id)
+// toAdapter hands the adapter ret's message: a notification at once, and a
+// request as a call whose return comes back to the session.
+func (s *sessionContext) toAdapter(ret returned) error {
+	switch {
+	case s.connecting:
+		s.queued = append(s.queued, ret)
+	case ret.in.Answer == nil:
+		return s.adapter.Notify(ret.in.Message)
+	default:
+		s.call(s.dir, s.self, s.adapter, ret, s.adapterReturns)
 	}
-	return s.client.Send(msg.Mapped(s.Paths.ToLocal))
+	return nil
 }
 
-// adapterOwn reports whether an adapter's message is in its own request space:
-// a question, or the cancel of one, and no answer to the client's.
-func adapterOwn(msg Message) bool { return msg.Kind() == Question || msg.Kind() == Cancel }
-
-// requests pairs each adapter's question with the client's answer. Every
-// adapter numbers its requests from its own counter, so two adapters send the
-// same ID over the client's one connection: a question gets a fresh ID on the
-// way out, and the answer finds its session by that ID.
-type requests struct {
-	next    uint64
-	pending map[MessageID]asked
-	// dropped are the questions of sessions that detached, which the client
-	// may still answer, or cancel, as it would any question.
-	dropped map[MessageID]struct{}
-}
-
-type asked struct {
-	dir Path      // the session that asked
-	id  MessageID // the adapter's own ID
-}
-
-func newRequests() *requests {
-	return &requests{pending: map[MessageID]asked{}, dropped: map[MessageID]struct{}{}}
-}
-
-func (r *requests) ask(dir Path, msg Message) Message {
-	r.next++
-	id := TextID(fmt.Sprintf("hermod-%d", r.next))
-	r.pending[id] = asked{dir: dir, id: msg.ID()}
-	return msg.WithID(id)
-}
-
-// asked is the ID the client knows the question dir's adapter asked under id
-// by. The entry stays: a cancelled request is still answered.
-func (r *requests) asked(dir Path, id MessageID) (MessageID, bool) {
-	for ours, a := range r.pending {
-		if a.dir == dir && a.id == id {
-			return ours, true
-		}
+// toClient hands the client an adapter's message: a notification at once,
+// and a request as a call whose answer returns to the adapter.
+func (s *sessionContext) toClient(in Inbound) error {
+	if in.Answer == nil {
+		return s.client.Notify(in.Message)
 	}
-	return MessageID{}, false
-}
-
-// answer is the session that asked, and the answer under the adapter's own ID;
-// live is false for a question whose session detached, whose answer has
-// nowhere to go.
-func (r *requests) answer(msg Message) (dir Path, answer Message, live bool, err error) {
-	if _, ok := r.dropped[msg.ID()]; ok {
-		delete(r.dropped, msg.ID())
-		return "", nil, false, nil
-	}
-	a, ok := r.pending[msg.ID()]
-	if !ok {
-		return "", nil, false, fmt.Errorf("session: answer to an unknown request %s", msg.ID())
-	}
-	delete(r.pending, msg.ID())
-	return a.dir, msg.WithID(a.id), true, nil
-}
-
-// forget drops what a session asked and can no longer be answered.
-func (r *requests) forget(dir Path) {
-	for id, a := range r.pending {
-		if a.dir == dir {
-			delete(r.pending, id)
-			r.dropped[id] = struct{}{}
-		}
-	}
+	s.call(s.dir, s.self, s.client, returned{call: passCall{}, in: in}, s.clientReturns)
+	return nil
 }

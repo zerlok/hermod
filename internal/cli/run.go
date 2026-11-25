@@ -119,8 +119,8 @@ func (a app) runChat(ctx context.Context, host string) error {
 		return fmt.Errorf("agent %s serves no chat client", agentClaude)
 	}
 	logger := log.New(a.stderr, "", 0)
-	serializer := air.NewSerializer()
-	connections := acp.NewAdapters[session.Path](serializer, logger)
+	registry := acp.Standard()
+	air.Register(registry)
 	adapters := session.Adapters{
 		Remote:  remote,
 		Local:   a.workspaceLocal(l.home, nil),
@@ -133,16 +133,14 @@ func (a app) runChat(ctx context.Context, host string) error {
 		MainWorktree: func(ctx context.Context, dir string) (string, string, bool) {
 			return git.MainWorktree(ctx, a.local, dir)
 		},
-		Connect: func(root session.Path, started bool, fromAdapter io.Reader, toAdapter io.Writer) session.Channel {
-			return connections.Connect(root, started, fromAdapter, toAdapter)
+		Connect: func(fromAdapter io.Reader, toAdapter io.Writer) session.Channel {
+			return acp.NewConn(ctx, fromAdapter, toAdapter, registry, acp.Agent, logger)
 		},
 		Errors: a.adapterLog(l.home),
 		Log:    logger,
 	}
-	client := acp.NewClient(a.stdin, a.stdout, serializer, logger)
-	defer func() { _ = client.Close() }()
 	return a.chat(ctx, session.ChatRequest{
-		Client: client,
+		Client: acp.NewConn(ctx, a.stdin, a.stdout, registry, acp.Client, logger),
 		Agent:  ag,
 		ACP:    chats,
 		Remote: remote,

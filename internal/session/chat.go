@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"maps"
 	"path"
@@ -59,15 +58,15 @@ func Chat(ctx context.Context, req ChatRequest) (err error) {
 		select {
 		case <-ctx.Done():
 			return nil
-		case msg, ok := <-req.Client.Receive():
+		case in, ok := <-req.Client.Receive():
 			if !ok {
 				return req.Client.Err()
 			}
-			if err := r.fromClient(running, msg); err != nil {
+			if err := r.fromClient(running, in); err != nil {
 				return err
 			}
-		case in := <-r.adapters:
-			if err := r.fromAdapter(running, in); err != nil {
+		case ev := <-r.events:
+			if err := ev(running); err != nil {
 				return err
 			}
 		}
@@ -76,148 +75,172 @@ func Chat(ctx context.Context, req ChatRequest) (err error) {
 
 // router is what Chat keeps across messages: which session a message is for,
 // and when a session is made or forgotten. What a session registers about its
-// chats and requests is the session's to decide.
+// chats is the session's to decide.
 type router struct {
 	req      ChatRequest
-	running  context.Context // ends the forwarders
+	running  context.Context // ends the forwarders and the calls
 	deps     sessionDeps
 	sessions map[Path]*SessionControl // keyed by the exact directory the session was made for
-	// pending is each request of the client's that a session passed on: the
-	// client's request ID → the directory of that session.
-	pending map[MessageID]Path
 	// connect is the client's Connect, kept for every adapter started later.
 	connect Message
 
-	adapters   chan adapterMessage
+	// events are what reaches the one loop from elsewhere: an adapter's
+	// message, or what a call returned.
+	events     chan event
 	forwarders sync.WaitGroup
+	calls      sync.WaitGroup // the calls whose return has not reached the loop, which close waits for
 }
 
-// adapterMessage is a message an adapter sent, with the session it came from;
-// a nil msg says the adapter's connection ended.
-type adapterMessage struct {
-	dir     Path
-	session *SessionControl
-	msg     Message
-}
+type event func(ctx context.Context) error
 
 func newRouter(running context.Context, req ChatRequest) *router {
-	logger := req.Log
-	if logger == nil {
-		logger = log.New(io.Discard, "", 0)
-	}
+	logger := orDiscardLog(req.Log)
 	req.Log = logger
 	r := &router{
 		req:      req,
 		running:  running,
 		sessions: map[Path]*SessionControl{},
-		pending:  map[MessageID]Path{},
-		adapters: make(chan adapterMessage),
+		events:   make(chan event),
 	}
 	r.deps = sessionDeps{
-		client: req.Client,
-		agent:  req.Agent,
-		acp:    req.ACP,
-		log:    logger,
-		shared: &shared{owners: map[ChatID]Path{}, requests: newRequests()},
+		client:  req.Client,
+		agent:   req.Agent,
+		acp:     req.ACP,
+		log:     logger,
+		owners:  map[ChatID]Path{},
+		call:    r.call,
+		post:    r.post,
+		running: running,
 	}
 	return r
 }
 
 // close detaches every session, in the order of their directories, and stops
-// the forwarders.
+// the forwarders and the calls.
 func (r *router) close(ctx context.Context, stop context.CancelFunc) error {
 	var errs []error
 	for _, dir := range slices.Sorted(maps.Keys(r.sessions)) {
 		errs = append(errs, r.sessions[dir].Detach(ctx))
-		r.forget(dir)
+		delete(r.sessions, dir)
 	}
 	// Detaching ends each adapter's connection, which ends its forwarder;
-	// stop frees one blocked handing a message to the loop that has returned.
+	// stop ends the calls, and frees a goroutine blocked handing an event to
+	// the loop that has returned.
 	stop()
 	r.forwarders.Wait()
+	r.calls.Wait()
 	return errors.Join(errs...)
 }
 
-func (r *router) fromClient(ctx context.Context, msg Message) error {
+// post hands ev to the loop, unless the router has stopped.
+func (r *router) post(ev event) {
+	select {
+	case r.events <- ev:
+	case <-r.running.Done():
+	}
+}
+
+// call passes ret's request on to as a call, under the request's context for
+// as long as the router runs, and brings what it returns back into the loop
+// through back, in order with the other messages of to's connection, to the
+// session s of dir while the router holds it. A request that could not be sent
+// returns its error the same way.
+func (r *router) call(dir Path, s *SessionControl, to Caller, ret returned, back func(event)) {
+	ctx, cancel := context.WithCancel(ret.in.Context)
+	stop := context.AfterFunc(r.running, cancel)
+	returnTo := func(back func(event)) func(Message, error) {
+		return func(msg Message, err error) {
+			defer r.calls.Done()
+			cancel()
+			stop()
+			ret.answer, ret.err = msg, err
+			back(func(ctx context.Context) error {
+				if held, ok := r.sessions[dir]; !ok || held != s {
+					return answer(ret.in, ret.answer, ret.err)
+				}
+				ended, err := s.Returned(ctx, ret)
+				if ended {
+					delete(r.sessions, dir)
+				}
+				return err
+			})
+		}
+	}
+	r.calls.Add(1)
+	if err := to.Call(ctx, ret.in.Message, returnTo(back)); err != nil {
+		// Called from the loop, the error cannot be handed to it here; it
+		// follows nothing of to's, whose connection may have ended.
+		go returnTo(r.post)(nil, err)
+	}
+}
+
+func (r *router) fromClient(ctx context.Context, in Inbound) error {
+	msg := in.Message
 	switch msg.Kind() {
 	case Connect:
 		r.connect = msg
-		return r.req.Client.Send(msg.Reply(HandshakeResult{Handshake: r.req.ACP.Connect()}))
+		return reply(in, HandshakeResult{Handshake: r.req.ACP.Connect()})
 
 	case List:
-		return r.req.Client.Send(r.list(ctx, msg))
-
-	case Cancel:
-		dir, ok := r.pending[msg.ID()]
-		if !ok {
-			r.req.Log.Printf("dropped a cancel of %s, which no session holds", msg.ID())
-			return nil
-		}
-		return r.handle(ctx, dir, msg)
-
-	case Answer:
-		dir, answer, live, err := r.deps.shared.requests.answer(msg)
+		result, err := r.list(ctx, msg.Dir())
 		if err != nil {
-			return err
+			return answer(in, nil, err)
 		}
-		if !live {
-			r.req.Log.Printf("dropped an answer to %s, whose session detached", msg.ID())
-			return nil
-		}
-		return r.handle(ctx, dir, answer)
+		return reply(in, result)
 
 	case Open:
 		if msg.Chat() != "" {
-			return r.forChat(ctx, msg)
+			return r.forChat(ctx, in)
 		}
 		if msg.Dir() == "" {
-			return r.req.Client.Send(msg.Fail(errors.New("hermod: the request names neither a chat nor a directory")))
+			return answer(in, nil, errors.New("hermod: the request names neither a chat nor a directory"))
 		}
 		if _, err := r.session(ctx, msg.Dir()); err != nil {
 			return err
 		}
-		return r.request(ctx, msg.Dir(), msg)
+		return r.handle(ctx, msg.Dir(), in)
 
 	case Suspend, Close:
-		return r.forChat(ctx, msg)
+		return r.forChat(ctx, in)
 
 	case Pass:
-		dir, ok := r.deps.shared.owners[msg.Chat()]
+		dir, ok := r.deps.owners[msg.Chat()]
 		if !ok || msg.Chat() == "" {
-			if msg.ID().IsZero() {
-				return nil
-			}
-			return r.req.Client.Send(msg.Fail(fmt.Errorf("hermod: no chat %q is open", msg.Chat())))
+			return answer(in, nil, fmt.Errorf("hermod: no chat %q is open", msg.Chat()))
 		}
-		return r.request(ctx, dir, msg)
-
-	case Question:
-		return fmt.Errorf("session: a question from the client: %s", msg.ID())
+		return r.handle(ctx, dir, in)
 	}
 	return fmt.Errorf("session: unhandled message kind %s", msg.Kind())
+}
+
+// reply answers a request session answers itself; a notification has no
+// answer.
+func reply(in Inbound, result Result) error {
+	if in.Answer == nil {
+		return nil
+	}
+	return in.Answer.Reply(result)
 }
 
 // forChat routes a message that names a chat to the session that holds it,
 // locating the chat in the agent program when none does. A chat the program
 // does not have is answered with an error, and the client goes on.
-func (r *router) forChat(ctx context.Context, msg Message) error {
-	dir, ok := r.deps.shared.owners[msg.Chat()]
+func (r *router) forChat(ctx context.Context, in Inbound) error {
+	msg := in.Message
+	dir, ok := r.deps.owners[msg.Chat()]
 	if !ok {
 		conv, err := r.locate(ctx, msg.Chat())
 		if err != nil {
-			return r.fail(msg, err)
+			return r.fail(in, err)
 		}
 		// A stopped chat keeps nothing running to suspend: attaching for it
 		// would start an adapter that no Close ever ends.
 		if msg.Kind() == Suspend && conv.State == agent.Stopped {
-			if msg.ID().IsZero() {
-				return nil
-			}
-			return r.req.Client.Send(msg.Reply(EmptyResult{}))
+			return reply(in, EmptyResult{})
 		}
 		paths, err := workspace.Map(ctx, r.req.Remote, r.req.Local)
 		if err != nil {
-			return r.fail(msg, err)
+			return r.fail(in, err)
 		}
 		dir = Path(paths.ToLocal(conv.Dir))
 		s, err := r.session(ctx, dir)
@@ -228,17 +251,17 @@ func (r *router) forChat(ctx context.Context, msg Message) error {
 			return err
 		}
 	}
-	return r.request(ctx, dir, msg)
+	return r.handle(ctx, dir, in)
 }
 
 // fail answers a request the router could not route with err; a notification
 // has no answer, so its failure is only logged.
-func (r *router) fail(msg Message, err error) error {
-	if msg.ID().IsZero() {
-		r.req.Log.Printf("dropped a %s of chat %q: %v", msg.Kind(), msg.Chat(), err)
+func (r *router) fail(in Inbound, err error) error {
+	if in.Answer == nil {
+		r.req.Log.Printf("dropped a %s of chat %q: %v", in.Message.Kind(), in.Message.Chat(), err)
 		return nil
 	}
-	return r.req.Client.Send(msg.Fail(err))
+	return in.Answer.Fail(err)
 }
 
 // locate asks the agent program where a chat belongs.
@@ -250,23 +273,22 @@ func (r *router) locate(ctx context.Context, chat ChatID) (agent.Conversation, e
 	return conv, err
 }
 
-// list answers a List with the conversations of exactly the directory asked:
-// the agent program lists those under it too, which are other directories'
-// chats. A directory no relay covers is mapped as a new workspace would join
-// it, so a project never attached here gets the remote's list as well.
-func (r *router) list(ctx context.Context, msg Message) Message {
-	dir := string(msg.Dir())
+// list is the conversations of exactly the directory asked: the agent program
+// lists those under it too, which are other directories' chats. A directory no
+// relay covers is mapped as a new workspace would join it, so a project never
+// attached here gets the remote's list as well.
+func (r *router) list(ctx context.Context, dir Path) (ListResult, error) {
 	if dir == "" {
-		return msg.Reply(ListResult{})
+		return ListResult{}, nil
 	}
-	paths, err := workspace.Map(ctx, r.req.Remote, r.req.Local, dir)
+	paths, err := workspace.Map(ctx, r.req.Remote, r.req.Local, string(dir))
 	if err != nil {
-		return msg.Fail(err)
+		return ListResult{}, err
 	}
-	remoteDir := path.Clean(paths.ToRemote(dir))
+	remoteDir := path.Clean(paths.ToRemote(string(dir)))
 	found, err := r.req.Agent.List(ctx, remoteDir)
 	if err != nil {
-		return msg.Fail(err)
+		return ListResult{}, err
 	}
 	kept := []agent.Conversation{}
 	for _, c := range found {
@@ -275,7 +297,7 @@ func (r *router) list(ctx context.Context, msg Message) Message {
 			kept = append(kept, c)
 		}
 	}
-	return msg.Reply(ListResult{Conversations: kept})
+	return ListResult{Conversations: kept}, nil
 }
 
 // session is the session of dir, attached when none holds it.
@@ -287,87 +309,71 @@ func (r *router) session(ctx context.Context, dir Path) (*SessionControl, error)
 	if err != nil {
 		return nil, err
 	}
-	s, err := newSession(dir, att, r.deps, r.connect)
-	if err != nil {
-		return nil, errors.Join(err, att.Workspace.Detach(ctx))
+	// The adapter's answers take the way of its messages, so each keeps its
+	// place among them.
+	// A call cancelled as the connection ended can return after its
+	// forwarder has gone, and then goes to the loop directly.
+	returns, gone := make(chan event), make(chan struct{})
+	back := func(ev event) {
+		select {
+		case returns <- ev:
+		case <-gone:
+			r.post(ev)
+		case <-r.running.Done():
+		}
 	}
+	s := newSession(dir, att, r.deps, r.connect, back)
 	r.sessions[dir] = s
-	r.forwarders.Go(func() { r.forward(dir, s, att.Adapter) })
+	r.forwarders.Go(func() {
+		defer close(gone)
+		r.forward(dir, s, att.Adapter, returns)
+	})
 	return s, nil
 }
 
-// request hands a client message to the session of dir, recording a request
-// that the session passes to its adapter, so a Cancel of it finds the session.
-// A Suspend is answered by the session and never reaches an adapter.
-func (r *router) request(ctx context.Context, dir Path, msg Message) error {
-	if !msg.ID().IsZero() && msg.Kind() != Suspend {
-		r.pending[msg.ID()] = dir
-	}
-	return r.handle(ctx, dir, msg)
-}
-
-func (r *router) handle(ctx context.Context, dir Path, msg Message) error {
+func (r *router) handle(ctx context.Context, dir Path, in Inbound) error {
 	s, ok := r.sessions[dir]
 	if !ok {
 		return fmt.Errorf("session: no session holds %s", dir)
 	}
-	ended, err := s.HandleClientMessage(ctx, msg)
+	ended, err := s.HandleClientMessage(ctx, in)
 	if ended {
-		r.forget(dir)
+		delete(r.sessions, dir)
 	}
 	return err
 }
 
-func (r *router) fromAdapter(ctx context.Context, in adapterMessage) error {
-	s, ok := r.sessions[in.dir]
-	if !ok || s != in.session {
-		return nil // on its way when its session ended
+// fromAdapter hands a session an adapter's message; a nil Message says the
+// adapter's connection ended. What was on its way when its session ended is
+// dropped.
+func (r *router) fromAdapter(ctx context.Context, dir Path, s *SessionControl, in Inbound) error {
+	if held, ok := r.sessions[dir]; !ok || held != s {
+		return nil
 	}
-	// A question, or the cancel of one, is in the adapter's own request space,
-	// numbered apart from the client's; anything else with an ID answers one
-	// of the client's.
-	if in.msg != nil && !adapterOwn(in.msg) && r.pending[in.msg.ID()] == in.dir {
-		delete(r.pending, in.msg.ID())
-	}
-	ended, err := s.HandleAdapterMessage(ctx, in.msg)
+	ended, err := s.HandleAdapterMessage(ctx, in)
 	if ended {
-		r.forget(in.dir)
+		delete(r.sessions, dir)
 	}
 	return err
 }
 
-// forget drops a session that ended, and the client's requests it held.
-func (r *router) forget(dir Path) {
-	delete(r.sessions, dir)
-	for id, held := range r.pending {
-		if held == dir {
-			delete(r.pending, id)
-		}
-	}
-}
-
-// forward carries one adapter's messages into the router's loop, and then the
+// forward carries one adapter's messages and the returns of the calls on its
+// connection into the router's loop, in the order they arrived, and then the
 // news that the adapter's connection ended.
-func (r *router) forward(dir Path, s *SessionControl, adapter Channel) {
-	deliver := func(msg Message) bool {
-		select {
-		case r.adapters <- adapterMessage{dir: dir, session: s, msg: msg}:
-			return true
-		case <-r.running.Done():
-			return false
-		}
-	}
+func (r *router) forward(dir Path, s *SessionControl, adapter Channel, returns <-chan event) {
 	for {
 		select {
-		case msg, ok := <-adapter.Receive():
+		case ev := <-returns:
+			r.post(ev)
+		case in, ok := <-adapter.Receive():
 			if !ok {
 				if err := adapter.Err(); err != nil {
 					r.req.Log.Printf("adapter of %s: %v", dir, err)
 				}
-				deliver(nil)
-				return
+				in = Inbound{}
 			}
-			if !deliver(msg) {
+			r.post(func(ctx context.Context) error { return r.fromAdapter(ctx, dir, s, in) })
+			if !ok {
 				return
 			}
 		case <-r.running.Done():

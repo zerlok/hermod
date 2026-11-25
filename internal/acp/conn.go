@@ -1,266 +1,477 @@
-// Package acp is the Agent Client Protocol on the wire: JSON-RPC messages, one
-// per line. A Conn reads each line through the Serializer it is built with,
-// which parses it fully into the type of its message or rejects it, and writes
-// any message the same way. Standard is ACP's own serializer, which a client's
-// serializer may extend with the client's own messages. acp routes nothing
-// itself.
+// Package acp is the Agent Client Protocol on the wire: a JSON-RPC 2.0
+// connection, one message per line, that knows no method, and a Registry that
+// gives each of ACP's messages a Go type, reads it fully into that type or
+// rejects it. acp routes nothing itself.
 package acp
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
+	"strconv"
 	"sync"
 
 	"github.com/zerlok/hermod/internal/session"
 )
 
-// Conn is one side's ACP connection over a pair of streams. It reads until its
-// input ends and writes one message per line.
-type Conn struct {
-	serializer Serializer
-	peer       Peer // who writes what the connection reads
-	log        *log.Logger
+// cancelMethod is the notification either side cancels one of its requests
+// with. A Conn sends and serves it itself: it is the end of a request's
+// context, never a message.
+const cancelMethod = "$/cancel_request"
 
-	received chan session.Message
-	done     chan struct{}
-	stop     sync.Once
+// Conn is one side's ACP connection over a pair of streams. Each hop owns its
+// IDs: a Call numbers its request from this connection's own counter and
+// returns the answer under that ID when it arrives, and a request that arrives
+// is answered under its ID on this connection only.
+type Conn struct {
+	reg  *Registry
+	peer Peer // the side that writes what the connection reads
+	log  *log.Logger
+
+	ctx context.Context // ends with the connection
+	end context.CancelFunc
+
+	received chan session.Inbound
 	err      error // why reading ended; set before received is closed
 
-	mu  sync.Mutex // one message per line, however many senders
+	wmu sync.Mutex // one message per line, however many writers
 	out io.Writer
 
-	requests *requests
+	mu     sync.Mutex
+	next   int64
+	calls  map[int64]*call     // this side's requests, until returned
+	ended  bool                // every call was returned errEnded, and none is taken
+	served map[string]*request // the peer's requests, by their ID's key
 }
 
-// requests are the requests each side wrote to the other, the method of each
-// by its ID, until it is answered: an answer is read, or written, by the type
-// of the request it answers. They have a lock of their own: the reader
-// records a request while a sender may be blocked writing to a peer that
-// waits to be read.
-type requests struct {
-	mu       sync.Mutex
-	asked    map[session.MessageID]string // by this side
-	received map[session.MessageID]string // by the peer
-}
-
-func newRequests() *requests {
-	return &requests{asked: map[session.MessageID]string{}, received: map[session.MessageID]string{}}
-}
-
-func (r *requests) ask(id session.MessageID, method string) { r.put(r.asked, id, method) }
-func (r *requests) receive(id session.MessageID, method string) {
-	r.put(r.received, id, method)
-}
-
-// unask forgets a request that was never written.
-func (r *requests) unask(id session.MessageID) { _, _ = r.take(r.asked, id) }
-
-// answered is the method of the request id this side asked; reading its
-// answer takes the entry, since a request has one answer.
-func (r *requests) answered(id session.MessageID) (string, bool) { return r.take(r.asked, id) }
-
-// answering is the method of the request id the peer asked; writing its
-// answer takes the entry.
-func (r *requests) answering(id session.MessageID) (string, bool) { return r.take(r.received, id) }
-
-func (r *requests) put(m map[session.MessageID]string, id session.MessageID, method string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	m[id] = method
-}
-
-func (r *requests) take(m map[session.MessageID]string, id session.MessageID) (string, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	method, ok := m[id]
-	delete(m, id)
-	return method, ok
+// call is one of this side's requests waiting for its answer.
+type call struct {
+	w        wire
+	m        method
+	returned func(session.Message, error)
+	stop     func() bool // ends the wait for the call's context; nil until set
 }
 
 var _ session.Channel = (*Conn)(nil)
 
-// NewClient is the connection to a chat client, which reads what the client
-// writes through serializer and logs the lines it rejects.
-func NewClient(in io.Reader, out io.Writer, serializer Serializer, logger *log.Logger) *Conn {
-	return newConn(in, out, Client, serializer, newRequests(), logger)
-}
+// errEnded is a call whose connection ended before its answer.
+var errEnded = errors.New("acp: the connection ended")
 
-// Adapters connects to agents' ACP adapters. Hermod is an adapter's client,
-// and the agent runs on the remote: the initialize a connection writes offers
-// none of the client capabilities that act on the client's own workstation,
-// its files and its terminals, so the agent reads, writes and runs everything
-// where it runs. An adapter runs on between the connections to it and may
-// answer on one what was asked over an earlier one, so the requests of each
-// adapter, by its key, outlive a connection.
-type Adapters[K comparable] struct {
-	serializer Serializer
-	log        *log.Logger
-
-	mu       sync.Mutex
-	requests map[K]*requests
-}
-
-// NewAdapters connects to adapters through serializer, and logs the lines it
-// rejects.
-func NewAdapters[K comparable](serializer Serializer, logger *log.Logger) *Adapters[K] {
-	return &Adapters[K]{serializer: serializer, log: logger, requests: map[K]*requests{}}
-}
-
-// Connect is a connection to the adapter of key, reading what it writes from
-// in. started is whether the adapter has just started: a new process answers
-// nothing asked of the one before it.
-func (a *Adapters[K]) Connect(key K, started bool, in io.Reader, out io.Writer) *Conn {
-	a.mu.Lock()
-	r, ok := a.requests[key]
-	if !ok || started {
-		r = newRequests()
-		a.requests[key] = r
-	}
-	a.mu.Unlock()
-	return newConn(in, out, Agent, a.serializer, r, a.log)
-}
-
-func newConn(in io.Reader, out io.Writer, peer Peer, serializer Serializer, r *requests, logger *log.Logger) *Conn {
+// NewConn is the connection to peer over in and out, carrying the methods of
+// reg. It ends when in ends or ctx does. A connection to an agent's adapter
+// makes Hermod the adapter's client, and the agent runs on the remote: the
+// initialize it writes offers none of the client capabilities that act on the
+// client's own workstation, its files and its terminals.
+func NewConn(ctx context.Context, in io.Reader, out io.Writer, reg *Registry, peer Peer, logger *log.Logger) *Conn {
+	ctx, end := context.WithCancel(ctx)
 	c := &Conn{
-		serializer: serializer,
-		peer:       peer,
-		log:        logger,
-		received:   make(chan session.Message),
-		done:       make(chan struct{}),
-		out:        out,
-		requests:   r,
+		reg:      reg,
+		peer:     peer,
+		log:      logger,
+		ctx:      ctx,
+		end:      end,
+		received: make(chan session.Inbound),
+		out:      out,
+		// An adapter's line stream outlives each connection to it, so an
+		// answer to an earlier connection's request may arrive on this one:
+		// numbering from a random start keeps it from matching one of ours.
+		next:   rand.Int64N(1 << 52),
+		calls:  map[int64]*call{},
+		served: map[string]*request{},
 	}
+	// A reader blocked on input that never comes would hold the calls
+	// waiting past the connection's end.
+	context.AfterFunc(ctx, c.endCalls)
 	go c.read(in)
 	return c
 }
 
-func (c *Conn) Receive() <-chan session.Message { return c.received }
+func (c *Conn) Receive() <-chan session.Inbound { return c.received }
 
 // Err is why the connection ended once Receive is closed: nil when its input
-// ended between messages, or when Close stopped it.
+// ended between messages, or when its context ended.
 func (c *Conn) Err() error { return c.err }
 
-// Close stops delivering messages; Receive is closed once the reading under
-// way returns. The streams are the caller's and stay open.
-func (c *Conn) Close() error {
-	c.stop.Do(func() { close(c.done) })
-	return nil
-}
-
-// Send writes msg as one line. A request is recorded before it is written,
-// since its answer may be read before the write returns, so that the answer
-// is read by its type.
-func (c *Conn) Send(msg session.Message) error {
-	if c.peer == Agent {
-		msg = withoutClientCapabilities(msg)
-	}
-	line, err := c.serializer.Encode(msg, c.requests.answering)
+// Call writes msg as a request at once, and hands its answer, read by the
+// result type of its method, to returned when it arrives: on the reading
+// goroutine, after every message read before it has been taken from Receive,
+// and before any read after it is delivered. A Call whose ctx ends first
+// cancels the request on the wire and returns ctx's error; one whose
+// connection ends returns errEnded. An error Call itself returns is a request
+// that was not written, and returned is not called.
+func (c *Conn) Call(ctx context.Context, msg session.Message, returned func(session.Message, error)) error {
+	w, m, err := c.method(msg, true)
 	if err != nil {
 		return err
 	}
-	r, asks := msg.(requester)
-	if !asks {
-		return c.write(line)
+	if init, ok := w.(message[InitializeParams]); ok && c.peer == Agent {
+		w = withoutClientCapabilities(init)
 	}
-	id, method := r.asks()
-	c.requests.ask(id, method)
-	if err := c.write(line); err != nil {
-		c.requests.unask(id)
+	c.mu.Lock()
+	if c.ended {
+		c.mu.Unlock()
+		return errEnded
+	}
+	c.next++
+	id := c.next
+	cl := &call{w: w, m: m, returned: returned}
+	c.calls[id] = cl
+	c.mu.Unlock()
+	rawID := strconv.AppendInt(nil, id, 10)
+	if err := c.write(frame{ID: rawID, Method: w.name()}, w.params()); err != nil {
+		if c.take(id) == nil {
+			return nil // the connection's end returned it already
+		}
 		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.calls[id] == cl {
+		cl.stop = context.AfterFunc(ctx, func() {
+			if c.take(id) == nil {
+				return // its answer won
+			}
+			if err := c.write(frame{Method: cancelMethod}, cancelParams{RequestID: rawID}); err != nil {
+				c.log.Printf("acp: cancel %s %d: %v", w.name(), id, err)
+			}
+			returned(nil, ctx.Err())
+		})
 	}
 	return nil
 }
 
-func (c *Conn) write(line []byte) error {
+// take removes the call id from those waiting, for the one who returns it;
+// nil when it was returned already.
+func (c *Conn) take(id int64) *call {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	cl, ok := c.calls[id]
+	if !ok {
+		return nil
+	}
+	delete(c.calls, id)
+	if cl.stop != nil {
+		cl.stop()
+	}
+	return cl
+}
+
+// endCalls returns every call waiting errEnded, and refuses those that come
+// after.
+func (c *Conn) endCalls() {
+	c.mu.Lock()
+	waiting := c.calls
+	c.calls, c.ended = map[int64]*call{}, true
+	c.mu.Unlock()
+	for _, cl := range waiting {
+		if cl.stop != nil {
+			cl.stop()
+		}
+		cl.returned(nil, errEnded)
+	}
+}
+
+// result is what a call returns for an answer that has result, or err.
+func (cl *call) result(result []byte, err error) (session.Message, error) {
+	if err != nil {
+		return nil, err
+	}
+	msg, err := cl.m.result(result)
+	if err != nil {
+		return nil, fmt.Errorf("acp: the answer to %s: %w", cl.w.name(), err)
+	}
+	return msg, nil
+}
+
+// Notify writes msg as a notification.
+func (c *Conn) Notify(msg session.Message) error {
+	w, _, err := c.method(msg, false)
+	if err != nil {
+		return err
+	}
+	return c.write(frame{Method: w.name()}, w.params())
+}
+
+// method is msg as acp writes it, with its method, which r registers as a
+// request or as a notification as asked.
+func (c *Conn) method(msg session.Message, request bool) (wire, method, error) {
+	w, ok := msg.(wire)
+	if !ok {
+		return nil, method{}, fmt.Errorf("acp: a %T is no message of acp's", msg)
+	}
+	m, ok := c.reg.methods[w.name()]
+	if !ok || m.request != request {
+		return nil, method{}, fmt.Errorf("acp: %q is registered as no %s", w.name(), kindOf(request))
+	}
+	return w, m, nil
+}
+
+// cancelParams are the params of $/cancel_request.
+type cancelParams struct {
+	RequestID json.RawMessage `json:"requestId"`
+	Extensible
+}
+
+// write writes f as one line, with v as its params, result or error.
+func (c *Conn) write(f frame, v any) error {
+	f.JSONRPC = jsonrpcVersion
+	if v != nil {
+		b, err := marshal(v)
+		if err != nil {
+			return fmt.Errorf("acp: encode %T: %w", v, err)
+		}
+		if f.Method != "" {
+			f.Params = b
+		} else {
+			f.Result = b
+		}
+	}
+	line, err := marshal(f)
+	if err != nil {
+		return fmt.Errorf("acp: encode a message: %w", err)
+	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 	if _, err := c.out.Write(append(line, '\n')); err != nil {
 		return fmt.Errorf("acp: send: %w", err)
 	}
 	return nil
 }
 
-// read delivers each line of in that parses as a message until in ends. A
-// final line without its newline is delivered when it is a whole message, and
-// is the error the connection ends with when it is cut inside one.
+// read serves each line of in until in ends. A final line without its newline
+// is served when it is a whole message, and is the error the connection ends
+// with when it is cut inside one.
 func (c *Conn) read(in io.Reader) {
-	defer close(c.received)
 	r := bufio.NewReader(in)
 	for {
 		line, readErr := r.ReadBytes('\n')
 		if line = bytes.TrimSpace(line); len(line) > 0 {
 			if readErr != nil && !json.Valid(line) {
-				c.fail(fmt.Errorf("acp: the connection ended inside a message: %.200s", line))
+				c.close(fmt.Errorf("acp: the connection ended inside a message: %.200s", line))
 				return
 			}
-			msg, err := c.serializer.Decode(line, c.peer, c.requests.answered)
-			if err != nil {
-				c.reject(err)
-			} else {
-				if r, ok := msg.(requester); ok {
-					c.requests.receive(r.asks())
-				}
-				if !c.deliver(msg) {
-					return
-				}
+			if !c.serve(line) {
+				c.close(nil)
+				return
 			}
 		}
 		if readErr != nil {
-			if !errors.Is(readErr, io.EOF) {
-				c.fail(fmt.Errorf("acp: read: %w", readErr))
+			if errors.Is(readErr, io.EOF) {
+				readErr = nil
+			} else {
+				readErr = fmt.Errorf("acp: read: %w", readErr)
 			}
+			c.close(readErr)
 			return
 		}
 	}
 }
 
-// deliver hands msg to the reader; false once the connection is stopped.
-func (c *Conn) deliver(msg session.Message) bool {
-	// A select picks at random among ready cases, so a stop that has come is
-	// seen before a reader waiting for the message.
-	select {
-	case <-c.done:
-		return false
-	default:
-	}
-	select {
-	case c.received <- msg:
-		return true
-	case <-c.done:
-		return false
-	}
-}
-
-// reject logs every rejected line and answers a rejected request with its
-// error: nothing the serializer did not parse reaches the other side.
-func (c *Conn) reject(err error) {
-	c.log.Printf("dropped a line from the %s: %v", c.peer, err)
-	var r *Rejection
-	if !errors.As(err, &r) || r.request.IsZero() {
-		return
-	}
-	id := requestID(r.request)
-	line, encErr := marshal(frame{JSONRPC: jsonrpcVersion, ID: &id, Error: &Error{Code: r.code, Message: r.err.Error()}})
-	if encErr == nil {
-		encErr = c.write(line)
-	}
-	if encErr != nil {
-		c.log.Printf("acp: could not answer the rejected request %s: %v", r.request, encErr)
-	}
-}
-
-// fail records why reading ended, unless Close stopped the connection first:
-// its owner closes the streams after it, and their failing then is no fault
-// of the connection.
-func (c *Conn) fail(err error) {
-	select {
-	case <-c.done:
-	default:
+// close ends the connection's context, and every call waiting and every
+// served request's context with it. The calls are returned before Receive
+// closes, so whoever reads both hears of them before the end.
+func (c *Conn) close(err error) {
+	if c.ctx.Err() == nil {
 		c.err = err
 	}
+	c.endCalls()
+	c.end()
+	close(c.received)
+}
+
+// serve handles one line: an answer to one of this side's calls, a cancel, or
+// a message to deliver. It is false once the connection's context ended.
+func (c *Conn) serve(line []byte) bool {
+	var f frame
+	if err := json.Unmarshal(line, &f); err != nil || f.JSONRPC != jsonrpcVersion {
+		c.log.Printf("acp: dropped a line from the %s that is no JSON-RPC %s message: %.200s", c.peer, jsonrpcVersion, line)
+		return true
+	}
+	key, isRequest, err := idKey(f.ID)
+	switch {
+	case err != nil:
+		c.log.Printf("acp: dropped a message from the %s: %v", c.peer, err)
+	case f.Method == "":
+		c.answered(f)
+	case f.Method == cancelMethod && !isRequest:
+		c.cancelled(f.Params)
+	default:
+		return c.arrived(f, key, isRequest)
+	}
+	return true
+}
+
+// idKey is a request's ID as a key that tells a number from a string, and
+// whether there is one: JSON-RPC's null ID names no request.
+func idKey(id json.RawMessage) (key string, ok bool, err error) {
+	if id == nil || isNull(id) {
+		return "", false, nil
+	}
+	var v any
+	if err := decodeNumbers(id, &v); err != nil {
+		return "", false, err
+	}
+	switch v := v.(type) {
+	case string:
+		return "s" + v, true, nil
+	case json.Number:
+		if _, err := v.Int64(); err == nil {
+			return "n" + v.String(), true, nil
+		}
+	}
+	return "", false, fmt.Errorf("an ID is an integer or a string, not %s", id)
+}
+
+// answered returns an answer to the call that waits for it, on the reading
+// goroutine, so it keeps its place among the messages read around it.
+func (c *Conn) answered(f frame) {
+	var cl *call
+	if id, err := strconv.ParseInt(string(f.ID), 10, 64); err == nil {
+		cl = c.take(id)
+	}
+	var err error
+	switch {
+	case cl == nil:
+		c.log.Printf("acp: dropped an answer from the %s to %s, which this side does not wait for", c.peer, f.ID)
+		return
+	case f.Error != nil && f.Result == nil:
+		err = f.Error
+	case f.Result == nil || f.Error != nil:
+		err = errors.New("acp: an answer has a result or an error, and not both")
+	}
+	cl.returned(cl.result(f.Result, err))
+}
+
+// cancelled ends the context of the peer's request that params name. The
+// request is still answered.
+func (c *Conn) cancelled(params json.RawMessage) {
+	var p cancelParams
+	err := decode(params, &p)
+	key, ok, idErr := idKey(p.RequestID)
+	if err != nil || idErr != nil || !ok {
+		c.log.Printf("acp: dropped a cancel from the %s of no request: %s", c.peer, params)
+		return
+	}
+	c.mu.Lock()
+	r, ok := c.served[key]
+	c.mu.Unlock()
+	if ok {
+		r.cancel()
+	}
+}
+
+// arrived reads a request or a notification by its method and delivers it.
+// A request whose method has no handler is answered -32601, and one whose
+// params do not read -32602; a notification either way is dropped.
+func (c *Conn) arrived(f frame, key string, isRequest bool) bool {
+	m, ok := c.reg.methods[f.Method]
+	if !ok || m.from != c.peer || m.request != isRequest {
+		return c.reject(f, isRequest, codeMethodNotFound, fmt.Errorf("method not found: no %s %q from the %s", kindOf(isRequest), f.Method, c.peer))
+	}
+	msg, err := m.params(f.Params)
+	if err != nil {
+		return c.reject(f, isRequest, codeInvalidParams, fmt.Errorf("invalid params of %q: %w", f.Method, err))
+	}
+	in := session.Inbound{Message: msg}
+	if isRequest {
+		ctx, cancel := context.WithCancel(c.ctx)
+		r := &request{c: c, id: f.ID, key: key, cancel: cancel}
+		c.mu.Lock()
+		c.served[key] = r
+		c.mu.Unlock()
+		in.Context, in.Answer = ctx, r
+	}
+	select {
+	case c.received <- in:
+		return true
+	case <-c.ctx.Done():
+		return false
+	}
+}
+
+func kindOf(isRequest bool) string {
+	if isRequest {
+		return "request"
+	}
+	return "notification"
+}
+
+// reject logs a message that is not delivered, and answers it when it is a
+// request: nothing undecoded reaches the other side.
+func (c *Conn) reject(f frame, isRequest bool, code int, err error) bool {
+	c.log.Printf("acp: dropped a message from the %s: %v", c.peer, err)
+	if isRequest {
+		if err := c.write(frame{ID: f.ID, Error: &Error{Code: code, Message: err.Error()}}, nil); err != nil {
+			c.log.Printf("acp: could not answer the rejected request %s: %v", f.ID, err)
+		}
+	}
+	return true
+}
+
+// request is a request that arrived, the session.Answer that answers it under
+// its ID.
+type request struct {
+	c        *Conn
+	id       json.RawMessage
+	key      string
+	cancel   context.CancelFunc
+	answered bool // under c.mu
+}
+
+func (r *request) Return(msg session.Message) error {
+	w, ok := msg.(wire)
+	if !ok {
+		return r.Fail(fmt.Errorf("hermod: a %T is no answer of acp's", msg))
+	}
+	return r.finish(frame{}, w.params())
+}
+
+func (r *request) Reply(result session.Result) error {
+	v, err := fromSession(result)
+	if err != nil {
+		return r.Fail(err)
+	}
+	return r.finish(frame{}, v)
+}
+
+// Fail answers with err: an error the other side answered a call with as it
+// was, a cancelled call as ACP's cancelled request, and any other as an
+// internal error.
+func (r *request) Fail(err error) error {
+	var e *Error
+	switch {
+	case errors.As(err, &e):
+	case errors.Is(err, context.Canceled):
+		e = &Error{Code: codeCancelled, Message: "request cancelled"}
+	default:
+		e = &Error{Code: codeInternal, Message: err.Error()}
+	}
+	return r.finish(frame{Error: e}, nil)
+}
+
+// finish writes the answer, once. A request whose connection has ended has
+// nobody left to answer.
+func (r *request) finish(f frame, v any) error {
+	r.c.mu.Lock()
+	done := r.answered
+	r.answered = true
+	if r.c.served[r.key] == r {
+		delete(r.c.served, r.key)
+	}
+	r.c.mu.Unlock()
+	r.cancel()
+	switch {
+	case done:
+		return fmt.Errorf("acp: request %s is answered already", r.id)
+	case r.c.ctx.Err() != nil:
+		return nil
+	}
+	f.ID = r.id
+	return r.c.write(f, v)
 }

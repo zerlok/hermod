@@ -1,364 +1,418 @@
 package acp
 
 import (
-	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"io"
-	"log"
 	"slices"
 	"strings"
 	"testing"
-	"testing/iotest"
 
 	"github.com/zerlok/hermod/internal/session"
 )
 
-// receive is every message a connection reads from in, what it writes back,
-// what it logs, and why it ended.
-func receive(peer Peer, in io.Reader) (got []session.Message, out, logged string, err error) {
-	var w, l bytes.Buffer
-	c := newConn(in, &w, peer, NewStandard(), newRequests(), log.New(&l, "", 0))
-	for msg := range c.Receive() {
-		got = append(got, msg)
-	}
-	return got, w.String(), l.String(), c.Err()
-}
-
+// TestConnRejects reads lines that are no message the registry has, or whose
+// params do not read: a request is answered with JSON-RPC's error under its
+// ID, anything else only logged, and nothing is delivered.
 func TestConnRejects(t *testing.T) {
 	cases := []struct {
 		name     string
 		peer     Peer
-		in       string
-		received []session.Kind
-		written  []string
-		logged   string
+		line     string
+		wantID   string // the ID of the error answer; "" for none
+		wantCode int
+		wantLog  string
 	}{
-		{"an unknown request is answered and nothing received", Client,
-			`{"jsonrpc":"2.0","id":1,"method":"session/fork","params":{}}`,
-			nil,
-			[]string{`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found: no request \"session/fork\" from the client"}}`},
-			`"session/fork"`},
-		{"an unknown notification is logged and dropped", Agent,
-			`{"jsonrpc":"2.0","method":"_session/list/changes","params":{}}`,
-			nil, nil, `"_session/list/changes"`},
-		{"a malformed request is answered with invalid params", Client,
-			`{"jsonrpc":"2.0","id":"a","method":"session/new","params":{"cwd":7,"mcpServers":[]}}`,
-			nil,
-			[]string{`{"jsonrpc":"2.0","id":"a","error":{"code":-32602,"message":"invalid params of \"session/new\": json: cannot unmarshal number into Go struct field NewSessionParams.cwd of type string"}}`},
-			"session/new"},
-		{"a line that is no JSON is dropped and the next read", Client,
-			"hello\n" + `{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s1"}}`,
-			[]session.Kind{session.Pass}, nil, "not a JSON-RPC message"},
-		{"an answer this side did not ask for is dropped", Agent,
-			`{"jsonrpc":"2.0","id":3,"result":{}}`,
-			nil, nil, "did not ask"},
+		{"an unknown request", Client, `{"jsonrpc":"2.0","id":1,"method":"session/fork","params":{"sessionId":"s1"}}`,
+			"1", codeMethodNotFound, `no request "session/fork" from the client`},
+		{"an unknown request under a string ID", Client, `{"jsonrpc":"2.0","id":"x","method":"_session/steering","params":{}}`,
+			`"x"`, codeMethodNotFound, "method not found"},
+		{"an unknown notification", Agent, `{"jsonrpc":"2.0","method":"_session/list/changes","params":{}}`,
+			"", 0, `no notification "_session/list/changes" from the agent`},
+		{"the agent's request from the client", Client, `{"jsonrpc":"2.0","id":2,"method":"fs/read_text_file","params":{"sessionId":"s1","path":"/p"}}`,
+			"2", codeMethodNotFound, "method not found"},
+		{"the client's request from the agent", Agent, `{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/p","mcpServers":[]}}`,
+			"2", codeMethodNotFound, "method not found"},
+		{"a notification sent as a request", Client, `{"jsonrpc":"2.0","id":3,"method":"session/cancel","params":{"sessionId":"s1"}}`,
+			"3", codeMethodNotFound, "method not found"},
+		{"a cancel sent as a request", Client, `{"jsonrpc":"2.0","id":3,"method":"$/cancel_request","params":{"requestId":1}}`,
+			"3", codeMethodNotFound, "method not found"},
+		{"a request sent as a notification", Client, `{"jsonrpc":"2.0","method":"session/new","params":{"cwd":"/p","mcpServers":[]}}`,
+			"", 0, `no notification "session/new"`},
+		{"a request under a null ID", Client, `{"jsonrpc":"2.0","id":null,"method":"session/new","params":{"cwd":"/p","mcpServers":[]}}`,
+			"", 0, `no notification "session/new"`},
+		{"invalid params of a request", Client, `{"jsonrpc":"2.0","id":4,"method":"session/new","params":{"cwd":"/p"}}`,
+			"4", codeInvalidParams, "mcpServers is required"},
+		{"invalid params of a notification", Agent, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"cursor_update"}}}`,
+			"", 0, "invalid params"},
+		{"a cancel of no request", Agent, `{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":null}}`,
+			"", 0, "a cancel from the agent of no request"},
+		{"an answer to a request this side did not ask", Agent, `{"jsonrpc":"2.0","id":1,"result":{}}`,
+			"", 0, "which this side does not wait for"},
+		{"an ID that is no number or string", Client, `{"jsonrpc":"2.0","id":{"n":1},"method":"session/list","params":{}}`,
+			"", 0, "an ID is an integer or a string"},
+		{"an ID with a fraction", Client, `{"jsonrpc":"2.0","id":1.5,"method":"session/list","params":{}}`,
+			"", 0, "an ID is an integer or a string"},
+		{"another version of JSON-RPC", Client, `{"jsonrpc":"1.0","id":1,"method":"session/list","params":{}}`,
+			"", 0, "no JSON-RPC 2.0 message"},
+		{"no JSON", Client, `hello`, "", 0, "no JSON-RPC 2.0 message"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, out, logged, err := receive(tc.peer, strings.NewReader(tc.in+"\n"))
-			if err != nil {
-				t.Fatalf("Err = %v", err)
-			}
-			var kinds []session.Kind
-			for _, msg := range got {
-				kinds = append(kinds, msg.Kind())
-			}
-			if !slices.Equal(kinds, tc.received) {
-				t.Errorf("received %v, want %v", kinds, tc.received)
-			}
-			gotLines := lines(out)
-			if len(gotLines) != len(tc.written) {
-				t.Fatalf("wrote %q, want %q", gotLines, tc.written)
-			}
-			for i := range gotLines {
-				if !sameJSON(t, gotLines[i], tc.written[i]) {
-					t.Errorf("wrote %s, want %s", gotLines[i], tc.written[i])
+			e := dial(t, tc.peer)
+			e.send(t, tc.line)
+			if tc.wantID != "" {
+				f := frameOf(t, e.next(t))
+				if string(f.ID) != tc.wantID || f.Error == nil || f.Error.Code != tc.wantCode {
+					t.Errorf("answered %s with %+v, want %s with code %d", f.ID, f.Error, tc.wantID, tc.wantCode)
 				}
 			}
-			if !strings.Contains(logged, tc.logged) {
-				t.Errorf("logged %q, want it to name %q", logged, tc.logged)
+			_ = e.w.Close()
+			for in := range e.conn.Receive() {
+				t.Errorf("delivered %v", in.Message)
+			}
+			if got := e.log.String(); !strings.Contains(got, tc.wantLog) {
+				t.Errorf("logged %q, want a line with %q", got, tc.wantLog)
 			}
 		})
 	}
 }
 
-// TestAnswerByRequest sends a request on a connection and reads the answer by
-// the type of what was asked: once, as a request has one answer, and only for
-// a request that was written.
-func TestAnswerByRequest(t *testing.T) {
-	cases := []struct {
-		name       string
-		peer       Peer   // the side the connection reads
-		from       Peer   // the side the request came from
-		request    string // what the connection sends
-		writeFails bool   // the request is not written
-		answers    string // what it then reads
-		kinds      []session.Kind
-		chats      []session.ChatID
-		received   []string // each message received, as written
-	}{
-		{"the adapter answers the client's session/new", Agent, Client,
-			`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/p","mcpServers":[]}}`, false,
-			`{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s2"}}`,
-			[]session.Kind{session.Pass}, []session.ChatID{"s2"},
-			[]string{`{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s2"}}`}},
-		{"the client answers the adapter's question under the router's ID", Client, Agent,
-			`{"jsonrpc":"2.0","id":"hermod-1","method":"fs/read_text_file","params":{"sessionId":"s1","path":"/p"}}`, false,
-			`{"jsonrpc":"2.0","id":"hermod-1","result":{"content":"x"}}`,
-			[]session.Kind{session.Answer}, []session.ChatID{""},
-			[]string{`{"jsonrpc":"2.0","id":"hermod-1","result":{"content":"x"}}`}},
-		{"a second answer to the same request is dropped", Agent, Client,
-			`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}`, false,
-			`{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}` + "\n" + `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
-			[]session.Kind{session.Pass}, []session.ChatID{""},
-			[]string{`{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`}},
-		{"an answer under the ID of another type is dropped", Agent, Client,
-			`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}`, false,
-			`{"jsonrpc":"2.0","id":"1","result":{"stopReason":"end_turn"}}`,
-			nil, nil, nil},
-		{"an adapter's answer that does not parse is dropped", Agent, Client,
-			`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}`, false,
-			`{"jsonrpc":"2.0","id":1,"result":{"stopReason":"tired"}}`,
-			nil, nil, nil},
-		{"the client's answer that does not parse is dropped", Client, Agent,
-			`{"jsonrpc":"2.0","id":"hermod-1","method":"fs/read_text_file","params":{"sessionId":"s1","path":"/p"}}`, false,
-			`{"jsonrpc":"2.0","id":"hermod-1","result":{}}`,
-			nil, nil, nil},
-		{"an answer to a request whose write failed is dropped", Agent, Client,
-			`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}`, true,
-			`{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`,
-			nil, nil, nil},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			in, feed := io.Pipe()
-			var out io.Writer = io.Discard
-			if tc.writeFails {
-				out = failingWriter{}
-			}
-			c := newConn(in, out, tc.peer, NewStandard(), newRequests(), discard())
-			if err := c.Send(read(t, tc.from, "", tc.request)); (err != nil) != tc.writeFails {
-				t.Fatalf("Send: %v, want an error: %v", err, tc.writeFails)
-			}
-			go func() {
-				_, _ = io.WriteString(feed, tc.answers+"\n")
-				_ = feed.Close()
-			}()
-			var kinds []session.Kind
-			var chats []session.ChatID
-			var received []string
-			for msg := range c.Receive() {
-				kinds = append(kinds, msg.Kind())
-				chats = append(chats, msg.Chat())
-				received = append(received, written(t, msg))
-			}
-			if !slices.Equal(kinds, tc.kinds) || !slices.Equal(chats, tc.chats) || len(received) != len(tc.received) {
-				t.Fatalf("received %v %q %q, want %v %q %q", kinds, chats, received, tc.kinds, tc.chats, tc.received)
-			}
-			for i := range received {
-				if !sameJSON(t, received[i], tc.received[i]) {
-					t.Errorf("received %s, want %s", received[i], tc.received[i])
-				}
-			}
-		})
-	}
-}
-
-type failingWriter struct{}
-
-func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
-
-// TestAdaptersConnect sends a request on one connection to an adapter and
-// reads the answer on a later one: the adapter of the same key that runs on
-// answers there, and a new one, or another adapter, answers nothing asked
-// before.
-func TestAdaptersConnect(t *testing.T) {
-	request := `{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}`
-	answer := `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`
+// TestConnCall sends a request under this connection's own ID and returns
+// what the answer under that ID says.
+func TestConnCall(t *testing.T) {
+	errBoth := errors.New("both")
 	cases := []struct {
 		name     string
-		key      string // the later connection's adapter; the first is "a"
-		started  bool   // the later connection is to an adapter just started
-		received int
+		method   string
+		params   string
+		answer   string // the result or error members of the answer, %s its ID; "" for none
+		cancel   bool   // the call's context ends before the answer
+		ends     bool   // the connection ends, after the answer when there is one
+		wantChat session.ChatID
+		wantCode int   // the code of the error answered; 0 for none
+		wantErr  error // any other error the call returns
 	}{
-		{"the adapter runs on", "a", false, 1},
-		{"the adapter started again", "a", true, 0},
-		{"another adapter", "b", false, 0},
+		{"a result read as the method's answer", "session/new", `{"cwd":"/p","mcpServers":[]}`,
+			`"result":{"sessionId":"s2"}`, false, false, "s2", 0, nil},
+		{"an error answer", "session/prompt", `{"sessionId":"s1","prompt":[]}`,
+			`"error":{"code":-32603,"message":"no"}`, false, false, "", -32603, nil},
+		{"an answer of the wrong type", "session/new", `{"cwd":"/p","mcpServers":[]}`,
+			`"result":{"stopReason":"end_turn"}`, false, false, "", 0, errBoth},
+		{"an answer with both a result and an error", "session/prompt", `{"sessionId":"s1","prompt":[]}`,
+			`"result":{"stopReason":"end_turn"},"error":{"code":1,"message":"m"}`, false, false, "", 0, errBoth},
+		{"a call whose context ends is cancelled on the wire", "session/prompt", `{"sessionId":"s1","prompt":[]}`,
+			"", true, false, "", 0, context.Canceled},
+		{"a call whose connection ends", "session/prompt", `{"sessionId":"s1","prompt":[]}`,
+			"", false, true, "", 0, errEnded},
+		{"an answer the connection's end follows at once", "session/new", `{"cwd":"/p","mcpServers":[]}`,
+			`"result":{"sessionId":"s2"}`, false, true, "s2", 0, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			adapters := NewAdapters[string](NewStandard(), discard())
-			first := adapters.Connect("a", true, strings.NewReader(""), io.Discard)
-			if err := first.Send(read(t, Client, "", request)); err != nil {
-				t.Fatalf("Send: %v", err)
+			e := dial(t, Agent)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := e.call(t, ctx, read(t, tc.method, false, tc.params))
+			req := frameOf(t, e.next(t))
+			if req.Method != tc.method || !sameJSON(t, string(req.Params), tc.params) {
+				t.Errorf("wrote %s %s, want %s %s", req.Method, req.Params, tc.method, tc.params)
 			}
-			for range first.Receive() {
+			switch {
+			case tc.cancel:
+				cancel()
+				f := frameOf(t, e.next(t))
+				if f.Method != cancelMethod || !sameJSON(t, string(f.Params), fmt.Sprintf(`{"requestId":%s}`, req.ID)) {
+					t.Errorf("wrote %s %s, want a cancel of %s", f.Method, f.Params, req.ID)
+				}
+			case tc.ends:
+				if tc.answer != "" {
+					e.send(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,%s}`, req.ID, tc.answer))
+				}
+				_ = e.w.Close()
+			default:
+				e.send(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,%s}`, req.ID, tc.answer))
 			}
-			later := adapters.Connect(tc.key, tc.started, strings.NewReader(answer+"\n"), io.Discard)
-			got := 0
-			for range later.Receive() {
-				got++
-			}
-			if got != tc.received {
-				t.Errorf("received %d answers, want %d", got, tc.received)
+			got := <-done
+			var answered *Error
+			switch {
+			case tc.wantCode != 0:
+				if !errors.As(got.err, &answered) || answered.Code != tc.wantCode {
+					t.Errorf("Call: %v, want the error answer %d", got.err, tc.wantCode)
+				}
+			case tc.wantErr == errBoth:
+				if got.err == nil {
+					t.Errorf("Call: %v, want an error", got.msg)
+				}
+			case tc.wantErr != nil:
+				if !errors.Is(got.err, tc.wantErr) {
+					t.Errorf("Call: %v, want %v", got.err, tc.wantErr)
+				}
+			default:
+				if got.err != nil || got.msg.Chat() != tc.wantChat {
+					t.Errorf("Call: %v, %v, want an answer of chat %q", got.msg, got.err, tc.wantChat)
+				}
 			}
 		})
 	}
 }
 
-// TestAdapterInitialize writes the client's initialize to an adapter without
-// the client capabilities that act on the client's workstation.
+// TestConnAnswerInOrder returns an answer where it was read: after every
+// message read before it has been taken from Receive, and before any read
+// after it is delivered.
+func TestConnAnswerInOrder(t *testing.T) {
+	update := `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}}}}`
+	cases := []struct {
+		name   string
+		before int // the updates written before the answer
+		after  int // and after it
+		want   string
+	}{
+		{"two updates before, one after", 2, 1, "update update answer update"},
+		{"none before, one after", 0, 1, "answer update"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := dial(t, Agent)
+			answered := make(chan struct{})
+			err := e.conn.Call(context.Background(), read(t, "session/prompt", false, `{"sessionId":"s1","prompt":[]}`),
+				func(session.Message, error) { answered <- struct{}{} })
+			if err != nil {
+				t.Fatalf("Call: %v", err)
+			}
+			req := frameOf(t, e.next(t))
+			lines := slices.Repeat([]string{update}, tc.before)
+			lines = append(lines, fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}`, req.ID))
+			lines = append(lines, slices.Repeat([]string{update}, tc.after)...)
+			go func() { _, _ = io.WriteString(e.w, strings.Join(lines, "\n")+"\n") }()
+			// The reader waits for each to be taken, so the order they are
+			// taken in is the order it handed them over in.
+			var got []string
+			for range tc.before + tc.after + 1 {
+				select {
+				case <-e.conn.Receive():
+					got = append(got, "update")
+				case <-answered:
+					got = append(got, "answer")
+				}
+			}
+			if strings.Join(got, " ") != tc.want {
+				t.Errorf("handed over %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestConnLateAnswer drops an answer to a call that was cancelled: its ID is
+// no longer waited for.
+func TestConnLateAnswer(t *testing.T) {
+	cases := []struct {
+		name    string
+		answer  string
+		wantLog string
+	}{
+		{"a result after the cancel", `"result":{"stopReason":"cancelled"}`, "which this side does not wait for"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := dial(t, Agent)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := e.call(t, ctx, read(t, "session/prompt", false, `{"sessionId":"s1","prompt":[]}`))
+			req := frameOf(t, e.next(t))
+			cancel()
+			e.next(t)
+			<-done
+			e.send(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,%s}`, req.ID, tc.answer))
+			_ = e.w.Close()
+			for range e.conn.Receive() {
+			}
+			if got := e.log.String(); !strings.Contains(got, tc.wantLog) {
+				t.Errorf("logged %q, want a line with %q", got, tc.wantLog)
+			}
+		})
+	}
+}
+
+// TestConnServe delivers a request that arrives with its context and its
+// Answer, which writes the answer under the request's own ID, a number or a
+// string as the other side wrote it.
+func TestConnServe(t *testing.T) {
+	cases := []struct {
+		name       string
+		line       string
+		cancel     bool // the other side cancels the request before it is answered
+		answer     func(session.Answer) error
+		wantKind   session.Kind
+		wantChat   session.ChatID
+		wantAnswer string
+	}{
+		{"a reply under a number ID", `{"jsonrpc":"2.0","id":7,"method":"session/list","params":{}}`, false,
+			func(a session.Answer) error { return a.Reply(session.ListResult{}) },
+			session.List, "", `{"jsonrpc":"2.0","id":7,"result":{"sessions":[]}}`},
+		{"a reply under a string ID", `{"jsonrpc":"2.0","id":"7","method":"session/close","params":{"sessionId":"s1"}}`, false,
+			func(a session.Answer) error { return a.Reply(session.EmptyResult{}) },
+			session.Suspend, "s1", `{"jsonrpc":"2.0","id":"7","result":{}}`},
+		{"another side's answer returned", `{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}`, false,
+			func(a session.Answer) error {
+				return a.Return(read(t, "session/prompt", true, `{"stopReason":"end_turn"}`))
+			},
+			session.Pass, "s1", `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`},
+		{"another side's error answer as it was", `{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}`, false,
+			func(a session.Answer) error { return a.Fail(&Error{Code: -32000, Message: "auth"}) },
+			session.Pass, "s1", `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"auth"}}`},
+		{"a failure as an internal error", `{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}`, false,
+			func(a session.Answer) error { return a.Fail(errors.New("no chat")) },
+			session.Pass, "s1", `{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"no chat"}}`},
+		{"a cancelled request still answered, as cancelled", `{"jsonrpc":"2.0","id":"q","method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}`, true,
+			func(a session.Answer) error { return a.Fail(context.Canceled) },
+			session.Pass, "s1", `{"jsonrpc":"2.0","id":"q","error":{"code":-32800,"message":"request cancelled"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := dial(t, Client)
+			e.send(t, tc.line)
+			in := e.inbound(t)
+			if in.Message.Kind() != tc.wantKind || in.Message.Chat() != tc.wantChat {
+				t.Errorf("delivered %s of chat %q, want %s of chat %q", in.Message.Kind(), in.Message.Chat(), tc.wantKind, tc.wantChat)
+			}
+			if tc.cancel {
+				e.send(t, fmt.Sprintf(`{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":%s}}`, frameOf(t, tc.line).ID))
+				<-in.Context.Done()
+			}
+			if err := tc.answer(in.Answer); err != nil {
+				t.Fatalf("answer: %v", err)
+			}
+			if got := e.next(t); !sameJSON(t, got, tc.wantAnswer) {
+				t.Errorf("wrote %s, want %s", got, tc.wantAnswer)
+			}
+			if err := in.Answer.Fail(errors.New("again")); err == nil {
+				t.Error("a request was answered twice")
+			}
+		})
+	}
+}
+
+// TestConnNotify delivers a notification without a context or an Answer, and
+// writes one with no ID.
+func TestConnNotify(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+	}{
+		{"an update", `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}}}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			from, to := dial(t, Agent), dial(t, Client)
+			from.send(t, tc.line)
+			in := from.inbound(t)
+			if in.Answer != nil || in.Context != nil {
+				t.Errorf("a notification arrived with an answer or a context")
+			}
+			if err := to.conn.Notify(in.Message); err != nil {
+				t.Fatalf("Notify: %v", err)
+			}
+			if got := to.next(t); !sameJSON(t, got, tc.line) {
+				t.Errorf("wrote %s, want %s", got, tc.line)
+			}
+		})
+	}
+}
+
+// TestPerHopIDs passes the questions of two adapters, under the same ID, on
+// as calls of the client's connection: each goes under an ID of its own there,
+// and each answer returns to its adapter under that adapter's ID.
+func TestPerHopIDs(t *testing.T) {
+	cases := []struct {
+		name string
+		id   string
+	}{
+		{"two questions under the ID 7", "7"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := dial(t, Client)
+			adapters := []*farEnd{dial(t, Agent), dial(t, Agent)}
+			sent := map[string]*farEnd{}
+			for i, a := range adapters {
+				a.send(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"method":"fs/read_text_file","params":{"sessionId":"s%d","path":"/p"}}`, tc.id, i))
+				in := a.inbound(t)
+				err := client.conn.Call(in.Context, in.Message, func(answer session.Message, err error) {
+					if err != nil {
+						_ = in.Answer.Fail(err)
+						return
+					}
+					_ = in.Answer.Return(answer)
+				})
+				if err != nil {
+					t.Fatalf("Call: %v", err)
+				}
+				req := frameOf(t, client.next(t))
+				if _, taken := sent[string(req.ID)]; taken {
+					t.Fatalf("the client's connection wrote a second request under %s", req.ID)
+				}
+				sent[string(req.ID)] = a
+			}
+			for id, a := range sent {
+				client.send(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"content":"for %s"}}`, id, id))
+				want := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"content":"for %s"}}`, tc.id, id)
+				if got := a.next(t); !sameJSON(t, got, want) {
+					t.Errorf("adapter got %s, want %s", got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestAdapterInitialize writes the initialize a connection to an adapter
+// sends without the client capabilities that act on the client's own
+// workstation, and a client's as it is.
 func TestAdapterInitialize(t *testing.T) {
+	params := `{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":true},"terminal":true,"session":{"notices":{}}},"_meta":{"k":"v"}}`
 	cases := []struct {
 		name string
 		peer Peer
-		line string
 		want string
 	}{
-		{"fs and terminal dropped for an adapter, Air's _meta kept", Agent,
-			`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":true,"writeTextFile":true},"terminal":true,"plan":{},"_meta":{"jetbrains":{"air":true}}},"_meta":{"jetbrains":{"air":{"loadReplayEnd":true}}}}}`,
-			`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"plan":{},"_meta":{"jetbrains":{"air":true}}},"_meta":{"jetbrains":{"air":{"loadReplayEnd":true}}}}}`},
-		{"no client capabilities", Agent,
-			`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}`,
-			`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}`},
-		{"kept for a client", Client,
-			`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":true},"terminal":true}}}`,
-			`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":true},"terminal":true}}}`},
-		{"another message kept for an adapter", Agent,
-			`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/p","mcpServers":[]}}`,
-			`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/p","mcpServers":[]}}`},
+		{"to an adapter", Agent, `{"protocolVersion":1,"clientCapabilities":{"session":{"notices":{}}},"_meta":{"k":"v"}}`},
+		{"to a client", Client, params},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			msg := read(t, Client, "", tc.line)
-			var out bytes.Buffer
-			c := newConn(strings.NewReader(""), &out, tc.peer, NewStandard(), newRequests(), discard())
-			if err := c.Send(msg); err != nil {
-				t.Fatalf("Send: %v", err)
-			}
-			got := lines(out.String())
-			if len(got) != 1 || !sameJSON(t, got[0], tc.want) {
-				t.Errorf("wrote %q, want %s", got, tc.want)
-			}
-			if got := written(t, msg); !sameJSON(t, got, tc.line) {
-				t.Errorf("the message changed: %s, want %s", got, tc.line)
+			e := dial(t, tc.peer)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			e.call(t, ctx, read(t, "initialize", false, params))
+			if got := frameOf(t, e.next(t)); !sameJSON(t, string(got.Params), tc.want) {
+				t.Errorf("wrote %s, want %s", got.Params, tc.want)
 			}
 		})
 	}
 }
 
-func TestConnectionEnds(t *testing.T) {
-	broken := errors.New("broken pipe")
-	request := `{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}`
+// TestConnEnds reads to the end of the input: a cut last line is the error
+// the connection ends with, and a whole one is delivered first.
+func TestConnEnds(t *testing.T) {
 	cases := []struct {
-		name    string
-		in      func() io.Reader
-		closed  bool // Close is called before anything is received
-		want    int  // messages received
-		wantErr string
+		name      string
+		input     string
+		wantKinds []session.Kind
+		wantErr   bool
 	}{
-		{"input ends after a line", func() io.Reader { return strings.NewReader(request + "\n" + request + "\n") }, false, 2, ""},
-		{"a whole message on a partial final line", func() io.Reader { return strings.NewReader(request + "\n" + request) }, false, 2, ""},
-		{"a message cut on a partial final line", func() io.Reader { return strings.NewReader(request + "\n" + request[:20]) }, false, 1, "ended inside a message"},
-		{"blank lines between messages", func() io.Reader { return strings.NewReader("\n" + request + "\n \r\n" + request + "\n\n") }, false, 2, ""},
-		{"empty input", func() io.Reader { return strings.NewReader("") }, false, 0, ""},
-		{"a read error", func() io.Reader { return io.MultiReader(strings.NewReader(request+"\n"), iotest.ErrReader(broken)) }, false, 1, broken.Error()},
-		{"closed by its owner", func() io.Reader { return strings.NewReader(request + "\n") }, true, 0, ""},
-		{"closed by its owner, then its input fails", func() io.Reader { return iotest.ErrReader(broken) }, true, 0, ""},
-		{"closed by its owner, then its input is cut", func() io.Reader { return strings.NewReader(request[:20]) }, true, 0, ""},
+		{"between messages", `{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s1"}}` + "\n", []session.Kind{session.Pass}, false},
+		{"a last line without its newline", `{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s1"}}`, []session.Kind{session.Pass}, false},
+		{"inside a message", `{"jsonrpc":"2.0","method":"session/can`, nil, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c := NewClient(tc.in(), io.Discard, NewStandard(), discard())
-			if tc.closed {
-				if err := c.Close(); err != nil {
-					t.Fatalf("Close: %v", err)
-				}
+			c := NewConn(context.Background(), strings.NewReader(tc.input), discardWriter{}, Standard(), Client, testLogger())
+			var kinds []session.Kind
+			for in := range c.Receive() {
+				kinds = append(kinds, in.Message.Kind())
 			}
-			got := 0
-			for range c.Receive() {
-				got++
-			}
-			err := c.Err()
-			switch {
-			case got != tc.want:
-				t.Errorf("received %d messages, want %d", got, tc.want)
-			case tc.wantErr == "" && err != nil:
-				t.Errorf("Err = %v, want nil", err)
-			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
-				t.Errorf("Err = %v, want one containing %q", err, tc.wantErr)
-			}
-		})
-	}
-}
-
-// foreign is a message of no acp serializer: a session's view of one.
-type foreign struct {
-	kind   session.Kind
-	id     session.MessageID
-	result session.Result
-}
-
-func (f foreign) Kind() session.Kind                                     { return f.kind }
-func (f foreign) ID() session.MessageID                                  { return f.id }
-func (foreign) Chat() session.ChatID                                     { return "" }
-func (foreign) Dir() session.Path                                        { return "" }
-func (f foreign) WithID(id session.MessageID) session.Message            { f.id = id; return f }
-func (f foreign) Mapped(func(session.Path) session.Path) session.Message { return f }
-func (f foreign) Reply(session.Result) session.Message                   { return f }
-func (f foreign) Result() session.Result                                 { return f.result }
-func (f foreign) Fail(error) session.Message                             { return f }
-
-// TestSend writes messages no acp serializer made, and those that have no
-// form on the wire, on a connection that has received request 7, a
-// session/list.
-func TestSend(t *testing.T) {
-	received := `{"jsonrpc":"2.0","id":7,"method":"session/list","params":{"cwd":"/p"}}`
-	notification := `{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s1"}}`
-	cases := []struct {
-		name string
-		msg  func(t *testing.T) session.Message
-		want string // the line written; "" for an error and nothing written
-	}{
-		{"another implementation's answer, by its result", func(*testing.T) session.Message {
-			return foreign{kind: session.Pass, id: num(7), result: session.ListResult{}}
-		}, `{"jsonrpc":"2.0","id":7,"result":{"sessions":[]}}`},
-		{"another implementation's answer that its method cannot hold", func(*testing.T) session.Message {
-			return foreign{kind: session.Pass, id: num(7), result: session.EmptyResult{}}
-		}, `{"jsonrpc":"2.0","id":7,"error":{"code":-32603,"message":"hermod: session/list is not answered with a session.EmptyResult"}}`},
-		{"another implementation's answer without a result", func(*testing.T) session.Message {
-			return foreign{kind: session.Answer, id: num(7)}
-		}, `{"jsonrpc":"2.0","id":7,"error":{"code":-32603,"message":"hermod: the answer holds no result"}}`},
-		{"another implementation's answer to no request received", func(*testing.T) session.Message {
-			return foreign{kind: session.Pass, id: num(8), result: session.ListResult{}}
-		}, ""},
-		{"another implementation's request", func(*testing.T) session.Message {
-			return foreign{kind: session.Open, id: num(7)}
-		}, ""},
-		{"another implementation's cancel", func(*testing.T) session.Message {
-			return foreign{kind: session.Cancel, id: num(7)}
-		}, ""},
-		{"nil", func(*testing.T) session.Message { return nil }, ""},
-		{"the answer to a notification", func(t *testing.T) session.Message {
-			return read(t, Client, "", notification).Reply(session.EmptyResult{})
-		}, ""},
-		{"a request under no ID", func(*testing.T) session.Message {
-			return NewRequest[PromptParams, PromptResult](session.MessageID{}, PromptParams{SessionID: "s1", Prompt: []ContentBlock{}})
-		}, ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var out bytes.Buffer
-			c := NewClient(strings.NewReader(received+"\n"), &out, NewStandard(), discard())
-			for range c.Receive() {
-			}
-			err := c.Send(tc.msg(t))
-			got := lines(out.String())
-			switch {
-			case tc.want == "" && (err == nil || len(got) != 0):
-				t.Errorf("Send = %v and wrote %q, want an error and nothing written", err, got)
-			case tc.want != "" && (err != nil || len(got) != 1 || !sameJSON(t, got[0], tc.want)):
-				t.Errorf("Send = %v and wrote %q, want %s", err, got, tc.want)
+			if fmt.Sprint(kinds) != fmt.Sprint(tc.wantKinds) || (c.Err() != nil) != tc.wantErr {
+				t.Errorf("delivered %v, ended with %v, want %v and an error: %v", kinds, c.Err(), tc.wantKinds, tc.wantErr)
 			}
 		})
 	}
