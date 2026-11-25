@@ -42,20 +42,21 @@ type Adapters struct {
 // Attach attaches the workspace dir belongs to and its adapter, a line-stream
 // worker it starts when none runs: an Exited one is removed and started
 // again. The adapter's connection ends when the workspace is detached, or
-// when the relay that carries it stops serving.
-func (a Adapters) Attach(ctx context.Context, dir Path) (Attachment, error) {
+// when the relay that carries it stops serving. A failed attach gives up what
+// it leased within a context teardown starts.
+func (a Adapters) Attach(ctx context.Context, dir Path, teardown workspace.Teardown) (Attachment, error) {
 	local := string(dir)
 	var tree workspace.Worktree
 	if main, root, ok := a.MainWorktree(ctx, local); ok {
 		tree = workspace.Worktree{Main: main, Root: root}
 	}
-	ws, err := workspace.Open(ctx, a.Remote, a.Local, local, tree)
+	ws, err := workspace.Open(ctx, a.Remote, a.Local, local, tree, teardown)
 	if err != nil {
 		return Attachment{}, err
 	}
 	att, err := a.attach(ctx, ws, local)
 	if err != nil {
-		return Attachment{}, errors.Join(err, ws.Detach(ctx))
+		return Attachment{}, errors.Join(err, teardown.Detach(ws))
 	}
 	return att, nil
 }

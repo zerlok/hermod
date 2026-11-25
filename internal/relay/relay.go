@@ -142,7 +142,7 @@ func (ls *leases) connect(ctx context.Context) (Lease, error) {
 		// may still be held: a new lease gets a serving of its own, and those
 		// leases keep the stopped one, whose Done stays closed.
 		if ls.srv != nil {
-			ls.srv.stop()
+			_ = ls.srv.stop(ctx)
 			ls.srv = nil
 		}
 		srv, err := ls.mech.serve(ctx)
@@ -170,17 +170,18 @@ func (ls *leases) settleLast(ctx context.Context, lk *lock, how giveUp) error {
 }
 
 func (ls *leases) giveUp(ctx context.Context, l *lease, how giveUp) error {
+	var stopped error
 	ls.mu.Lock()
 	if l.srv != nil {
 		l.srv.holders--
 		// A serving already replaced was stopped then.
 		if l.srv.holders == 0 && l.srv == ls.srv {
-			ls.srv.stop()
+			stopped = ls.srv.stop(ctx)
 			ls.srv = nil
 		}
 	}
 	ls.mu.Unlock()
-	return ls.settleLast(ctx, l.lock, how)
+	return errors.Join(stopped, ls.settleLast(ctx, l.lock, how))
 }
 
 // lease is one holder's lease on a relay.
@@ -226,6 +227,9 @@ type serving struct {
 	err    error
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	// shutdown, when set, ends what the serving's cancel does not end at
+	// once, within the context stop is handed.
+	shutdown func(ctx context.Context) error
 
 	holders int // this process's leases on it, guarded by the leases' mu
 }
@@ -251,10 +255,15 @@ func (s *serving) run(f func() error) {
 	s.wg.Go(func() { s.finish(f()) })
 }
 
-// stop ends the serving and waits for what it ran.
-func (s *serving) stop() {
+// stop ends the serving within ctx and waits for what it ran.
+func (s *serving) stop(ctx context.Context) error {
 	s.finish(nil)
+	var err error
+	if s.shutdown != nil {
+		err = s.shutdown(ctx)
+	}
 	s.wg.Wait()
+	return err
 }
 
 func (s *serving) finished() bool {

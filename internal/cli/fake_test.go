@@ -10,11 +10,13 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/air"
 	"github.com/zerlok/hermod/internal/session"
 	"github.com/zerlok/hermod/internal/shell"
+	"github.com/zerlok/hermod/internal/workspace"
 )
 
 const (
@@ -116,11 +118,13 @@ type recorder struct {
 	// delivered while the core served it.
 	received   []session.Kind
 	configured []air.Request
-	logs       map[string]*memLog
-	stdout     bytes.Buffer
-	stderr     bytes.Buffer
-	local      *workstation
-	stdin      io.Reader
+	// teardowns are the deadlines each command's teardown was built with.
+	teardowns []time.Duration
+	logs      map[string]*memLog
+	stdout    bytes.Buffer
+	stderr    bytes.Buffer
+	local     *workstation
+	stdin     io.Reader
 }
 
 // streamName names which of the process's streams s is, "" for none and
@@ -192,6 +196,12 @@ func newApp(t *testing.T, s setup) (app, *recorder) {
 			r.configured = append(r.configured, req)
 			entry, err := air.NewEntry(req.Name, req.Remote, req.Hermod, req.ChatArgs, req.Env)
 			return air.Result{Entry: entry, RemoteLine: req.RemoteVariable + "=" + req.Remote}, err
+		},
+		teardown: func(timeout time.Duration) workspace.Teardown {
+			r.teardowns = append(r.teardowns, timeout)
+			return func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), timeout)
+			}
 		},
 		local:      r.local,
 		dryRun:     func(plan io.Writer) shell.Executor { return planner{plan: plan} },

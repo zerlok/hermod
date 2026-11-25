@@ -142,7 +142,7 @@ func TestAttachDecides(t *testing.T) {
 			f := newFake()
 			f.attach = ends
 			withConversation(f, tc.probe)
-			req := Request{Remote: f.remote(), Local: testLocal(t), Dir: api, Args: []string{"vim"}, Name: "edit"}
+			req := Request{Remote: f.remote(), Local: testLocal(t), Dir: api, Args: []string{"vim"}, Name: "edit", Teardown: unbounded}
 			key := "edit"
 			if tc.agent {
 				req, key = conversation(f, req), convW
@@ -276,7 +276,7 @@ func TestAttachWorkerDirectory(t *testing.T) {
 			f.attach = ends
 			var logged bytes.Buffer
 			req := conversation(f, Request{
-				Remote: f.remote(), Local: testLocal(t), Dir: api,
+				Remote: f.remote(), Local: testLocal(t), Dir: api, Teardown: unbounded,
 				Environ:  env.Environ([]string{"AGENT_X=1", "SECRET=s"}),
 				Identity: Identity{Name: "Me"},
 				Log:      log.New(&logged, "", 0),
@@ -366,6 +366,7 @@ func TestAttachNets(t *testing.T) {
 			req := Request{
 				Remote: f.remote(), Local: testLocal(t), Dir: api, Args: []string{"vim"}, Name: "edit",
 				Forwards: tc.forwards, Log: log.New(&logged, "", 0), Random: bytes.NewReader(make([]byte, 1024)),
+				Teardown: unbounded,
 			}
 			key := "edit"
 			if tc.agent {
@@ -436,10 +437,10 @@ func TestRejoinHooks(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFake()
 			ctx := context.Background()
-			req := conversation(f, Request{Remote: f.remote(), Local: testLocal(t), Dir: api}, tc.hooks...)
+			req := conversation(f, Request{Remote: f.remote(), Local: testLocal(t), Dir: api, Teardown: unbounded}, tc.hooks...)
 			f.sessions[convW] = &tmuxSession{state: workspace.WorkerRunning}
 			f.dirs[".hermod/s/"+convW] = tc.recorded
-			ws, err := workspace.Open(ctx, req.Remote, req.Local, req.Dir, workspace.Worktree{})
+			ws, err := workspace.Open(ctx, req.Remote, req.Local, req.Dir, workspace.Worktree{}, unbounded)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
@@ -506,7 +507,7 @@ func TestAttachEnds(t *testing.T) {
 			}
 			err := Attach(ctx, Request{
 				Remote: f.remote(), Local: testLocal(t), Dir: api, Args: []string{"vim"}, Name: "edit",
-				Streams: workspace.Streams{In: in},
+				Streams: workspace.Streams{In: in}, Teardown: unbounded,
 			})
 			if (err != nil) != tc.wantErr {
 				t.Errorf("Attach: %v, want error %v", err, tc.wantErr)
@@ -516,6 +517,68 @@ func TestAttachEnds(t *testing.T) {
 			}
 			if _, ok := f.sessions["edit"]; !ok {
 				t.Error("the worker is gone, want it running on")
+			}
+		})
+	}
+}
+
+// TestOpenFails checks that an open whose flush fails gives up what it leased
+// within a teardown started for it, which a signal that ended the run does not
+// cut, for an attach and for the adapters alike.
+func TestOpenFails(t *testing.T) {
+	attach := func(ctx context.Context, f *fake, local workspace.Local, teardown workspace.Teardown) error {
+		return Attach(ctx, Request{
+			Remote: f.remote(), Local: local, Dir: api, Args: []string{"vim"}, Name: "edit",
+			Streams: workspace.Streams{In: strings.NewReader("")}, Teardown: teardown,
+		})
+	}
+	adapters := func(ctx context.Context, f *fake, local workspace.Local, teardown workspace.Teardown) error {
+		_, err := Adapters{
+			Remote: f.remote(), Local: local, Agent: fakeAgent{f: f},
+			Identity:     func(context.Context, string) Identity { return Identity{} },
+			MainWorktree: func(context.Context, string) (string, string, bool) { return "", "", false },
+			Connect:      func(io.Reader, io.Writer) Channel { return nullChannel{received: make(chan Inbound)} },
+		}.Attach(ctx, Path(api), teardown)
+		return err
+	}
+	cases := []struct {
+		name         string
+		open         func(context.Context, *fake, workspace.Local, workspace.Teardown) error
+		signalled    bool // the run context ended before the open
+		wantChanges  []string
+		wantCut      []string
+		wantTeardown int
+	}{
+		{"an attach", attach, false, []string{"create " + api, "flush " + api, "flush " + api, "terminate " + api}, nil, 1},
+		{"an attach after a signal", attach, true, []string{"create " + api, "flush " + api, "flush " + api, "terminate " + api}, []string{"flush " + api}, 1},
+		{"the adapters", adapters, false, []string{"create " + api, "flush " + api, "flush " + api, "terminate " + api}, nil, 1},
+		{"the adapters after a signal", adapters, true, []string{"create " + api, "flush " + api, "flush " + api, "terminate " + api}, []string{"flush " + api}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.signalled {
+				cancel()
+			}
+			f := newFake()
+			f.flushFails = true
+			started := 0
+			teardown := func() (context.Context, context.CancelFunc) {
+				started++
+				return unbounded()
+			}
+			if err := tc.open(ctx, f, testLocal(t), teardown); err == nil {
+				t.Error("open: no error, want the flush's")
+			}
+			if got := f.changes(); !reflect.DeepEqual(got, tc.wantChanges) {
+				t.Errorf("changes %q, want %q", got, tc.wantChanges)
+			}
+			if !reflect.DeepEqual(f.cut, tc.wantCut) {
+				t.Errorf("run with an ended context %q, want %q", f.cut, tc.wantCut)
+			}
+			if started != tc.wantTeardown {
+				t.Errorf("teardowns started %d, want %d", started, tc.wantTeardown)
 			}
 		})
 	}

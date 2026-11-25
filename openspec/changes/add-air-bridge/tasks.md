@@ -169,9 +169,9 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 ## 23. Graceful shutdown; contexts from `cli`
 
-- [ ] 23.1 In `cli`, build the run context, ended by the first SIGINT or SIGTERM, and a function that starts the teardown context, ended by its deadline, counted from that call or the first signal, whichever is first, or by a second signal; name `--teardown-timeout` and `HERMOD_TEARDOWN_TIMEOUT`, 10 s by default, the stand-in reading the variable only ([Shutdown](../../../docs/ARCHITECTURE.md#shutdown))
-- [ ] 23.2 Hand the teardown context into the core: `Workspace.Detach`, the chat's detach of every session, the leases' `Suspend` and `Release`, and the run context into `acp.Conn`; remove `context.WithoutCancel` and `context.Background` from `workspace`, `session`, `relay` (the Net relay's shutdown takes its bound from the context), `worker` and `acp`
-- [ ] 23.3 Tests: a teardown within the deadline, one cut by the deadline, one started without a signal and bounded, a second signal, and the deadline from the flag, the variable and the default
+- [x] 23.1 In `cli`, build the run context, ended by the first SIGINT or SIGTERM, and a function that starts the teardown context, ended by its deadline, counted from that call or the first signal, whichever is first, or by a second signal; name `--teardown-timeout` and `HERMOD_TEARDOWN_TIMEOUT`, 10 s by default, the stand-in reading the variable only ([Shutdown](../../../docs/ARCHITECTURE.md#shutdown))
+- [x] 23.2 Hand the teardown context into the core: `Workspace.Detach`, the chat's detach of every session, the leases' `Suspend` and `Release`, and the run context into `acp.Conn`; remove `context.WithoutCancel` and `context.Background` from `workspace`, `session`, `relay` (the Net relay's shutdown takes its bound from the context), `worker` and `acp`
+- [x] 23.3 Tests: a teardown within the deadline, one cut by the deadline, one started without a signal and bounded, a second signal, and the deadline from the flag, the variable and the default
 
 ## 24. Relays end their own leases; workspace leases
 

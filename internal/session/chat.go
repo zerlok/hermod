@@ -27,8 +27,9 @@ type Attachment struct {
 }
 
 // AttachFunc attaches the workspace dir belongs to, starting its adapter when
-// none runs. The adapter's connection ends when the workspace is detached.
-type AttachFunc func(ctx context.Context, dir Path) (Attachment, error)
+// none runs, and gives up within a context teardown starts what a failed
+// attach leased. The adapter's connection ends when the workspace is detached.
+type AttachFunc func(ctx context.Context, dir Path, teardown workspace.Teardown) (Attachment, error)
 
 // ChatRequest is one chat client's connection, as the command line built it.
 type ChatRequest struct {
@@ -41,7 +42,10 @@ type ChatRequest struct {
 	Remote workspace.Remote
 	Local  workspace.Local
 	Attach AttachFunc
-	Log    *log.Logger // nil discards
+	// Teardown starts the context of every detach: a session's that ends
+	// during the chat, and every session's once the chat ends.
+	Teardown workspace.Teardown
+	Log      *log.Logger // nil discards
 }
 
 // Chat serves one chat client. The client holds a single connection for every
@@ -53,7 +57,7 @@ type ChatRequest struct {
 func Chat(ctx context.Context, req ChatRequest) (err error) {
 	running, stop := context.WithCancel(ctx)
 	r := newRouter(running, req)
-	defer func() { err = errors.Join(err, r.close(context.WithoutCancel(ctx), stop)) }()
+	defer func() { err = errors.Join(err, r.close(stop)) }()
 	for {
 		select {
 		case <-ctx.Done():
@@ -103,21 +107,24 @@ func newRouter(running context.Context, req ChatRequest) *router {
 		events:   make(chan event),
 	}
 	r.deps = sessionDeps{
-		client:  req.Client,
-		agent:   req.Agent,
-		acp:     req.ACP,
-		log:     logger,
-		owners:  map[ChatID]Path{},
-		call:    r.call,
-		post:    r.post,
-		running: running,
+		client:   req.Client,
+		agent:    req.Agent,
+		acp:      req.ACP,
+		log:      logger,
+		owners:   map[ChatID]Path{},
+		call:     r.call,
+		post:     r.post,
+		running:  running,
+		teardown: req.Teardown,
 	}
 	return r
 }
 
-// close detaches every session, in the order of their directories, and stops
-// the forwarders and the calls.
-func (r *router) close(ctx context.Context, stop context.CancelFunc) error {
+// close detaches every session, in the order of their directories, within
+// one teardown context, and stops the forwarders and the calls.
+func (r *router) close(stop context.CancelFunc) error {
+	ctx, cancel := r.req.Teardown()
+	defer cancel()
 	var errs []error
 	for _, dir := range slices.Sorted(maps.Keys(r.sessions)) {
 		errs = append(errs, r.sessions[dir].Detach(ctx))
@@ -305,7 +312,7 @@ func (r *router) session(ctx context.Context, dir Path) (*SessionControl, error)
 	if s, ok := r.sessions[dir]; ok {
 		return s, nil
 	}
-	att, err := r.req.Attach(ctx, dir)
+	att, err := r.req.Attach(ctx, dir, r.req.Teardown)
 	if err != nil {
 		return nil, err
 	}

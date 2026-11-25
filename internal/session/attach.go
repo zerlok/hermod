@@ -57,6 +57,10 @@ type Request struct {
 	Identity Identity
 	Streams  workspace.Streams
 
+	// Teardown starts the context of the detach that ends the session, or
+	// follows an open that failed.
+	Teardown workspace.Teardown
+
 	Log    *log.Logger // nil discards
 	Random io.Reader   // hook tokens and ports; nil is crypto/rand
 }
@@ -165,7 +169,7 @@ func Attach(ctx context.Context, req Request) error {
 	if err != nil {
 		return err
 	}
-	ws, err := workspace.Open(ctx, req.Remote, req.Local, req.Dir, req.Tree)
+	ws, err := workspace.Open(ctx, req.Remote, req.Local, req.Dir, req.Tree, req.Teardown)
 	if err != nil {
 		return err
 	}
@@ -173,7 +177,7 @@ func Attach(ctx context.Context, req Request) error {
 		req.logger().Printf("workspace %s holds the workspace of %s, whose files are now carried twice", ws.Root(), p.Local)
 	}
 	err = run(ctx, req, ws, id, key)
-	return errors.Join(err, ws.Detach(ctx))
+	return errors.Join(err, req.Teardown.Detach(ws))
 }
 
 // run is a session on an opened workspace, up to the end of its attach; id is

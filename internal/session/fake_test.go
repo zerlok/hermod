@@ -70,6 +70,7 @@ type fake struct {
 	sessions     map[string]*tmuxSession
 	dirs         map[string]map[string]string // the workers' directories under the remote home
 	listFails    bool                         // Mutagen cannot list its sessions
+	flushFails   bool                         // Mutagen fails the next flush
 	attach       ending
 	signal       context.CancelFunc   // stops the session when a joined terminal signals
 	forwardFails bool                 // a forward's remote port is taken
@@ -84,6 +85,7 @@ type fake struct {
 	forms        map[string]string    // the form each worker was started in, by key
 	joins        []string             // the form of each join, in order
 	ran          []string
+	cut          []string // the changes run with their context already ended
 }
 
 func newFake() *fake {
@@ -91,6 +93,11 @@ func newFake() *fake {
 		syncs: map[string]*mutagenSession{}, sessions: map[string]*tmuxSession{},
 		dirs: map[string]map[string]string{}, forms: map[string]string{},
 	}
+}
+
+// unbounded is a teardown no deadline cuts.
+func unbounded() (context.Context, context.CancelFunc) {
+	return context.WithCancel(context.Background())
 }
 
 func (f *fake) remote() workspace.Remote {
@@ -166,7 +173,7 @@ func (f *fake) onLocal(args []string) play {
 		return func(context.Context, io.Reader, io.Writer, io.Writer) error { return nil }
 	}
 	verb, rest := args[2], args[3:]
-	return func(_ context.Context, _ io.Reader, out, errOut io.Writer) error {
+	return func(ctx context.Context, _ io.Reader, out, errOut io.Writer) error {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		switch verb {
@@ -190,7 +197,16 @@ func (f *fake) onLocal(args []string) play {
 			return exitError(1)
 		}
 		f.record(verb, s.local)
+		if ctx.Err() != nil {
+			f.cut = append(f.cut, verb+" "+s.local)
+		}
 		switch verb {
+		case "flush":
+			if f.flushFails {
+				f.flushFails = false
+				_, _ = fmt.Fprintln(errOut, "Error: unable to flush")
+				return exitError(1)
+			}
 		case "pause":
 			s.paused = true
 		case "resume":

@@ -67,6 +67,11 @@ func newFake(syncs map[string]*mutagenSession, sessions map[string]*tmuxSession)
 	return &fake{syncs: syncs, sessions: sessions, written: map[string]map[string]string{}, started: map[string]workertest.Start{}}
 }
 
+// unbounded is a teardown no deadline cuts.
+func unbounded() (context.Context, context.CancelFunc) {
+	return context.WithCancel(context.Background())
+}
+
 // remote is the fake as a workspace's Remote.
 func (f *fake) remote() Remote {
 	return Remote{Host: testHost, Home: testRemoteHome, Exec: f, Read: f}

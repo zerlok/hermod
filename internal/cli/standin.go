@@ -40,13 +40,17 @@ func (a app) standIn(ctx context.Context, claudeArgs []string) (err error) {
 	if err != nil {
 		return err
 	}
+	timeout, err := resolveTeardownTimeout(nil, a.lookupEnv)
+	if err != nil {
+		return err
+	}
 	key := workerName(l.cwd, l.home)
 	if invocation == agent.InvokesConversation {
 		key = id
 	}
 	own, finish := a.sessionLog(filepath.Join(logDir(l.home, a.lookupEnv), key+".log"))
 	defer func() { finish(err) }()
-	return a.runAttach(ctx, attachIntent{remote: remote, args: args}, attachOutput{plan: own, logs: own, setup: own})
+	return a.runAttach(ctx, attachIntent{remote: remote, args: args, teardown: timeout}, attachOutput{plan: own, logs: own, setup: own})
 }
 
 // sessionLog is where the stand-in writes its own output: the log at name and

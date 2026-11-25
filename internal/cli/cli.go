@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/zerlok/hermod/internal/claude"
 	"github.com/zerlok/hermod/internal/session"
 	"github.com/zerlok/hermod/internal/shell"
+	"github.com/zerlok/hermod/internal/workspace"
 )
 
 // The variables Hermod reads. An argument always wins over its variable.
@@ -47,7 +49,14 @@ const (
 	envDataHome = "XDG_DATA_HOME"
 	// envPath is where configure looks for the stand-in link.
 	envPath = "PATH"
+	// envTeardownTimeout is how long a command may take to give up what it
+	// holds when --teardown-timeout is not given, as a Go duration.
+	envTeardownTimeout = "HERMOD_TEARDOWN_TIMEOUT"
 )
+
+// teardownTimeoutFlag is the flag every command takes its teardown's deadline
+// from.
+const teardownTimeoutFlag = "teardown-timeout"
 
 // agentClaude is the one agent the `air` commands serve.
 const agentClaude = "claude"
@@ -70,6 +79,9 @@ type app struct {
 	attach    func(context.Context, session.Request) error
 	chat      func(context.Context, session.ChatRequest) error
 	configure func(air.Request) (air.Result, error)
+	// teardown starts the contexts in which a command gives up what its run
+	// holds, each bounded by timeout.
+	teardown func(timeout time.Duration) workspace.Teardown
 
 	// local runs every command on this workstation; a dry run plans the
 	// commands that change a state with dryRun instead.
@@ -94,9 +106,10 @@ type app struct {
 	stderr io.Writer
 }
 
-// Run runs this process's invocation and returns its exit code. SIGINT and
-// SIGTERM cancel the command's context, so a session unwinds through its
-// detach rather than leaving its relays leased.
+// Run runs this process's invocation and returns its exit code. The first
+// SIGINT or SIGTERM ends the command's run, so a session unwinds through its
+// detach rather than leaving its relays leased; the detach is bounded by the
+// teardown's deadline, and a second signal ends it at once.
 //
 // SIGPIPE is caught too. A caller such as the Agent SDK may stop reading
 // Hermod's stdout or stderr before Hermod is done, and Go kills a program that
@@ -105,7 +118,10 @@ type app struct {
 // than ignored because an ignored signal stays ignored in the programs Hermod
 // starts, and a caught one does not.
 func Run() int {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	contexts, stop := newShutdown(signals, time.Now)
 	defer stop()
 	brokenPipe := make(chan os.Signal, 1)
 	signal.Notify(brokenPipe, syscall.SIGPIPE)
@@ -113,7 +129,8 @@ func Run() int {
 
 	a := app{
 		attach: session.Attach, chat: session.Chat, configure: air.Configure,
-		local: shell.NewLocal(), dryRun: shell.NewDryRun,
+		teardown: contexts.teardown,
+		local:    shell.NewLocal(), dryRun: shell.NewDryRun,
 		cwd: os.Getwd, home: os.UserHomeDir, hostname: os.Hostname,
 		lookupEnv: os.LookupEnv, environ: os.Environ, executable: os.Executable,
 		newAgent: claudeAgent(readOnce(os.ReadFile)),
@@ -121,7 +138,7 @@ func Run() int {
 		openLog:  openLog,
 		stdin:    os.Stdin, stdout: os.Stdout, stderr: os.Stderr,
 	}
-	return exitCode(execute(ctx, a, os.Args), os.Stderr)
+	return exitCode(execute(contexts.run, a, os.Args), os.Stderr)
 }
 
 // readOnce is read with each file's first answer kept for the process. A
@@ -193,6 +210,8 @@ func newRootCmd(a app) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	cmd.PersistentFlags().Duration(teardownTimeoutFlag, defaultTeardownTimeout,
+		"how long to give up what the command holds, from the first SIGINT or SIGTERM or the start of its teardown ("+envTeardownTimeout+")")
 	cmd.AddCommand(newAttachCmd(a), newAirCmd(a))
 	return cmd
 }
@@ -232,6 +251,10 @@ func newAttachCmd(a app) *cobra.Command {
 				_ = cmd.Usage()
 				return err
 			}
+			timeout, err := teardownTimeout(cmd, a.lookupEnv)
+			if err != nil {
+				return err
+			}
 			return a.runAttach(cmd.Context(), attachIntent{
 				remote:   remote,
 				dir:      dir,
@@ -239,6 +262,7 @@ func newAttachCmd(a app) *cobra.Command {
 				args:     resolveCommand(passthrough, a.lookupEnv),
 				forwards: fwds,
 				dryRun:   dryRun,
+				teardown: timeout,
 			}, attachOutput{plan: a.stdout, logs: a.stderr})
 		},
 	}
@@ -324,7 +348,11 @@ func newACPCmd(a app) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return a.runChat(cmd.Context(), remote)
+			timeout, err := teardownTimeout(cmd, a.lookupEnv)
+			if err != nil {
+				return err
+			}
+			return a.runChat(cmd.Context(), remote, timeout)
 		},
 	}
 }

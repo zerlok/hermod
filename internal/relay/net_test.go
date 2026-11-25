@@ -300,3 +300,53 @@ func TestNetConnection(t *testing.T) {
 		})
 	}
 }
+
+// TestNetShutdown checks that a filtered Net relay's shutdown, at its last
+// lease's release, waits for the calls it serves only within the context the
+// release is handed.
+func TestNetShutdown(t *testing.T) {
+	cases := []struct {
+		name    string
+		calling bool // a call is still running at the release
+		ended   bool // the release's context has ended
+		wantErr error
+	}{
+		{"no call running", false, false, nil},
+		{"no call running, past the deadline", false, true, nil},
+		{"a running call cut at the context's end", true, true, context.Canceled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entered, unblock := make(chan struct{}), make(chan struct{})
+			local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				close(entered)
+				<-unblock
+			}))
+			defer local.Close()
+			defer close(unblock)
+			var fwd forwarded
+			ex := &fakeExec{answer: fwd.answer(writes(readyLine + "\n"))}
+			pass := filterFunc(func(c Call) (Call, error) { return c, nil })
+			l, err := NewNet(ex, t.TempDir(), "hermod-net", "prod-box", 45001, strings.TrimPrefix(local.URL, "http://"), pass).Connect(context.Background())
+			if err != nil {
+				t.Fatalf("Connect() error: %v", err)
+			}
+			if tc.calling {
+				go func() {
+					if resp, err := http.Post("http://"+fwd.address()+"/hook", "application/json", strings.NewReader(`{}`)); err == nil {
+						_ = resp.Body.Close()
+					}
+				}()
+				<-entered
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			if tc.ended {
+				cancel()
+			}
+			defer cancel()
+			if err := l.Release(ctx); !errors.Is(err, tc.wantErr) || (err == nil) != (tc.wantErr == nil) {
+				t.Errorf("Release: %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}

@@ -283,7 +283,8 @@ type chatEnv struct {
 	logged   bytes.Buffer
 	mu       sync.Mutex
 	adapters map[Path]*fakeChannel
-	names    map[string]string // an adapter worker's name → how a table names it
+	names    map[string]string  // an adapter worker's name → how a table names it
+	stop     context.CancelFunc // ends the router's run, as a signal does
 }
 
 func newChatEnv(t *testing.T) *chatEnv {
@@ -311,13 +312,14 @@ func mustHandshake(version int, caps string) agent.Handshake {
 
 func (e *chatEnv) request() ChatRequest {
 	return ChatRequest{
-		Client: e.client,
-		Agent:  fakeAgent{f: e.f},
-		ACP:    fakeAgent{f: e.f, handshake: testHandshake},
-		Remote: e.f.remote(),
-		Local:  e.local,
-		Attach: e.attach,
-		Log:    log.New(&e.logged, "", 0),
+		Client:   e.client,
+		Agent:    fakeAgent{f: e.f},
+		ACP:      fakeAgent{f: e.f, handshake: testHandshake},
+		Remote:   e.f.remote(),
+		Local:    e.local,
+		Attach:   e.attach,
+		Teardown: unbounded,
+		Log:      log.New(&e.logged, "", 0),
 	}
 }
 
@@ -335,11 +337,11 @@ func (e *chatEnv) adapter(dir Path) *fakeChannel {
 
 // attach opens dir's workspace and starts its adapter worker unless it runs,
 // as cli's attach does.
-func (e *chatEnv) attach(ctx context.Context, dir Path) (Attachment, error) {
+func (e *chatEnv) attach(ctx context.Context, dir Path, teardown workspace.Teardown) (Attachment, error) {
 	if e.refuse[string(dir)] {
 		return Attachment{}, errRefused
 	}
-	ws, err := workspace.Open(ctx, e.f.remote(), e.local, string(dir), workspace.Worktree{})
+	ws, err := workspace.Open(ctx, e.f.remote(), e.local, string(dir), workspace.Worktree{}, teardown)
 	if err != nil {
 		return Attachment{}, err
 	}

@@ -33,6 +33,7 @@ type step struct {
 	cancel      string  // side cancels its request of this name
 	ends        bool    // the adapter's connection ends
 	workersFail bool    // tmux cannot list its sessions from this step on
+	signal      bool    // the run ends before this step, as at a signal
 }
 
 func client(m fakeMsg) step           { return step{send: m, ask: true} }
@@ -79,6 +80,7 @@ func TestChatEvents(t *testing.T) {
 		wantAdapters map[string][]string
 		wantChanges  []string
 		wantSessions map[string]int // directory → chats waited on
+		wantCut      []string       // changes run with their context already ended
 		wantLog      []string       // parts of lines logged, in order
 		forbidLog    []string       // parts of no line logged
 	}{
@@ -531,6 +533,24 @@ func TestChatEvents(t *testing.T) {
 			wantChanges:  []string{"create " + api, "flush " + api, "pause " + api},
 			wantSessions: map[string]int{api: 0},
 		},
+		{
+			name:    "a suspend after a signal detaches within a teardown the signal does not cut",
+			running: []string{api},
+			steps: []step{client(openIn("1", api)), answers(api, "1", msg("r1", "c1")),
+				{send: suspendReq("2", "c1"), ask: true, signal: true}},
+			wantClient:   []string{returns("1", msg("r1", "c1")), replies("2", "empty")},
+			wantAdapters: map[string][]string{api: {call(openIn("1", apiR))}},
+			wantChanges:  []string{"create " + api, "flush " + api, "pause " + api},
+		},
+		{
+			name:    "the adapter's connection ending after a signal detaches within a teardown the signal does not cut",
+			running: []string{api},
+			steps: []step{client(openIn("1", api)), answers(api, "1", msg("r1", "c1")),
+				{side: api, ends: true, signal: true}},
+			wantClient:   []string{returns("1", msg("r1", "c1"))},
+			wantAdapters: map[string][]string{api: {call(openIn("1", apiR))}},
+			wantChanges:  []string{"create " + api, "flush " + api, "pause " + api},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -544,8 +564,9 @@ func TestChatEvents(t *testing.T) {
 				e.refuse[d] = true
 			}
 			ctx, stop := context.WithCancel(context.Background())
+			e.stop = stop
 			r := newRouter(ctx, e.request())
-			t.Cleanup(func() { _ = r.close(context.Background(), stop) })
+			t.Cleanup(func() { _ = r.close(stop) })
 
 			var err error
 			for _, s := range tc.steps {
@@ -575,6 +596,9 @@ func TestChatEvents(t *testing.T) {
 			if got := waiting(r); !reflect.DeepEqual(got, tc.wantSessions) && len(got)+len(tc.wantSessions) > 0 {
 				t.Errorf("sessions %v, want %v", got, tc.wantSessions)
 			}
+			if got := e.f.cut; !sameLines(got, tc.wantCut) {
+				t.Errorf("run with an ended context %q, want %q", got, tc.wantCut)
+			}
 			if got := e.logLines(); !logged(got, tc.wantLog, tc.forbidLog) {
 				t.Errorf("logged %q, want lines with %q and none with %q", got, tc.wantLog, tc.forbidLog)
 			}
@@ -589,6 +613,9 @@ func (e *chatEnv) run(t *testing.T, r *router, s step) error {
 	e.f.mu.Lock()
 	e.f.workersFail = e.f.workersFail || s.workersFail
 	e.f.mu.Unlock()
+	if s.signal {
+		e.stop()
+	}
 	side := e.client
 	if s.side != "" {
 		side = e.adapter(Path(s.side))

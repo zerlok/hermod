@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/zerlok/hermod/internal/acp"
 	"github.com/zerlok/hermod/internal/agent"
@@ -30,6 +31,7 @@ type attachIntent struct {
 	args     []string
 	forwards []session.Forward
 	dryRun   bool
+	teardown time.Duration // bounds the detach
 }
 
 // local is what a command reads of this workstation, resolved once.
@@ -98,13 +100,15 @@ func (a app) runAttach(ctx context.Context, in attachIntent, out attachOutput) e
 		Environ:    env.Environ(a.environ()),
 		Identity:   session.Identity{Name: identity.Name, Email: identity.Email},
 		Streams:    workspace.Streams{In: a.stdin, Out: a.stdout, Err: a.stderr},
+		Teardown:   a.teardown(in.teardown),
 		Log:        log.New(out.logs, "", 0),
 	})
 }
 
 // runChat serves Air's one ACP connection on stdin and stdout. stdout is the
-// connection, so Hermod's own lines go to stderr.
-func (a app) runChat(ctx context.Context, host string) error {
+// connection, so Hermod's own lines go to stderr. Each detach is bounded by
+// teardown.
+func (a app) runChat(ctx context.Context, host string, teardown time.Duration) error {
 	l, err := a.readLocal()
 	if err != nil {
 		return err
@@ -140,13 +144,14 @@ func (a app) runChat(ctx context.Context, host string) error {
 		Log:    logger,
 	}
 	return a.chat(ctx, session.ChatRequest{
-		Client: acp.NewConn(ctx, a.stdin, a.stdout, registry, acp.Client, logger),
-		Agent:  ag,
-		ACP:    chats,
-		Remote: remote,
-		Local:  adapters.Local,
-		Attach: adapters.Attach,
-		Log:    logger,
+		Client:   acp.NewConn(ctx, a.stdin, a.stdout, registry, acp.Client, logger),
+		Agent:    ag,
+		ACP:      chats,
+		Remote:   remote,
+		Local:    adapters.Local,
+		Attach:   adapters.Attach,
+		Teardown: a.teardown(teardown),
+		Log:      logger,
 	})
 }
 

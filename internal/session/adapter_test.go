@@ -21,7 +21,7 @@ const adapterWord = "ADAPTER"
 func adapterKeyOf(t *testing.T, dir string) string {
 	t.Helper()
 	ctx := context.Background()
-	ws, err := workspace.Open(ctx, newFake().remote(), testLocal(t), dir, workspace.Worktree{})
+	ws, err := workspace.Open(ctx, newFake().remote(), testLocal(t), dir, workspace.Worktree{}, unbounded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,14 +118,14 @@ func TestAdaptersAttach(t *testing.T) {
 			var holder Attachment
 			if tc.held {
 				var err error
-				holder, err = adapters.Attach(ctx, Path(api))
+				holder, err = adapters.Attach(ctx, Path(api), unbounded)
 				if err != nil {
 					t.Fatalf("the holder's Attach: %v", err)
 				}
 				conns = nil
 				defer func() { _ = holder.Workspace.Detach(ctx) }()
 			}
-			att, err := adapters.Attach(ctx, Path(api))
+			att, err := adapters.Attach(ctx, Path(api), unbounded)
 			if !matches(err, tc.wantErr) {
 				t.Fatalf("Attach: %v, want %v", err, tc.wantErr)
 			}
@@ -239,7 +239,7 @@ func TestAdaptersErrors(t *testing.T) {
 					return l, nil
 				}
 			}
-			att, err := adapters.Attach(ctx, Path(api))
+			att, err := adapters.Attach(ctx, Path(api), unbounded)
 			if err != nil {
 				t.Fatalf("Attach: %v", err)
 			}

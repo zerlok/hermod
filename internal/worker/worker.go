@@ -365,7 +365,7 @@ func Start(ctx context.Context, remote Remote, spec Spec) (Worker, error) {
 		w.key.underHome(), staging, spec.Dir, env.WorkerDir, pidFile, envFile,
 		spec.Form.String(), fifo, outLog, errLog, shell.Line(session.KeepFailedPane()),
 	}, spec.Command...)
-	newSession, err := handed(func(in shell.Executor) shell.Executor {
+	newSession, err := handed(ctx, func(in shell.Executor) shell.Executor {
 		return shell.NewLogin(shell.NewTmux(in, w.key.name, shell.Detached(), shell.WithSessionOptions(options...)))
 	}, pane)
 	if err != nil {
@@ -384,9 +384,9 @@ func Start(ctx context.Context, remote Remote, spec Spec) (Worker, error) {
 
 // handed is args as the executors wrap makes hand them inward, run nowhere,
 // for a script on the remote that decides whether to run them.
-func handed(wrap func(shell.Executor) shell.Executor, args []string) ([]string, error) {
+func handed(ctx context.Context, wrap func(shell.Executor) shell.Executor, args []string) ([]string, error) {
 	var c capture
-	if err := wrap(&c).Exec(context.Background(), shell.Command{Args: args}).Wait(); err != nil {
+	if err := wrap(&c).Exec(ctx, shell.Command{Args: args}).Wait(); err != nil {
 		return nil, err
 	}
 	return c.args, nil
@@ -540,7 +540,7 @@ func (w Worker) Look(ctx context.Context, cmd []string, files ...string) (Look, 
 	}
 	var line string
 	if len(cmd) > 0 {
-		login, err := handed(shell.NewLogin, cmd)
+		login, err := handed(ctx, shell.NewLogin, cmd)
 		if err != nil {
 			return Look{}, fmt.Errorf("look at worker %s: %w", w.key, err)
 		}

@@ -101,13 +101,12 @@ func (r *Net) serve(ctx context.Context) (*serving, error) {
 	if r.filter == nil {
 		srv.run(func() error { return r.proxy(sctx, ln) })
 	} else {
-		r.serveHTTP(sctx, srv, ln)
+		r.serveHTTP(srv, ln)
 	}
 	// NOTE: a "tcp" listener's address is always a *net.TCPAddr.
 	port := ln.Addr().(*net.TCPAddr).Port
 	if err := r.forward(ctx, sctx, srv, port); err != nil {
-		srv.stop()
-		return nil, err
+		return nil, errors.Join(err, srv.stop(ctx))
 	}
 	return srv, nil
 }
@@ -210,12 +209,21 @@ func closeWrite(c net.Conn) {
 	}
 }
 
-// serveHTTP serves each call to the listener through the filter until ctx
-// ends.
-func (r *Net) serveHTTP(ctx context.Context, srv *serving, ln net.Listener) {
+// serveHTTP serves each call to the listener through the filter until the
+// serving stops.
+func (r *Net) serveHTTP(srv *serving, ln net.Listener) {
 	server := &http.Server{
 		Handler:           filtered{filter: r.filter, local: r.local, client: &http.Client{Timeout: netTimeout}},
 		ReadHeaderTimeout: netTimeout,
+	}
+	srv.shutdown = func(ctx context.Context) error {
+		err := server.Shutdown(ctx)
+		if err != nil {
+			// The calls still running are cut, as the process's end would cut
+			// them.
+			err = errors.Join(err, server.Close())
+		}
+		return err
 	}
 	srv.run(func() error {
 		err := server.Serve(ln)
@@ -223,12 +231,6 @@ func (r *Net) serveHTTP(ctx context.Context, srv *serving, ln net.Listener) {
 			return nil
 		}
 		return err
-	})
-	srv.run(func() error {
-		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), netTimeout)
-		defer cancel()
-		return server.Shutdown(shutdown)
 	})
 }
 

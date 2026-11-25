@@ -138,7 +138,7 @@ func TestStateDiagram(t *testing.T) {
 		{
 			name: "its relays are connected for the first time",
 			do: func(ctx context.Context, w *world) (err error) {
-				w.ws, err = Open(ctx, w.f.remote(), w.local, api, Worktree{})
+				w.ws, err = Open(ctx, w.f.remote(), w.local, api, Worktree{}, unbounded)
 				return err
 			},
 			want: Attached, wantSyncs: []string{n(api, apiR)},
@@ -160,7 +160,7 @@ func TestStateDiagram(t *testing.T) {
 		{
 			name: "its relays are connected again",
 			do: func(ctx context.Context, w *world) (err error) {
-				w.ws, err = Open(ctx, w.f.remote(), w.local, api, Worktree{})
+				w.ws, err = Open(ctx, w.f.remote(), w.local, api, Worktree{}, unbounded)
 				return err
 			},
 			want: Attached, wantSyncs: []string{n(api, apiR)},
@@ -332,7 +332,7 @@ func TestOpen(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			f := newFake(syncsOf(tc.existing...), nil)
-			w, err := Open(ctx, f.remote(), testLocal(t), tc.dir, tc.tree)
+			w, err := Open(ctx, f.remote(), testLocal(t), tc.dir, tc.tree, unbounded)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
@@ -398,7 +398,7 @@ func TestOpenRefuses(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFake(syncsOf(tc.existing...), nil)
 			tc.local.Locks = t.TempDir()
-			_, err := Open(context.Background(), f.remote(), tc.local, tc.dir, tc.tree)
+			_, err := Open(context.Background(), f.remote(), tc.local, tc.dir, tc.tree, unbounded)
 			if err == nil || (tc.wantErr != anyErr && !errors.Is(err, tc.wantErr)) {
 				t.Errorf("Open: %v, want %v", err, tc.wantErr)
 			}
@@ -447,7 +447,7 @@ func TestAddFS(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			f := newFake(syncsOf(tc.existing...), nil)
-			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{})
+			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{}, unbounded)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
@@ -511,7 +511,7 @@ func TestFSOutput(t *testing.T) {
 			if !tc.noOutput {
 				local.Output = &output
 			}
-			w, err := Open(ctx, f.remote(), local, api, Worktree{})
+			w, err := Open(ctx, f.remote(), local, api, Worktree{}, unbounded)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
@@ -550,7 +550,7 @@ func TestHostTags(t *testing.T) {
 			f := newFake(nil, nil)
 			local := testLocal(t)
 			local.Origin = tc.origin
-			w, err := Open(ctx, f.remote(), local, api, Worktree{})
+			w, err := Open(ctx, f.remote(), local, api, Worktree{}, unbounded)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
@@ -578,8 +578,10 @@ func TestDetach(t *testing.T) {
 		leased      []rel // relays of other workspaces this one leases too
 		net         bool  // a Net relay is leased before the other relays
 		tmuxFails   bool
+		ended       bool // the context the detach is handed has ended
 		wantChanges []string
 		wantErr     bool
+		wantEnded   bool // the error carries the context's
 	}{
 		{
 			name:        "a worker remains",
@@ -606,6 +608,20 @@ func TestDetach(t *testing.T) {
 			tmuxFails:   true,
 			wantChanges: []string{"pause " + ws},
 			wantErr:     true,
+		},
+		{
+			name:        "the workers cannot be read once the context has ended",
+			sessions:    map[string]*tmuxSession{},
+			tmuxFails:   true,
+			ended:       true,
+			wantChanges: []string{"pause " + ws},
+			wantErr:     true,
+			wantEnded:   true,
+		},
+		{
+			name:        "nothing fails once the context has ended",
+			ended:       true,
+			wantChanges: []string{"flush " + ws, "terminate " + ws},
 		},
 		{
 			name:        "another workspace's relay, whose worker runs",
@@ -636,7 +652,7 @@ func TestDetach(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			f := newFake(syncsOf(append([]rel{{local: api, remote: apiR}}, tc.leased...)...), tc.sessions)
-			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{})
+			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{}, unbounded)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
@@ -652,9 +668,17 @@ func TestDetach(t *testing.T) {
 			}
 			f.changes()
 			f.tmuxFails = tc.tmuxFails
-			err = w.Detach(ctx)
+			detachCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			if tc.ended {
+				cancel()
+			}
+			err = w.Detach(detachCtx)
 			if (err != nil) != tc.wantErr {
 				t.Errorf("Detach: %v, want error %v", err, tc.wantErr)
+			}
+			if errors.Is(err, context.Canceled) != tc.wantEnded {
+				t.Errorf("Detach: %v, want the context's error %v", err, tc.wantEnded)
 			}
 			if got := f.changes(); !reflect.DeepEqual(got, tc.wantChanges) {
 				t.Errorf("changes %q, want %q", got, tc.wantChanges)
@@ -726,13 +750,13 @@ func TestClose(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			f := newFake(syncsOf(rel{local: api, remote: apiR}), tc.sessions)
-			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{})
+			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{}, unbounded)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
 			f.changes()
 			f.tmuxFails = tc.tmuxFails
-			err = w.Close(ctx, key(t, tc.key))
+			err = w.Close(ctx, key(t, tc.key), unbounded)
 			if (err != nil) != tc.wantErr {
 				t.Errorf("Close: %v, want error %v", err, tc.wantErr)
 			}
@@ -890,7 +914,7 @@ func TestAttach(t *testing.T) {
 				}
 				defer func() { _ = lease.Release(ctx) }()
 			}
-			w, err := Open(ctx, f.remote(), local, api, Worktree{})
+			w, err := Open(ctx, f.remote(), local, api, Worktree{}, unbounded)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
@@ -936,7 +960,7 @@ func TestJoin(t *testing.T) {
 				}
 				defer func() { _ = lease.Release(ctx) }()
 			}
-			w, err := Open(ctx, f.remote(), local, api, Worktree{})
+			w, err := Open(ctx, f.remote(), local, api, Worktree{}, unbounded)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
@@ -980,7 +1004,7 @@ func TestEnd(t *testing.T) {
 				sessions["hermod-a"] = tagged(ws, tc.state)
 			}
 			f := newFake(syncsOf(rel{local: api, remote: apiR}), sessions)
-			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{})
+			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{}, unbounded)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
@@ -1025,7 +1049,7 @@ func TestLookAndFreePort(t *testing.T) {
 				sessions["hermod-a"] = tagged(ws, tc.state)
 			}
 			f := newFake(syncsOf(rel{local: api, remote: apiR}), sessions)
-			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{})
+			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{}, unbounded)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
@@ -1111,7 +1135,7 @@ func TestHost(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			f := newFake(nil, nil)
-			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{})
+			w, err := Open(ctx, f.remote(), testLocal(t), api, Worktree{}, unbounded)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}

@@ -7,6 +7,7 @@ import (
 	"log"
 
 	"github.com/zerlok/hermod/internal/agent"
+	"github.com/zerlok/hermod/internal/workspace"
 )
 
 // sessionContext is what a session's states work on besides the state itself.
@@ -20,6 +21,8 @@ type sessionContext struct {
 	acp     agent.ACP
 	log     *log.Logger
 	call    callFunc
+	// teardown starts the context of a detach the session makes itself.
+	teardown workspace.Teardown
 	// clientReturns and adapterReturns bring a call's return back into the
 	// loop, in order with the messages of the connection it was made on.
 	clientReturns, adapterReturns func(event)
@@ -113,6 +116,9 @@ type sessionDeps struct {
 	call    callFunc
 	post    func(event)     // the loop's own way in, which the client's returns take
 	running context.Context // the router's, which the kept Connect is called under
+	// teardown starts the context of a detach that ends a session during the
+	// run, which a signal that ends the run does not cut.
+	teardown workspace.Teardown
 }
 
 // newSession is the session of dir on att, whose adapter's returns come back
@@ -131,6 +137,7 @@ func newSession(dir Path, att Attachment, deps sessionDeps, connect Message, ada
 		acp:            deps.acp,
 		log:            deps.log,
 		call:           deps.call,
+		teardown:       deps.teardown,
 		clientReturns:  deps.post,
 		adapterReturns: adapterReturns,
 		chats:          map[ChatID]*ChatControl{},
@@ -335,15 +342,22 @@ func (st sessionAttached) Located(_ SessionSM, s *sessionContext, id ChatID, sta
 	return nil
 }
 
+// Detach gives the workspace up within ctx, the teardown of whoever holds the
+// session.
 func (st sessionAttached) Detach(ctx context.Context, sm SessionSM, s *sessionContext) error {
-	return st.detach(ctx, sm, s)
+	return st.gaveUp(sm, s, s.Workspace.Detach(ctx))
 }
 
-// detach gives the workspace up, and only then is the session Detached: one
-// whose workspace could not be detached still holds it. The adapter and the
-// chats it runs go on.
-func (st sessionAttached) detach(ctx context.Context, sm SessionSM, s *sessionContext) error {
-	if err := s.Workspace.Detach(ctx); err != nil {
+// detach gives the workspace up within a teardown started for it. The adapter
+// and the chats it runs go on.
+func (st sessionAttached) detach(_ context.Context, sm SessionSM, s *sessionContext) error {
+	return st.gaveUp(sm, s, s.teardown.Detach(s.Workspace))
+}
+
+// gaveUp is Detached only for a workspace given up: one whose workspace could
+// not be detached still holds it.
+func (sessionAttached) gaveUp(sm SessionSM, s *sessionContext, err error) error {
+	if err != nil {
 		return err
 	}
 	return s.leave(sm)
@@ -365,7 +379,7 @@ func (st sessionAttached) end(ctx context.Context, sm SessionSM, s *sessionConte
 	if err != nil {
 		return errors.Join(err, st.detach(ctx, sm, s))
 	}
-	if err := s.Workspace.Close(ctx, key); err != nil {
+	if err := s.Workspace.Close(ctx, key, s.teardown); err != nil {
 		return err
 	}
 	return s.leave(sm)

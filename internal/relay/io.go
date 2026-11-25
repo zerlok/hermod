@@ -109,7 +109,7 @@ func (r *IO) serve(ctx context.Context) (*serving, error) {
 		srv.run(func() error { return ended(errEx.Wait()) })
 		srv.run(func() error { return feed(ctx, r.input, inEx) })
 	default:
-		srv.stop()
+		_ = srv.stop(ctx)
 		return nil, fmt.Errorf("relay: unhandled stdio %T", r.remote)
 	}
 	return srv, nil

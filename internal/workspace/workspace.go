@@ -288,7 +288,10 @@ func covering(all []found, dir string, keep func(found) bool) (found, bool) {
 // both sides before anything works on them, and fixes the path map for the
 // run. A relay whose two ends another workspace joined already is leased
 // rather than made twice, since a relay is named after its ends.
-func Open(ctx context.Context, remote Remote, local Local, dir string, tree Worktree) (*Workspace, error) {
+//
+// When that connect or flush fails, Open gives up what it leased so far
+// within a context teardown starts.
+func Open(ctx context.Context, remote Remote, local Local, dir string, tree Worktree, teardown Teardown) (*Workspace, error) {
 	if err := absolute(dir, remote.Home, local.Home); err != nil {
 		return nil, err
 	}
@@ -343,7 +346,7 @@ func Open(ctx context.Context, remote Remote, local Local, dir string, tree Work
 		}
 	}
 	if err := w.addFS(ctx, holder.name, holder.workspace, holder.roots); err != nil {
-		return nil, errors.Join(err, w.Detach(ctx))
+		return nil, errors.Join(err, teardown.Detach(w))
 	}
 	places := []pathmap.Place{w.root, holder.place}
 	for _, f := range all {
@@ -704,8 +707,9 @@ func (w *Workspace) hold(h held) {
 // releases it with none left. A relay leased from another workspace is kept by
 // that workspace's workers, not by this one's. The FS relays go last, each
 // kind in the reverse order of taking, so what the others carried is flushed
-// with them. Every error met is returned together, and the leases are given up
-// all the same.
+// with them, within ctx, which bounds the caller's teardown. Every error met
+// is returned together, and the leases are given up all the same. A detach
+// that failed once ctx ended returns ctx's error too: the end cut it.
 func (w *Workspace) Detach(ctx context.Context) error {
 	w.mu.Lock()
 	leases := w.held
@@ -714,10 +718,6 @@ func (w *Workspace) Detach(ctx context.Context) error {
 	if len(leases) == 0 {
 		return nil
 	}
-	// A detach runs when its caller ends, often because its context did; the
-	// leases are given up all the same, or a relay would stay Connected with
-	// nobody behind it.
-	ctx = context.WithoutCancel(ctx)
 	var errs []error
 	remain := map[string]bool{}
 	for _, h := range leases {
@@ -740,7 +740,21 @@ func (w *Workspace) Detach(ctx context.Context) error {
 			}
 		}
 	}
-	return errors.Join(errs...)
+	if err := errors.Join(errs...); err != nil {
+		return errors.Join(err, ctx.Err())
+	}
+	return nil
+}
+
+// Teardown starts the context in which what a run holds is given up. Its
+// caller bounds it, so a detach never outlives what the caller decided.
+type Teardown func() (context.Context, context.CancelFunc)
+
+// Detach detaches w within a context t starts for it.
+func (t Teardown) Detach(w *Workspace) error {
+	ctx, cancel := t()
+	defer cancel()
+	return w.Detach(ctx)
 }
 
 // Look reads in one call the state of the worker under key and the named
@@ -787,22 +801,25 @@ func end(ctx context.Context, wk worker.Worker, state worker.State) error {
 	return fmt.Errorf("workspace: unhandled worker state %s", state)
 }
 
-// Close ends the worker under key and detaches: a Running worker is closed
-// with SIGHUP, an Exited one removed. The relays are connected first, so the
-// detach that follows cannot race another session's, and with another worker
-// left they stay, while with none they go. A worker already Absent has nothing
-// to close: only the leases this process holds are given up, as Detach does.
-func (w *Workspace) Close(ctx context.Context, key Key) error {
+// Close ends the worker under key and detaches within a context teardown
+// starts: a Running worker is closed with SIGHUP, an Exited one removed. The
+// relays are connected first, so the detach that follows cannot race another
+// session's, and with another worker left they stay, while with none they go.
+// A worker already Absent has nothing to close: only the leases this process
+// holds are given up, as Detach does.
+func (w *Workspace) Close(ctx context.Context, key Key, teardown Teardown) error {
+	return errors.Join(w.close(ctx, key), teardown.Detach(w))
+}
+
+// close ends the worker under key, its relays connected first.
+func (w *Workspace) close(ctx context.Context, key Key) error {
 	wk := worker.New(w.workerRemote(), key)
 	state, err := wk.State(ctx)
-	if err != nil {
-		return errors.Join(err, w.Detach(ctx))
-	}
-	if state == worker.Absent {
-		return w.Detach(ctx)
+	if err != nil || state == worker.Absent {
+		return err
 	}
 	if err := w.connect(ctx); err != nil {
-		return errors.Join(err, w.Detach(ctx))
+		return err
 	}
-	return errors.Join(end(ctx, wk, state), w.Detach(ctx))
+	return end(ctx, wk, state)
 }
