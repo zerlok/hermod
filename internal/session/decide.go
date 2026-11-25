@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/zerlok/hermod/internal/agent"
-	"github.com/zerlok/hermod/internal/worker"
+	"github.com/zerlok/hermod/internal/workspace"
 )
 
 // action is what a session does with its worker.
@@ -35,7 +35,7 @@ var ErrRunsOutside = errors.New("session: the conversation runs outside Hermod; 
 
 // states are the two states a session decides from.
 type states struct {
-	worker    worker.State
+	worker    workspace.WorkerState
 	runsAgent bool        // the worker runs one agent's conversation
 	agent     agent.State // that conversation's, when it does
 }
@@ -46,15 +46,15 @@ type states struct {
 // program refuses when there is nothing to.
 func decide(s states) (action, error) {
 	switch s.worker {
-	case worker.Absent, worker.Running, worker.Exited:
+	case workspace.WorkerAbsent, workspace.WorkerRunning, workspace.WorkerExited:
 	default:
 		return 0, fmt.Errorf("session: unhandled worker state %s", s.worker)
 	}
 	if !s.runsAgent {
 		switch s.worker {
-		case worker.Running:
+		case workspace.WorkerRunning:
 			return join, nil
-		case worker.Exited:
+		case workspace.WorkerExited:
 			return replace, nil
 		}
 		return start, nil
@@ -63,12 +63,12 @@ func decide(s states) (action, error) {
 	case agent.Running:
 		// An Exited worker's process has failed, so a conversation that runs
 		// all the same runs in another process, as with no worker at all.
-		if s.worker == worker.Running {
+		if s.worker == workspace.WorkerRunning {
 			return join, nil
 		}
 		return 0, ErrRunsOutside
 	case agent.Stopped:
-		if s.worker == worker.Absent {
+		if s.worker == workspace.WorkerAbsent {
 			return start, nil
 		}
 		return replace, nil

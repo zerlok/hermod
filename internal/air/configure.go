@@ -6,28 +6,30 @@ import (
 	"path/filepath"
 )
 
-// standInName is the name Air's terminal is given as its Claude executable:
-// hermod started under it runs as the stand-in.
-const standInName = "claude"
-
-// StandInPath is where `make install` puts the stand-in link by default, under
-// the user's data directory. It is off PATH, so a local claude stays the one a
-// shell finds.
-func StandInPath(dataHome string) string {
-	return filepath.Join(dataHome, "hermod", "bin", standInName)
+// StandInPath is where `make install` puts the stand-in link named name by
+// default, under the user's data directory. It is off PATH, so a local claude
+// stays the one a shell finds.
+func StandInPath(dataHome, name string) string {
+	return filepath.Join(dataHome, "hermod", "bin", name)
 }
 
 // Request is what `hermod air configure claude` registers, every value
 // resolved by the caller.
 type Request struct {
-	Home       string            // the user's home, which holds acp.json
-	DataHome   string            // the user's data directory, which holds the default stand-in link
-	Remote     string            // the remote the entry serves
-	Name       string            // the entry's name; "" is DefaultName
-	Hermod     string            // the hermod binary, an absolute path
-	Env        map[string]string // the entry's environment; empty writes none
-	SearchPath []string          // the directories of PATH, searched for the stand-in link
-	DryRun     bool              // build the entry and change nothing
+	Home     string // the user's home, which holds acp.json
+	DataHome string // the user's data directory, which holds the default stand-in link
+	Remote   string // the remote the entry serves
+	Name     string // the entry's name; "" is DefaultName
+	Hermod   string // the hermod binary, an absolute path
+	// ChatArgs are hermod's arguments before the remote that serve Air's
+	// chat, named by the caller, whose command line they are.
+	ChatArgs []string
+	// StandInName is the name of the stand-in link, under which hermod
+	// stands in for the agent program, named by the caller.
+	StandInName string
+	Env         map[string]string // the entry's environment; empty writes none
+	SearchPath  []string          // the directories of PATH, searched for the stand-in link
+	DryRun      bool              // build the entry and change nothing
 	// RemoteVariable is the variable Air's own environment sets to the remote
 	// for terminal mode, named by the caller.
 	RemoteVariable string
@@ -49,11 +51,15 @@ type Result struct {
 // the stand-in link, which is the installer's.
 func Configure(r Request) (Result, error) {
 	// Checked before anything is written, so a missing name cannot leave a
-	// registered entry with a "=<remote>" line nothing reads.
+	// registered entry with a "=<remote>" line nothing reads, or a link
+	// nothing finds.
 	if r.RemoteVariable == "" {
 		return Result{}, errors.New("terminal mode needs the name of the remote variable")
 	}
-	entry, err := NewEntry(r.Name, r.Remote, r.Hermod, r.Env)
+	if r.StandInName == "" {
+		return Result{}, errors.New("terminal mode needs the name of the stand-in link")
+	}
+	entry, err := NewEntry(r.Name, r.Remote, r.Hermod, r.ChatArgs, r.Env)
 	if err != nil {
 		return Result{}, err
 	}
@@ -82,9 +88,9 @@ func Configure(r Request) (Result, error) {
 func standInCandidates(r Request) []string {
 	links := make([]string, 0, len(r.SearchPath)+1)
 	for _, dir := range r.SearchPath {
-		links = append(links, filepath.Join(dir, standInName))
+		links = append(links, filepath.Join(dir, r.StandInName))
 	}
-	links = append(links, StandInPath(r.DataHome))
+	links = append(links, StandInPath(r.DataHome, r.StandInName))
 	absolute := links[:0]
 	for _, l := range links {
 		if filepath.IsAbs(l) {

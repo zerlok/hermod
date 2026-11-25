@@ -99,7 +99,7 @@ func fsLabels(host, workspace string) []relay.Label {
 
 // ConversationKey is the key of the worker that runs the agent's conversation
 // id, `hermod-<id>`.
-func ConversationKey(id string) (worker.Key, error) { return worker.NewKey(prefix + id) }
+func ConversationKey(id string) (Key, error) { return worker.NewKey(prefix + id) }
 
 // adapterKey is the key of the worker that runs the agent program's adapter
 // for workspace, `hermod-acp-<workspace>`: one per workspace.

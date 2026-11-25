@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/zerlok/hermod/internal/agent"
-	"github.com/zerlok/hermod/internal/worker"
 	"github.com/zerlok/hermod/internal/workspace"
 )
 
@@ -221,7 +220,7 @@ func (e *chatEnv) attach(ctx context.Context, dir Path) (Attachment, error) {
 	e.names[key.String()] = "acp:" + ws.Root()
 	_, runs := e.f.sessions[key.String()]
 	if !runs {
-		e.f.sessions[key.String()] = &tmuxSession{state: worker.Running, tags: map[string]string{"@hermod-workspace": ws.Name()}}
+		e.f.sessions[key.String()] = &tmuxSession{state: workspace.WorkerRunning, tags: map[string]string{"@hermod-workspace": ws.Name()}}
 	}
 	e.f.mu.Unlock()
 	return Attachment{

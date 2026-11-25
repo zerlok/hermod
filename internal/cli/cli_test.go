@@ -6,15 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/session"
-	"github.com/zerlok/hermod/internal/worker"
+	"github.com/zerlok/hermod/internal/shell"
+	"github.com/zerlok/hermod/internal/workspace"
 )
 
 // attachView is what an attach's request resolved, comparable in a table.
@@ -297,6 +301,8 @@ func TestACPResolves(t *testing.T) {
 // configureView is what an `air configure`'s request resolved.
 type configureView struct {
 	remote, name, hermod, dataHome string
+	chatArgs                       []string
+	standIn                        string
 	env                            map[string]string
 	searchPath                     []string
 	dryRun                         bool
@@ -305,7 +311,10 @@ type configureView struct {
 // TestConfigureResolves checks the request `air configure` hands Air's
 // adapter, and what it prints.
 func TestConfigureResolves(t *testing.T) {
-	base := configureView{remote: "prod-box", hermod: testHermod, dataHome: testHome + "/.local/share"}
+	base := configureView{
+		remote: "prod-box", hermod: testHermod, dataHome: testHome + "/.local/share",
+		chatArgs: []string{"air", "acp", "claude"}, standIn: "claude",
+	}
 	with := func(change func(v *configureView)) configureView {
 		v := base
 		change(&v)
@@ -353,6 +362,7 @@ func TestConfigureResolves(t *testing.T) {
 			req := r.configured[0]
 			got := configureView{
 				remote: req.Remote, name: req.Name, hermod: req.Hermod, dataHome: req.DataHome,
+				chatArgs: req.ChatArgs, standIn: req.StandInName,
 				env: req.Env, searchPath: req.SearchPath, dryRun: req.DryRun,
 			}
 			if !reflect.DeepEqual(got, tc.want) {
@@ -518,7 +528,7 @@ func TestAdapterLog(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			a, r := newApp(t, setup{env: tc.env, logFails: tc.logFails})
-			key, err := worker.NewKey(tc.key)
+			key, err := workspace.NewKey(tc.key)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -720,6 +730,204 @@ func TestReadOnce(t *testing.T) {
 			}
 			if calls != tc.wantCalls {
 				t.Errorf("read the file %d times, want %d", calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
+// TestAgentWiring checks which workstation each agent a command hands the
+// core asks: the agent that answers for the remote reaches it over ssh, and
+// the local one runs on this workstation.
+func TestAgentWiring(t *testing.T) {
+	const remote, local = "prod-box", "local"
+	attachAgent := func(r *recorder) agent.Agent { return r.attached[0].Agent }
+	attachLocal := func(r *recorder) agent.Agent { return r.attached[0].LocalAgent }
+	chatAgent := func(r *recorder) agent.Agent { return r.chats[0].Agent }
+	chatACP := func(r *recorder) agent.Agent {
+		a, ok := r.chats[0].ACP.(agent.Agent)
+		if !ok {
+			return nil
+		}
+		return a
+	}
+	cases := []struct {
+		name  string
+		argv  string
+		agent func(r *recorder) agent.Agent
+		want  string
+	}{
+		{"attach's agent", "hermod attach prod-box", attachAgent, remote},
+		{"attach's local agent", "hermod attach prod-box", attachLocal, local},
+		{"a dry run's agent still reads", "hermod attach prod-box -n", attachAgent, remote},
+		{"the stand-in's agent", "claude --version", attachAgent, remote},
+		{"the stand-in's local agent", "claude --version", attachLocal, local},
+		{"the chat's agent", "hermod air acp claude prod-box", chatAgent, remote},
+		{"the chat's ACP", "hermod air acp claude prod-box", chatACP, remote},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, r := newApp(t, setup{env: vars{envRemote: remote}, terminal: true})
+			if err := execute(context.Background(), a, strings.Fields(tc.argv)); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			ag := tc.agent(r)
+			if ag == nil {
+				t.Fatal("no agent handed in")
+			}
+			before := len(r.local.ran)
+			_, _ = ag.StateDir(context.Background(), testCwd)
+			ran := r.local.ran[before:]
+			if len(ran) != 1 {
+				t.Fatalf("ran %q, want one command", ran)
+			}
+			got := local
+			if words := strings.Fields(ran[0]); len(words) > 1 && words[0] == "ssh" && slices.Contains(words, remote) {
+				got = remote
+			}
+			if got != tc.want {
+				t.Errorf("asked %s by %q, want %s", got, ran[0], tc.want)
+			}
+		})
+	}
+}
+
+// TestHookWiring checks that attach hands the core Air's hook test.
+func TestHookWiring(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{"Air's endpoint", "http://127.0.0.1:63342/air/hooks/claude", true},
+		{"another loopback endpoint", "http://127.0.0.1:8080/hooks", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, r := newApp(t, setup{})
+			if err := execute(context.Background(), a, strings.Fields("hermod attach prod-box")); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			u, err := url.Parse(tc.url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := r.attached[0].IsHook(u); got != tc.want {
+				t.Errorf("IsHook(%s) = %v, want %v", tc.url, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestChatSerializer checks that the chat's client connection reads stdin
+// and answers on stdout with Air's serializer: Air's own messages arrive by
+// what they mean, and a method neither serializer knows never reaches the
+// core, a request being answered with method not found and a notification
+// only logged.
+func TestChatSerializer(t *testing.T) {
+	cases := []struct {
+		name    string
+		line    string
+		want    []session.Kind
+		wantOut string
+		wantLog string
+	}{
+		{
+			name: "Air's close of a tab",
+			line: `{"jsonrpc":"2.0","id":1,"method":"session/close","params":{"sessionId":"s1"}}`,
+			want: []session.Kind{session.Suspend},
+		},
+		{
+			name: "Air's archive",
+			line: `{"jsonrpc":"2.0","id":1,"method":"_session/archive","params":{"sessionId":"s1"}}`,
+			want: []session.Kind{session.Close},
+		},
+		{
+			name: "a standard message",
+			line: `{"jsonrpc":"2.0","id":1,"method":"session/list","params":{"cwd":"/home/me/dev/api"}}`,
+			want: []session.Kind{session.List},
+		},
+		{
+			name:    "a request of an unknown method",
+			line:    `{"jsonrpc":"2.0","id":1,"method":"_other/thing","params":{}}`,
+			wantOut: `{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found: no request \"_other/thing\" from the client"}}` + "\n",
+			wantLog: `dropped a line from the client: acp: method not found: no request "_other/thing" from the client` + "\n",
+		},
+		{
+			name:    "a notification of an unknown method",
+			line:    `{"jsonrpc":"2.0","method":"_other/thing","params":{}}`,
+			wantLog: `dropped a line from the client: acp: no notification "_other/thing" from the client` + "\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, r := newApp(t, setup{stdin: tc.line + "\n"})
+			if err := execute(context.Background(), a, strings.Fields("hermod air acp claude prod-box")); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if !reflect.DeepEqual(r.received, tc.want) {
+				t.Errorf("received %v, want %v", r.received, tc.want)
+			}
+			if got := r.stdout.String(); got != tc.wantOut {
+				t.Errorf("stdout %q, want %q", got, tc.wantOut)
+			}
+			if got := r.stderr.String(); got != tc.wantLog {
+				t.Errorf("stderr %q, want %q", got, tc.wantLog)
+			}
+		})
+	}
+}
+
+// TestChatNeedsACP checks that the chat is served only by an agent that
+// implements agent.ACP: another is refused before the core is handed a
+// request.
+func TestChatNeedsACP(t *testing.T) {
+	cases := []struct {
+		name       string
+		agent      func(exec shell.Executor) agent.Agent
+		wantErr    bool
+		wantCalled int
+	}{
+		{name: "Claude", agent: nil, wantErr: false, wantCalled: 1},
+		{name: "an agent without ACP", agent: func(shell.Executor) agent.Agent { return plainAgent{} }, wantErr: true, wantCalled: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, r := newApp(t, setup{agent: tc.agent})
+			err := execute(context.Background(), a, strings.Fields("hermod air acp claude prod-box"))
+			if (err != nil) != tc.wantErr {
+				t.Errorf("execute: %v, want an error: %t", err, tc.wantErr)
+			}
+			if got := r.called(); got != tc.wantCalled {
+				t.Errorf("handed the core %d requests, want %d", got, tc.wantCalled)
+			}
+		})
+	}
+}
+
+// TestEntryServesChat checks that the command an `air configure` entry runs is
+// the command that serves Air's chat, for the remote the entry names.
+func TestEntryServesChat(t *testing.T) {
+	cases := []struct {
+		name       string
+		argv       string
+		wantRemote string
+	}{
+		{"the remote as an argument", "hermod air configure claude prod-box", "prod-box"},
+		{"the remote from the environment", "hermod air configure claude", "dev-box"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, r := newApp(t, setup{env: vars{envRemote: "dev-box"}})
+			if err := execute(context.Background(), a, strings.Fields(tc.argv)); err != nil {
+				t.Fatalf("configure: %v", err)
+			}
+			req := r.configured[0]
+			entry := append(append([]string{req.Hermod}, req.ChatArgs...), req.Remote)
+			if err := execute(context.Background(), a, entry); err != nil {
+				t.Fatalf("the entry's command %q: %v", entry, err)
+			}
+			if len(r.chats) != 1 || r.chats[0].Remote.Host != tc.wantRemote {
+				t.Errorf("served %d chats, want one for %s", len(r.chats), tc.wantRemote)
 			}
 		})
 	}

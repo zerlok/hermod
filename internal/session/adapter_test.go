@@ -9,8 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zerlok/hermod/internal/relay"
-	"github.com/zerlok/hermod/internal/worker"
 	"github.com/zerlok/hermod/internal/workspace"
 )
 
@@ -58,10 +56,10 @@ type adapterConn struct {
 // the workspace detaches; and that a workspace that cannot be opened, or a
 // line stream another reader holds, connects nothing and leaves no lease.
 func TestAdaptersAttach(t *testing.T) {
-	stream := worker.LineStream.String()
+	stream := workspace.LineStream.String()
 	cases := []struct {
 		name      string
-		adapter   worker.State
+		adapter   workspace.WorkerState
 		listFails bool
 		held      bool // another attach holds the adapter's line stream
 		waits     bool // the line stream serves until the workspace detaches
@@ -73,25 +71,25 @@ func TestAdaptersAttach(t *testing.T) {
 		wantJoins   []string
 		wantChanges []string
 	}{
-		{"no adapter: start", worker.Absent, false, false, false, nil, true, stream, []string{stream}, []string{
+		{"no adapter: start", workspace.WorkerAbsent, false, false, false, nil, true, stream, []string{stream}, []string{
 			"create " + api, "flush " + api,
 			"write env", "start in " + apiR + " " + adapterWord,
 		}},
-		{"exited adapter: remove, then start", worker.Exited, false, false, false, nil, true, stream, []string{stream}, []string{
+		{"exited adapter: remove, then start", workspace.WorkerExited, false, false, false, nil, true, stream, []string{stream}, []string{
 			"create " + api, "flush " + api,
 			"remove " + adapterWord,
 			"write env", "start in " + apiR + " " + adapterWord,
 		}},
-		{"running adapter: join", worker.Running, false, false, false, nil, false, "", []string{stream}, []string{
+		{"running adapter: join", workspace.WorkerRunning, false, false, false, nil, false, "", []string{stream}, []string{
 			"create " + api, "flush " + api,
 		}},
-		{"running adapter, detached while it serves", worker.Running, false, false, true, nil, false, "", []string{stream}, []string{
+		{"running adapter, detached while it serves", workspace.WorkerRunning, false, false, true, nil, false, "", []string{stream}, []string{
 			"create " + api, "flush " + api,
 		}},
-		{"relays that cannot be read", worker.Absent, true, false, false, errAny, false, "", nil, nil},
+		{"relays that cannot be read", workspace.WorkerAbsent, true, false, false, errAny, false, "", nil, nil},
 		// The holder's detach pausing the files shows the refused attach left
 		// no lease of its own on them.
-		{"a line stream another reader holds", worker.Running, false, true, true, relay.ErrInUse, false, "", []string{stream}, []string{
+		{"a line stream another reader holds", workspace.WorkerRunning, false, true, true, workspace.ErrInUse, false, "", []string{stream}, []string{
 			"create " + api, "flush " + api,
 			"flush " + api,
 			"pause " + api,
@@ -104,7 +102,7 @@ func TestAdaptersAttach(t *testing.T) {
 			f := newFake()
 			f.listFails = tc.listFails
 			f.streamWaits = tc.waits
-			if tc.adapter != worker.Absent {
+			if tc.adapter != workspace.WorkerAbsent {
 				f.sessions[key] = &tmuxSession{state: tc.adapter}
 			}
 			local := testLocal(t)
@@ -219,7 +217,7 @@ func TestAdaptersErrors(t *testing.T) {
 			key := adapterKeyOf(t, api)
 			f := newFake()
 			f.adapterSays = says
-			f.sessions[key] = &tmuxSession{state: worker.Running}
+			f.sessions[key] = &tmuxSession{state: workspace.WorkerRunning}
 			var (
 				logged strings.Builder
 				opened = map[string]*errLog{}
@@ -236,7 +234,7 @@ func TestAdaptersErrors(t *testing.T) {
 				Log: log.New(&logged, "", 0),
 			}
 			if tc.errors {
-				adapters.Errors = func(k worker.Key) (io.WriteCloser, error) {
+				adapters.Errors = func(k workspace.Key) (io.WriteCloser, error) {
 					if tc.openFails {
 						return nil, errors.New("error log: read-only file system")
 					}

@@ -8,17 +8,17 @@ import (
 	"log"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/zerlok/hermod/internal/acp"
+	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/air"
 	"github.com/zerlok/hermod/internal/claude"
 	"github.com/zerlok/hermod/internal/env"
 	"github.com/zerlok/hermod/internal/git"
-	"github.com/zerlok/hermod/internal/relay"
 	"github.com/zerlok/hermod/internal/session"
 	"github.com/zerlok/hermod/internal/shell"
-	"github.com/zerlok/hermod/internal/worker"
 	"github.com/zerlok/hermod/internal/workspace"
 )
 
@@ -97,7 +97,7 @@ func (a app) runAttach(ctx context.Context, in attachIntent, out attachOutput) e
 		Forwards:   in.forwards,
 		Environ:    env.Environ(a.environ()),
 		Identity:   session.Identity{Name: identity.Name, Email: identity.Email},
-		Streams:    relay.Streams{In: a.stdin, Out: a.stdout, Err: a.stderr},
+		Streams:    workspace.Streams{In: a.stdin, Out: a.stdout, Err: a.stderr},
 		Log:        log.New(out.logs, "", 0),
 	})
 }
@@ -113,14 +113,18 @@ func (a app) runChat(ctx context.Context, host string) error {
 	if err != nil {
 		return err
 	}
+	ag := a.remoteAgent(host)
+	chats, ok := ag.(agent.ACP)
+	if !ok {
+		return fmt.Errorf("agent %s serves no chat client", agentClaude)
+	}
 	logger := log.New(a.stderr, "", 0)
 	serializer := air.NewSerializer()
 	connections := acp.NewAdapters[session.Path](serializer, logger)
-	ag := a.remoteAgent(host)
 	adapters := session.Adapters{
 		Remote:  remote,
 		Local:   a.workspaceLocal(l.home, nil),
-		Agent:   ag,
+		Agent:   chats,
 		Environ: env.Environ(a.environ()),
 		Identity: func(ctx context.Context, dir string) session.Identity {
 			id := git.Read(ctx, a.local, dir)
@@ -140,7 +144,7 @@ func (a app) runChat(ctx context.Context, host string) error {
 	return a.chat(ctx, session.ChatRequest{
 		Client: client,
 		Agent:  ag,
-		ACP:    ag,
+		ACP:    chats,
 		Remote: remote,
 		Local:  adapters.Local,
 		Attach: adapters.Attach,
@@ -151,8 +155,8 @@ func (a app) runChat(ctx context.Context, host string) error {
 // adapterLog opens the log of an adapter's stderr, by the adapter's key, as
 // the stand-in's session is logged by its worker: the process's stderr is
 // Air's, and serves every adapter at once.
-func (a app) adapterLog(home string) func(key worker.Key) (io.WriteCloser, error) {
-	return func(key worker.Key) (io.WriteCloser, error) {
+func (a app) adapterLog(home string) func(key workspace.Key) (io.WriteCloser, error) {
+	return func(key workspace.Key) (io.WriteCloser, error) {
 		f, err := a.openLog(filepath.Join(logDir(home, a.lookupEnv), key.String()+".log"))
 		if err != nil {
 			return nil, err
@@ -194,6 +198,8 @@ func (a app) runConfigure(in configureIntent, out io.Writer) error {
 		Remote:         in.remote,
 		Name:           in.name,
 		Hermod:         hermod,
+		ChatArgs:       slices.Clone(chatArgs),
+		StandInName:    claude.Program,
 		Env:            entryEnv,
 		SearchPath:     searchPath,
 		DryRun:         in.dryRun,
@@ -228,16 +234,20 @@ func (a app) remoteReader(host string) shell.Executor {
 	return shell.NewLogin(shell.NewSSH(a.local, host))
 }
 
-// remoteAgent is Claude answering for the remote host, asked through the
-// remote's reader.
-func (a app) remoteAgent(host string) claude.Agent {
-	return claude.New(claude.Config{Exec: a.remoteReader(host), ReadFile: a.readFile})
+// claudeAgent builds Claude answering through an executor, reading this
+// workstation's files with readFile.
+func claudeAgent(readFile func(name string) ([]byte, error)) func(exec shell.Executor) agent.Agent {
+	return func(exec shell.Executor) agent.Agent {
+		return claude.New(claude.Config{Exec: exec, ReadFile: readFile})
+	}
 }
 
-// localAgent is Claude answering for this workstation.
-func (a app) localAgent() claude.Agent {
-	return claude.New(claude.Config{Exec: a.local, ReadFile: a.readFile})
-}
+// remoteAgent is the agent answering for the remote host, asked through the
+// remote's reader.
+func (a app) remoteAgent(host string) agent.Agent { return a.newAgent(a.remoteReader(host)) }
+
+// localAgent is the agent answering for this workstation.
+func (a app) localAgent() agent.Agent { return a.newAgent(a.local) }
 
 // workspaceLocal is this workstation as a workspace needs it, its FS relays
 // writing Mutagen's output to setup as well when it is not nil.

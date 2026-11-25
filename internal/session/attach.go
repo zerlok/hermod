@@ -22,10 +22,8 @@ import (
 	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/env"
 	"github.com/zerlok/hermod/internal/pathmap"
-	"github.com/zerlok/hermod/internal/relay"
 	"github.com/zerlok/hermod/internal/secret"
 	"github.com/zerlok/hermod/internal/shell"
-	"github.com/zerlok/hermod/internal/worker"
 	"github.com/zerlok/hermod/internal/workspace"
 )
 
@@ -57,7 +55,7 @@ type Request struct {
 
 	Environ  env.Vars // the caller's environment, of which a worker gets only what its agent declares
 	Identity Identity
-	Streams  relay.Streams
+	Streams  workspace.Streams
 
 	Log    *log.Logger // nil discards
 	Random io.Reader   // hook tokens and ports; nil is crypto/rand
@@ -151,7 +149,7 @@ func Attach(ctx context.Context, req Request) error {
 		invocation, id = req.Agent.Classify(req.Args)
 	}
 	var (
-		key worker.Key
+		key workspace.Key
 		err error
 	)
 	switch invocation {
@@ -160,7 +158,7 @@ func Attach(ctx context.Context, req Request) error {
 	case agent.InvokesConversation:
 		key, err = workspace.ConversationKey(id)
 	case agent.InvokesCommand:
-		key, err = worker.NewKey(req.Name)
+		key, err = workspace.NewKey(req.Name)
 	default:
 		return fmt.Errorf("session: unhandled invocation %s", invocation)
 	}
@@ -180,7 +178,7 @@ func Attach(ctx context.Context, req Request) error {
 
 // run is a session on an opened workspace, up to the end of its attach; id is
 // the conversation's, "" for a command no agent runs.
-func run(ctx context.Context, req Request, ws *workspace.Workspace, id string, key worker.Key) error {
+func run(ctx context.Context, req Request, ws *workspace.Workspace, id string, key workspace.Key) error {
 	seen, err := ws.Look(ctx, key, portFile, tokenFile, routesFile)
 	if err != nil {
 		return err
@@ -218,13 +216,13 @@ func run(ctx context.Context, req Request, ws *workspace.Workspace, id string, k
 		aimed = rejoinHooks(ctx, req, ws, seen)
 	}
 	addNets(ctx, req, ws, aimed)
-	return left(ctx, ws.Attach(ctx, key, worker.Terminal, req.Streams))
+	return left(ctx, ws.Attach(ctx, key, workspace.Terminal, req.Streams))
 }
 
 // carryOut carries out a decision on the worker of key: a join leaves it as it
 // runs, a replace ends it and then starts it with begin, and a start starts it
 // with begin.
-func carryOut(ctx context.Context, ws *workspace.Workspace, key worker.Key, act action, begin func() error) error {
+func carryOut(ctx context.Context, ws *workspace.Workspace, key workspace.Key, act action, begin func() error) error {
 	switch act {
 	case join:
 		return nil
@@ -245,7 +243,7 @@ func carryOut(ctx context.Context, ws *workspace.Workspace, key worker.Key, act 
 // read from its context, not from the error: the signal also kills the
 // relays' processes, and the attach may return one of their failures instead.
 func left(ctx context.Context, err error) error {
-	if ctx.Err() != nil || errors.Is(err, relay.ErrLeft) || errors.Is(err, relay.ErrEnded) {
+	if ctx.Err() != nil || errors.Is(err, workspace.ErrLeft) || errors.Is(err, workspace.ErrEnded) {
 		return nil
 	}
 	return err
@@ -258,10 +256,10 @@ func left(ctx context.Context, err error) error {
 // Host, its hooks aimed at the client; a command no agent runs is executed on
 // the Host as given. It returns the hooks the agent's settings call, nil for
 // none.
-func startWorker(ctx context.Context, req Request, ws *workspace.Workspace, key worker.Key, id string) (*hooks, error) {
+func startWorker(ctx context.Context, req Request, ws *workspace.Workspace, key workspace.Key, id string) (*hooks, error) {
 	dir := ws.PathMap().ToRemote(req.Dir)
 	if id == "" {
-		host := ws.Host(key, worker.Terminal, identityRecord(req.Identity))
+		host := ws.Host(key, workspace.Terminal, identityRecord(req.Identity))
 		return nil, host.Exec(ctx, shell.Command{Args: req.Args, Dir: dir}).Wait()
 	}
 	if req.LocalAgent == nil {
@@ -283,7 +281,7 @@ func startWorker(ctx context.Context, req Request, ws *workspace.Workspace, key 
 		return nil, err
 	}
 	a := newAimer(req, client, func() (workerHook, error) { return newWorkerHook(ctx, req, ws) })
-	host := ws.Host(key, worker.Terminal, a.record)
+	host := ws.Host(key, workspace.Terminal, a.record)
 	if err := req.Agent.Start(ctx, host, launch(req, ws, a.aim)); err != nil {
 		return nil, err
 	}
@@ -296,7 +294,7 @@ func startWorker(ctx context.Context, req Request, ws *workspace.Workspace, key 
 // settings keep the port, token and routes they were started with. A worker
 // that records none, or settings that cannot be read now, run without the
 // hooks' Net relay.
-func rejoinHooks(ctx context.Context, req Request, ws *workspace.Workspace, seen worker.Look) *hooks {
+func rejoinHooks(ctx context.Context, req Request, ws *workspace.Workspace, seen workspace.Look) *hooks {
 	client, err := clientOf(ctx, req, ws)
 	if err != nil {
 		req.logger().Printf("no hooks: %v", err)
@@ -328,7 +326,7 @@ func identityRecord(id Identity) func() (workspace.Record, error) {
 }
 
 // readHook is the hook a look found recorded in the worker's directory.
-func readHook(seen worker.Look) (recorded, bool) {
+func readHook(seen workspace.Look) (recorded, bool) {
 	portFound, okPort := seen.File(portFile)
 	tokenFound, okToken := seen.File(tokenFile)
 	routesFound, okRoutes := seen.File(routesFile)

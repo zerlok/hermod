@@ -74,7 +74,7 @@ func (m Members) State() State {
 
 // Worker is the state of the worker under key, Absent when the workspace has
 // none.
-func (m Members) Worker(key worker.Key) worker.State {
+func (m Members) Worker(key Key) WorkerState {
 	for _, w := range m.Workers {
 		if w.Worker.Key() == key {
 			return w.State
@@ -423,7 +423,7 @@ func (w *Workspace) Nested() []pathmap.Place { return append([]pathmap.Place(nil
 
 // AdapterKey is the key of the worker that runs the agent program's adapter
 // for this workspace.
-func (w *Workspace) AdapterKey() (worker.Key, error) { return adapterKey(w.name) }
+func (w *Workspace) AdapterKey() (Key, error) { return adapterKey(w.name) }
 
 // State reads the workspace's members: its FS relays from Mutagen and its
 // workers from tmux.
@@ -536,7 +536,7 @@ type File struct {
 // command's, so the command's streams are left unused. record is read when the
 // command executes, so it holds what the start's own command has decided by
 // then; an error from it fails the start before anything changes.
-func (w *Workspace) Host(key worker.Key, form worker.Form, record func() (Record, error)) shell.Executor {
+func (w *Workspace) Host(key Key, form Form, record func() (Record, error)) shell.Executor {
 	return host{w: w, key: key, form: form, record: record}
 }
 
@@ -583,8 +583,8 @@ func (h host) start(ctx context.Context, cmd shell.Command) error {
 // worker's stdio in form and streams, and returns when that relay or an FS
 // relay stops serving, with why, or when ctx ends. The leases stay held for
 // Detach. A line stream has one reader: while another lease holds its relay
-// the attach fails with relay.ErrInUse.
-func (w *Workspace) Attach(ctx context.Context, key worker.Key, form worker.Form, streams relay.Streams) error {
+// the attach fails with ErrInUse.
+func (w *Workspace) Attach(ctx context.Context, key Key, form Form, streams Streams) error {
 	wait, err := w.Join(ctx, key, form, streams)
 	if err != nil {
 		return err
@@ -596,7 +596,7 @@ func (w *Workspace) Attach(ctx context.Context, key worker.Key, form worker.Form
 // once they are connected, and wait returns when Attach would. A refused or
 // failed connect is Join's own error, so the caller learns it before it
 // hands the streams to anyone.
-func (w *Workspace) Join(ctx context.Context, key worker.Key, form worker.Form, streams relay.Streams) (wait func() error, err error) {
+func (w *Workspace) Join(ctx context.Context, key Key, form Form, streams Streams) (wait func() error, err error) {
 	if err := w.connect(ctx); err != nil {
 		return nil, err
 	}
@@ -745,7 +745,7 @@ func (w *Workspace) Detach(ctx context.Context) error {
 
 // Look reads in one call the state of the worker under key and the named
 // files of its directory.
-func (w *Workspace) Look(ctx context.Context, key worker.Key, files ...string) (worker.Look, error) {
+func (w *Workspace) Look(ctx context.Context, key Key, files ...string) (Look, error) {
 	return worker.New(w.workerRemote(), key).Look(ctx, nil, files...)
 }
 
@@ -759,7 +759,7 @@ func (w *Workspace) FreePort(ctx context.Context, record string, candidates []in
 // a caller that starts another worker under the same key next: a Running
 // worker is closed with SIGHUP, an Exited one removed, and an Absent one has
 // nothing to end.
-func (w *Workspace) End(ctx context.Context, key worker.Key) error {
+func (w *Workspace) End(ctx context.Context, key Key) error {
 	wk := worker.New(w.workerRemote(), key)
 	state, err := wk.State(ctx)
 	if err != nil {
@@ -792,7 +792,7 @@ func end(ctx context.Context, wk worker.Worker, state worker.State) error {
 // detach that follows cannot race another session's, and with another worker
 // left they stay, while with none they go. A worker already Absent has nothing
 // to close: only the leases this process holds are given up, as Detach does.
-func (w *Workspace) Close(ctx context.Context, key worker.Key) error {
+func (w *Workspace) Close(ctx context.Context, key Key) error {
 	wk := worker.New(w.workerRemote(), key)
 	state, err := wk.State(ctx)
 	if err != nil {

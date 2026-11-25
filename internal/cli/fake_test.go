@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/air"
 	"github.com/zerlok/hermod/internal/session"
 	"github.com/zerlok/hermod/internal/shell"
@@ -109,8 +110,11 @@ func (m *memLog) Close() error { m.closed = true; return nil }
 // recorder records what the commands handed into the core, and what the
 // process wrote.
 type recorder struct {
-	attached   []session.Request
-	chats      []session.ChatRequest
+	attached []session.Request
+	chats    []session.ChatRequest
+	// received are the kinds of the messages the chat's client connection
+	// delivered while the core served it.
+	received   []session.Kind
 	configured []air.Request
 	logs       map[string]*memLog
 	stdout     bytes.Buffer
@@ -152,6 +156,11 @@ type setup struct {
 	// mutagenSays is written by the core, as an FS relay's Mutagen output,
 	// to the request's Output when it has one.
 	mutagenSays string
+	// stdin is what the process reads; a chat's core reads every message of
+	// it from the client's connection before it returns.
+	stdin string
+	// agent, when set, builds every agent in Claude's place.
+	agent func(exec shell.Executor) agent.Agent
 }
 
 func newApp(t *testing.T, s setup) (app, *recorder) {
@@ -159,7 +168,7 @@ func newApp(t *testing.T, s setup) (app, *recorder) {
 	r := &recorder{
 		logs:  map[string]*memLog{},
 		local: &workstation{remoteOut: testRemoteHome + "\n", answers: s.answers},
-		stdin: strings.NewReader(""),
+		stdin: strings.NewReader(s.stdin),
 	}
 	a := app{
 		attach: func(ctx context.Context, req session.Request) error {
@@ -174,11 +183,14 @@ func newApp(t *testing.T, s setup) (app, *recorder) {
 		},
 		chat: func(_ context.Context, req session.ChatRequest) error {
 			r.chats = append(r.chats, req)
+			for msg := range req.Client.Receive() {
+				r.received = append(r.received, msg.Kind())
+			}
 			return nil
 		},
 		configure: func(req air.Request) (air.Result, error) {
 			r.configured = append(r.configured, req)
-			entry, err := air.NewEntry(req.Name, req.Remote, req.Hermod, req.Env)
+			entry, err := air.NewEntry(req.Name, req.Remote, req.Hermod, req.ChatArgs, req.Env)
 			return air.Result{Entry: entry, RemoteLine: req.RemoteVariable + "=" + req.Remote}, err
 		},
 		local:      r.local,
@@ -189,7 +201,7 @@ func newApp(t *testing.T, s setup) (app, *recorder) {
 		lookupEnv:  s.env.lookup,
 		environ:    s.env.environ,
 		executable: func() (string, error) { return testHermod, nil },
-		readFile:   func(string) ([]byte, error) { return nil, errors.New("no file") },
+		newAgent:   claudeAgent(func(string) ([]byte, error) { return nil, errors.New("no file") }),
 		terminal:   func() bool { return s.terminal },
 		openLog: func(name string) (io.WriteCloser, error) {
 			if s.logFails {
@@ -200,12 +212,27 @@ func newApp(t *testing.T, s setup) (app, *recorder) {
 			return l, nil
 		},
 	}
+	if s.agent != nil {
+		a.newAgent = s.agent
+	}
 	a.stdin, a.stdout, a.stderr = r.stdin, &r.stdout, &r.stderr
 	if s.stderrGone {
 		a.stderr = goneWriter{}
 	}
 	return a, r
 }
+
+// plainAgent is an agent that serves no chat client: it implements no
+// agent.ACP. It answers nothing it is asked.
+type plainAgent struct{}
+
+func (plainAgent) Classify([]string) (agent.Invocation, string)               { return agent.InvokesCommand, "" }
+func (plainAgent) List(context.Context, string) ([]agent.Conversation, error) { return nil, nil }
+func (plainAgent) Lookup(context.Context, string) (agent.Conversation, error) {
+	return agent.Conversation{}, agent.ErrUnknown
+}
+func (plainAgent) Start(context.Context, shell.Executor, agent.Launch) error { return nil }
+func (plainAgent) StateDir(context.Context, string) (string, error)          { return "", nil }
 
 // called is how many requests the commands handed into the core.
 func (r *recorder) called() int { return len(r.attached) + len(r.chats) + len(r.configured) }

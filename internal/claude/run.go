@@ -291,7 +291,7 @@ func (r *rewriter) command() ([]string, []env.Pair) {
 		files = append([]file{{name: settingsFile, content: r.settings}}, files...)
 	}
 	if len(files) == 0 {
-		out := []string{"claude"}
+		out := []string{Program}
 		for _, w := range r.words {
 			out = append(out, w.text)
 		}
@@ -306,7 +306,7 @@ func (r *rewriter) command() ([]string, []env.Pair) {
 			"unset "+name)
 		vars = append(vars, env.Pair{Key: name, Value: env.Secret(f.content)})
 	}
-	exec := []string{"exec claude"}
+	exec := []string{"exec " + Program}
 	var params []string
 	for _, w := range r.words {
 		if w.file {
@@ -317,7 +317,7 @@ func (r *rewriter) command() ([]string, []env.Pair) {
 		exec = append(exec, `"${`+strconv.Itoa(len(params))+`}"`)
 	}
 	script = append(script, strings.Join(exec, " "))
-	return append([]string{"sh", "-c", strings.Join(script, "\n"), "claude"}, params...), vars
+	return append([]string{"sh", "-c", strings.Join(script, "\n"), Program}, params...), vars
 }
 
 // isInline reports whether an option's value is a JSON document rather than a

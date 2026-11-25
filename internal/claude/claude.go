@@ -36,6 +36,10 @@ var (
 	_ agent.ACP   = Agent{}
 )
 
+// Program is Claude Code's program name: the command a conversation runs, and
+// the base name of an argv that is Claude's.
+const Program = "claude"
+
 // New is Claude as cfg builds it.
 func New(cfg Config) Agent { return Agent{cfg: cfg} }
 
@@ -63,7 +67,7 @@ var oneShotSubcommands = map[string]bool{
 //   - Anything else, including `--resume` with no UUID (Claude's own picker),
 //     runs as given.
 func (Agent) Classify(argv []string) (agent.Invocation, string) {
-	if len(argv) == 0 || path.Base(argv[0]) != "claude" {
+	if len(argv) == 0 || path.Base(argv[0]) != Program {
 		return agent.InvokesCommand, ""
 	}
 	a := scan(argv[1:])

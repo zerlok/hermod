@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -26,10 +27,6 @@ func ACPPath(home string) string {
 // remote makes each remote its own agent in Air's picker.
 func DefaultName(remote string) string { return "Claude (" + remote + ")" }
 
-// acpArgs are the arguments before the remote that make hermod Air's chat
-// agent for Claude.
-var acpArgs = []string{"air", "acp", "claude"}
-
 // Entry is one agent in acp.json, built only by NewEntry.
 type Entry struct {
 	name string
@@ -42,11 +39,11 @@ type entryBody struct {
 	Env     map[string]string `json:"env,omitempty"`
 }
 
-// NewEntry is the entry that runs `hermod air acp claude <remote>`. hermod
-// must be an absolute path, since Air does not load the user's shell and could
-// find nothing by name. env is the entry's environment; with none, the entry
-// has no env member.
-func NewEntry(name, remote, hermod string, env map[string]string) (Entry, error) {
+// NewEntry is the entry that runs hermod with args and then remote, which
+// serves Air's chat from that remote. hermod must be an absolute path, since
+// Air does not load the user's shell and could find nothing by name. env is
+// the entry's environment; with none, the entry has no env member.
+func NewEntry(name, remote, hermod string, args []string, env map[string]string) (Entry, error) {
 	if strings.TrimSpace(remote) == "" {
 		return Entry{}, errors.New("an Air entry needs a remote")
 	}
@@ -56,8 +53,10 @@ func NewEntry(name, remote, hermod string, env map[string]string) (Entry, error)
 	if name == "" {
 		name = DefaultName(remote)
 	}
-	args := append(append([]string(nil), acpArgs...), remote)
-	body, err := marshal(entryBody{Command: hermod, Args: args, Env: env})
+	if len(args) == 0 {
+		return Entry{}, errors.New("an Air entry needs hermod's arguments")
+	}
+	body, err := marshal(entryBody{Command: hermod, Args: append(slices.Clone(args), remote), Env: env})
 	if err != nil {
 		return Entry{}, fmt.Errorf("encode the entry %q: %w", name, err)
 	}

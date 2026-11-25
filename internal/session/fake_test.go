@@ -16,7 +16,6 @@ import (
 	"github.com/zerlok/hermod/internal/pathmap"
 	"github.com/zerlok/hermod/internal/relay/relaytest"
 	"github.com/zerlok/hermod/internal/shell"
-	"github.com/zerlok/hermod/internal/worker"
 	"github.com/zerlok/hermod/internal/worker/workertest"
 	"github.com/zerlok/hermod/internal/workspace"
 )
@@ -46,7 +45,7 @@ type mutagenSession struct {
 
 // tmuxSession is one tmux session on the fake remote.
 type tmuxSession struct {
-	state worker.State
+	state workspace.WorkerState
 	tags  map[string]string
 }
 
@@ -302,7 +301,7 @@ func (f *fake) keep(c workertest.Command) play {
 		if _, ok := f.sessions[name]; ok {
 			return exitError(c.Refused)
 		}
-		f.sessions[name] = &tmuxSession{state: worker.Running, tags: c.Start.Tags}
+		f.sessions[name] = &tmuxSession{state: workspace.WorkerRunning, tags: c.Start.Tags}
 		f.dirs[c.Start.WorkerDir] = f.dirs[c.Start.Staging]
 		delete(f.dirs, c.Start.Staging)
 		f.forms[name] = c.Start.Form
@@ -317,7 +316,7 @@ func (f *fake) act(c workertest.Command) play {
 		switch c.Op {
 		case "attach":
 			f.mu.Lock()
-			f.joins = append(f.joins, worker.Terminal.String())
+			f.joins = append(f.joins, workspace.Terminal.String())
 			f.mu.Unlock()
 			return f.join(ctx)
 		case "feed", "log":
@@ -351,7 +350,7 @@ func (f *fake) act(c workertest.Command) play {
 						tags[o] = f.workspaceOf()
 					}
 				}
-				listed = append(listed, workertest.Listed{Name: name, Dead: s.state == worker.Exited, Tags: tags})
+				listed = append(listed, workertest.Listed{Name: name, Dead: s.state == workspace.WorkerExited, Tags: tags})
 			}
 			_, _ = io.WriteString(out, c.List(listed))
 		case "look":
@@ -370,14 +369,14 @@ func (f *fake) act(c workertest.Command) play {
 			_, _ = fmt.Fprintln(out, c.Ports[0])
 		case "close":
 			name := c.Session
-			if s, ok := f.sessions[name]; ok && s.state == worker.Exited {
+			if s, ok := f.sessions[name]; ok && s.state == workspace.WorkerExited {
 				return exitError(c.Refused)
 			}
 			delete(f.sessions, name)
 			f.record("close", name)
 		case "remove":
 			name := c.Session
-			if s, ok := f.sessions[name]; ok && s.state == worker.Running {
+			if s, ok := f.sessions[name]; ok && s.state == workspace.WorkerRunning {
 				return exitError(c.Refused)
 			}
 			delete(f.sessions, name)
@@ -407,7 +406,7 @@ func (f *fake) workspaceOf() string {
 func (f *fake) stream(ctx context.Context, op string) error {
 	f.mu.Lock()
 	if op == "feed" {
-		f.joins = append(f.joins, worker.LineStream.String())
+		f.joins = append(f.joins, workspace.LineStream.String())
 	}
 	waits := f.streamWaits
 	f.mu.Unlock()
@@ -452,8 +451,8 @@ func (f *fake) join(ctx context.Context) error {
 	return nil
 }
 
-func dead(s worker.State) string {
-	if s == worker.Exited {
+func dead(s workspace.WorkerState) string {
+	if s == workspace.WorkerExited {
 		return "1"
 	}
 	return "0"

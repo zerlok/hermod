@@ -19,13 +19,21 @@ const (
 
 const hermodRel = "go/bin/hermod"
 
+// The names a caller gives Configure: hermod's chat command, and the stand-in
+// link's name.
+var testChatArgs = []string{"air", "acp", "claude"}
+
+const testStandIn = "claude"
+
 func request(root string, mod func(*Request)) Request {
 	r := Request{
 		Home:     filepath.Join(root, "home"),
 		DataHome: filepath.Join(root, "home", ".local", "share"),
 		Remote:   "prod-box",
 		Hermod:   filepath.Join(root, hermodRel),
+		ChatArgs: testChatArgs,
 
+		StandInName:    testStandIn,
 		RemoteVariable: "HERMOD_REMOTE",
 	}
 	if mod != nil {
@@ -157,6 +165,8 @@ func TestConfigure(t *testing.T) {
 			wantMode: 0o600, wantLine: "AIR_REMOTE=prod-box",
 		},
 		{name: "no remote variable", layout: acpPlain, before: `{"k":1}`, req: func(r *Request) { r.RemoteVariable = "" }, wantErr: true, wantMode: 0o644},
+		{name: "no stand-in name", layout: acpPlain, before: `{"k":1}`, req: func(r *Request) { r.StandInName = "" }, wantErr: true, wantMode: 0o644},
+		{name: "no chat arguments", layout: acpPlain, before: `{"k":1}`, req: func(r *Request) { r.ChatArgs = nil }, wantErr: true, wantMode: 0o644},
 		{name: "not JSON", layout: acpPlain, before: `{"agent_servers":`, wantErr: true, wantMode: 0o644},
 		{name: "not an object", layout: acpPlain, before: `[1]`, wantErr: true, wantMode: 0o644},
 		{name: "null", layout: acpPlain, before: `null`, wantErr: true, wantMode: 0o644},
@@ -326,9 +336,9 @@ func TestConfigureFindsTheStandIn(t *testing.T) {
 			mustWrite(t, filepath.Join(root, "other"), "#!/bin/sh\n", 0o755)
 			places := map[standInPlace]string{
 				foundNone:       "",
-				foundFirstPath:  filepath.Join(first, standInName),
-				foundSecondPath: filepath.Join(second, standInName),
-				foundDefault:    StandInPath(req.DataHome),
+				foundFirstPath:  filepath.Join(first, testStandIn),
+				foundSecondPath: filepath.Join(second, testStandIn),
+				foundDefault:    StandInPath(req.DataHome, testStandIn),
 			}
 			put := map[string]candidate{places[foundFirstPath]: tc.firstPath, places[foundSecondPath]: tc.secondPath, places[foundDefault]: tc.atDefault}
 			for path, c := range put {
@@ -394,20 +404,27 @@ func TestEntry(t *testing.T) {
 		entry    string
 		remote   string
 		hermod   string
+		args     []string
 		env      map[string]string
 		wantName string
-		wantJSON string
+		wantJSON string // "" is refused
 	}{
-		{"default name", "", "prod-box", "/home/me/go/bin/hermod", nil, "Claude (prod-box)",
+		{"default name", "", "prod-box", "/home/me/go/bin/hermod", testChatArgs, nil, "Claude (prod-box)",
 			`{"Claude (prod-box)":{"command":"/home/me/go/bin/hermod","args":["air","acp","claude","prod-box"]}}`},
-		{"given name with origin", "Remote", "box-b", "/usr/local/bin/hermod", map[string]string{"HERMOD_ORIGIN": "laptop"}, "Remote",
+		{"given name with origin", "Remote", "box-b", "/usr/local/bin/hermod", testChatArgs, map[string]string{"HERMOD_ORIGIN": "laptop"}, "Remote",
 			`{"Remote":{"command":"/usr/local/bin/hermod","args":["air","acp","claude","box-b"],"env":{"HERMOD_ORIGIN":"laptop"}}}`},
+		{"the caller's own arguments", "", "prod-box", "/home/me/go/bin/hermod", []string{"serve"}, nil, "Claude (prod-box)",
+			`{"Claude (prod-box)":{"command":"/home/me/go/bin/hermod","args":["serve","prod-box"]}}`},
+		{"no arguments", "", "prod-box", "/home/me/go/bin/hermod", nil, nil, "", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			e, err := NewEntry(tc.entry, tc.remote, tc.hermod, tc.env)
+			e, err := NewEntry(tc.entry, tc.remote, tc.hermod, tc.args, tc.env)
+			if (err != nil) != (tc.wantJSON == "") {
+				t.Fatalf("NewEntry: %v, want refused %v", err, tc.wantJSON == "")
+			}
 			if err != nil {
-				t.Fatal(err)
+				return
 			}
 			if e.Name() != tc.wantName {
 				t.Errorf("Name() = %q, want %q", e.Name(), tc.wantName)

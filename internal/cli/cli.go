@@ -20,7 +20,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/air"
+	"github.com/zerlok/hermod/internal/claude"
 	"github.com/zerlok/hermod/internal/session"
 	"github.com/zerlok/hermod/internal/shell"
 )
@@ -50,9 +52,17 @@ const (
 // agentClaude is the one agent the `air` commands serve.
 const agentClaude = "claude"
 
-// standInName is the program name under which the binary stands in for
-// Claude.
-const standInName = "claude"
+// The words of the `air` commands, which the stand-in's message and Air's entry
+// repeat.
+const (
+	airCmd       = "air"
+	acpCmd       = "acp"
+	configureCmd = "configure"
+)
+
+// chatArgs is the command line that serves Air's chat: Air's entry runs it, and
+// the stand-in names it to a program that asks for a conversation.
+var chatArgs = []string{airCmd, acpCmd, agentClaude}
 
 // app holds what the commands read of the process and the use cases they
 // call, injected so a test runs no command and reads no real environment.
@@ -72,7 +82,8 @@ type app struct {
 	lookupEnv  func(key string) (string, bool)
 	environ    func() []string
 	executable func() (string, error)
-	readFile   func(name string) ([]byte, error)
+	// newAgent builds the agent that answers through exec.
+	newAgent func(exec shell.Executor) agent.Agent
 	// terminal reports whether the caller is on a terminal.
 	terminal func() bool
 	// openLog opens a log for appending, creating it private.
@@ -105,7 +116,7 @@ func Run() int {
 		local: shell.NewLocal(), dryRun: shell.NewDryRun,
 		cwd: os.Getwd, home: os.UserHomeDir, hostname: os.Hostname,
 		lookupEnv: os.LookupEnv, environ: os.Environ, executable: os.Executable,
-		readFile: readOnce(os.ReadFile),
+		newAgent: claudeAgent(readOnce(os.ReadFile)),
 		terminal: func() bool { return isTerminal(os.Stdin) && isTerminal(os.Stdout) },
 		openLog:  openLog,
 		stdin:    os.Stdin, stdout: os.Stdout, stderr: os.Stderr,
@@ -140,10 +151,11 @@ func readOnce(read func(name string) ([]byte, error)) func(name string) ([]byte,
 	}
 }
 
-// execute dispatches on the program name in argv[0]: started as claude, the
-// binary is the stand-in; under any other name it runs Hermod's command line.
+// execute dispatches on the program name in argv[0]: started under Claude's
+// program name, the binary is the stand-in; under any other name it runs
+// Hermod's command line.
 func execute(ctx context.Context, a app, argv []string) error {
-	if len(argv) > 0 && filepath.Base(argv[0]) == standInName {
+	if len(argv) > 0 && filepath.Base(argv[0]) == claude.Program {
 		return a.standIn(ctx, argv[1:])
 	}
 	cmd := newRootCmd(a)
@@ -239,14 +251,14 @@ func newAttachCmd(a app) *cobra.Command {
 
 func newAirCmd(a app) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "air",
+		Use:   airCmd,
 		Short: "Serve a remote's agent to JetBrains Air",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_ = cmd.Usage()
 			if len(args) > 0 {
 				return fmt.Errorf("unknown command %q for %q", args[0], cmd.CommandPath())
 			}
-			return errors.New("name a subcommand: configure or acp")
+			return errors.New("name a subcommand: " + configureCmd + " or " + acpCmd)
 		},
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -297,10 +309,10 @@ func agentRemote(cmd *cobra.Command, args []string, lookupEnv func(string) (stri
 
 func newACPCmd(a app) *cobra.Command {
 	return &cobra.Command{
-		Use:   "acp claude [REMOTE]",
+		Use:   acpCmd + " " + agentClaude + " [REMOTE]",
 		Short: "Serve Air's chats of every project from their workspaces on a remote",
 		Long: "Serve Air's chats of every project from their workspaces on a remote.\n\n" +
-			"This is what the entry `air configure` writes runs: it speaks ACP with Air on stdin and stdout,\n" +
+			"This is what the entry `" + airCmd + " " + configureCmd + "` writes runs: it speaks ACP with Air on stdin and stdout,\n" +
 			"and routes each chat to the adapter of its project's workspace. REMOTE is an ~/.ssh/config\n" +
 			"host alias, " + envRemote + " when none is given.",
 		SilenceUsage:      true,
@@ -323,7 +335,7 @@ func newConfigureCmd(a app) *cobra.Command {
 		dryRun       bool
 	)
 	cmd := &cobra.Command{
-		Use:   "configure claude [REMOTE] [flags]",
+		Use:   configureCmd + " " + agentClaude + " [REMOTE] [flags]",
 		Short: "Make a remote an agent in Air's chat, and print what Air's terminal mode needs",
 		Long: "Make a remote an agent in Air's chat, and print what Air's terminal mode needs.\n\n" +
 			"Merges one entry into Air's acp.json, keeping every other entry. REMOTE is an ~/.ssh/config\n" +

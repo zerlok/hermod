@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,12 +31,10 @@ func (a app) standIn(ctx context.Context, claudeArgs []string) (err error) {
 	if err != nil {
 		return err
 	}
-	args := append([]string{standInName}, claudeArgs...)
-	// Classifying reads only the arguments, so Claude built for no
-	// workstation does.
-	invocation, id := claude.New(claude.Config{}).Classify(args)
+	args := append([]string{claude.Program}, claudeArgs...)
+	invocation, id := a.localAgent().Classify(args)
 	if invocation != agent.InvokesOneShot && !a.terminal() {
-		return errors.New("a conversation runs on a terminal only; a program holds one through `hermod air acp " + agentClaude + "`")
+		return errors.New("a conversation runs on a terminal only; a program holds one through `hermod " + strings.Join(chatArgs, " ") + "`")
 	}
 	l, err := a.readLocal()
 	if err != nil {

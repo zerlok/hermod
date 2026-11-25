@@ -9,8 +9,6 @@ import (
 
 	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/env"
-	"github.com/zerlok/hermod/internal/relay"
-	"github.com/zerlok/hermod/internal/worker"
 	"github.com/zerlok/hermod/internal/workspace"
 )
 
@@ -38,7 +36,7 @@ type Adapters struct {
 
 	// Errors opens the log of what the adapter of key writes to its stderr.
 	// nil, or a log that cannot be opened, leaves those lines to Log.
-	Errors func(key worker.Key) (io.WriteCloser, error)
+	Errors func(key workspace.Key) (io.WriteCloser, error)
 
 	Log *log.Logger // nil discards
 }
@@ -83,7 +81,7 @@ func (a Adapters) attach(ctx context.Context, ws *workspace.Workspace, dir strin
 	}
 	logger.Printf("adapter %s: %s", key, act)
 	err = carryOut(ctx, ws, key, act, func() error {
-		host := ws.Host(key, worker.LineStream, identityRecord(a.Identity(ctx, dir)))
+		host := ws.Host(key, workspace.LineStream, identityRecord(a.Identity(ctx, dir)))
 		launch := agent.Launch{Dir: ws.Root(), Paths: ws.PathMap(), Environ: a.Environ}
 		return a.Agent.Adapter(ctx, host, launch)
 	})
@@ -94,7 +92,7 @@ func (a Adapters) attach(ctx context.Context, ws *workspace.Workspace, dir strin
 	errs, closeErrs := a.errors(key, logger)
 	toAdapter, input := io.Pipe()
 	output, fromAdapter := io.Pipe()
-	wait, err := ws.Join(ctx, key, worker.LineStream, relay.Streams{In: toAdapter, Out: fromAdapter, Err: errs})
+	wait, err := ws.Join(ctx, key, workspace.LineStream, workspace.Streams{In: toAdapter, Out: fromAdapter, Err: errs})
 	if err != nil {
 		closeErrs()
 		return Attachment{}, err
@@ -118,7 +116,7 @@ func (a Adapters) attach(ctx context.Context, ws *workspace.Workspace, dir strin
 // errors is where the adapter of key writes its stderr, and how to close it
 // once its relay has stopped. A log that cannot be opened costs only itself:
 // the lines go to logger instead.
-func (a Adapters) errors(key worker.Key, logger *log.Logger) (io.Writer, func()) {
+func (a Adapters) errors(key workspace.Key, logger *log.Logger) (io.Writer, func()) {
 	if a.Errors == nil {
 		return logger.Writer(), func() {}
 	}

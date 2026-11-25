@@ -19,7 +19,6 @@ import (
 	"github.com/zerlok/hermod/internal/pathmap"
 	"github.com/zerlok/hermod/internal/relay"
 	"github.com/zerlok/hermod/internal/secret"
-	"github.com/zerlok/hermod/internal/worker"
 	"github.com/zerlok/hermod/internal/workspace"
 )
 
@@ -76,63 +75,63 @@ func TestAttachDecides(t *testing.T) {
 		name        string
 		agent       bool   // the command is a conversation's
 		probe       string // what the agent program says of the conversation
-		worker      worker.State
+		worker      workspace.WorkerState
 		wantErr     error
 		wantChanges []string
 	}{
-		{"running conversation, running worker: attach", true, "running", worker.Running, nil, []string{
+		{"running conversation, running worker: attach", true, "running", workspace.WorkerRunning, nil, []string{
 			"create " + api, "flush " + api,
 			"pause " + api,
 		}},
-		{"running conversation, no worker: refuse", true, "running", worker.Absent, ErrRunsOutside, []string{
+		{"running conversation, no worker: refuse", true, "running", workspace.WorkerAbsent, ErrRunsOutside, []string{
 			"create " + api, "flush " + api,
 			"flush " + api, "terminate " + api,
 		}},
-		{"running conversation, exited worker: refuse", true, "running", worker.Exited, ErrRunsOutside, []string{
+		{"running conversation, exited worker: refuse", true, "running", workspace.WorkerExited, ErrRunsOutside, []string{
 			"create " + api, "flush " + api,
 			"pause " + api,
 		}},
-		{"stopped conversation, running worker: remove, then start", true, "stopped", worker.Running, nil, []string{
+		{"stopped conversation, running worker: remove, then start", true, "stopped", workspace.WorkerRunning, nil, []string{
 			"create " + api, "flush " + api,
 			"close " + convW,
 			"create " + transcripts.Local, "flush " + transcripts.Local,
 			"write env", "start in " + apiR + " " + convW,
 			"pause " + transcripts.Local, "pause " + api,
 		}},
-		{"stopped conversation, exited worker: remove, then start", true, "stopped", worker.Exited, nil, []string{
+		{"stopped conversation, exited worker: remove, then start", true, "stopped", workspace.WorkerExited, nil, []string{
 			"create " + api, "flush " + api,
 			"remove " + convW,
 			"create " + transcripts.Local, "flush " + transcripts.Local,
 			"write env", "start in " + apiR + " " + convW,
 			"pause " + transcripts.Local, "pause " + api,
 		}},
-		{"a conversation the program does not have yet, no worker: start", true, "", worker.Absent, nil, []string{
+		{"a conversation the program does not have yet, no worker: start", true, "", workspace.WorkerAbsent, nil, []string{
 			"create " + api, "flush " + api,
 			"create " + transcripts.Local, "flush " + transcripts.Local,
 			"write env", "start in " + apiR + " " + convW,
 			"pause " + transcripts.Local, "pause " + api,
 		}},
-		{"stopped conversation, no worker: start", true, "stopped", worker.Absent, nil, []string{
+		{"stopped conversation, no worker: start", true, "stopped", workspace.WorkerAbsent, nil, []string{
 			"create " + api, "flush " + api,
 			"create " + transcripts.Local, "flush " + transcripts.Local,
 			"write env", "start in " + apiR + " " + convW,
 			"pause " + transcripts.Local, "pause " + api,
 		}},
-		{"an unreadable answer of the agent program", true, "garbled", worker.Running, errAny, []string{
+		{"an unreadable answer of the agent program", true, "garbled", workspace.WorkerRunning, errAny, []string{
 			"create " + api, "flush " + api,
 			"pause " + api,
 		}},
-		{"no agent, running worker: attach", false, "", worker.Running, nil, []string{
+		{"no agent, running worker: attach", false, "", workspace.WorkerRunning, nil, []string{
 			"create " + api, "flush " + api,
 			"pause " + api,
 		}},
-		{"no agent, exited worker: remove, then start", false, "", worker.Exited, nil, []string{
+		{"no agent, exited worker: remove, then start", false, "", workspace.WorkerExited, nil, []string{
 			"create " + api, "flush " + api,
 			"remove edit",
 			"write env", "start in " + apiR + " edit",
 			"pause " + api,
 		}},
-		{"no agent, no worker: start", false, "", worker.Absent, nil, []string{
+		{"no agent, no worker: start", false, "", workspace.WorkerAbsent, nil, []string{
 			"create " + api, "flush " + api,
 			"write env", "start in " + apiR + " edit",
 			"pause " + api,
@@ -148,7 +147,7 @@ func TestAttachDecides(t *testing.T) {
 			if tc.agent {
 				req, key = conversation(f, req), convW
 			}
-			if tc.worker != worker.Absent {
+			if tc.worker != workspace.WorkerAbsent {
 				f.sessions[key] = &tmuxSession{state: tc.worker}
 			}
 			err := Attach(context.Background(), req)
@@ -338,28 +337,28 @@ func TestAttachNets(t *testing.T) {
 		name         string
 		agent        bool // the command is a conversation's
 		hooks        []agent.Hook
-		worker       worker.State
+		worker       workspace.WorkerState
 		recorded     map[string]string // the worker's directory before
 		forwards     []Forward
 		forwardFails bool
 		wantForwards []string
 		wantLog      string
 	}{
-		{"a new hooked worker", true, []agent.Hook{airHook}, worker.Absent, nil, nil, false, []string{"forward 10000"}, ""},
-		{"a running hooked worker", true, []agent.Hook{airHook}, worker.Running, recorded, nil, false, []string{"forward 20001"}, ""},
-		{"a running hooked worker with nothing recorded", true, []agent.Hook{airHook}, worker.Running, nil, nil, false, nil, "no hooks"},
-		{"a running worker the caller's settings hook to no client", true, []agent.Hook{webHook}, worker.Running, recorded, nil, false, nil, ""},
-		{"a new worker with no hook to the client", true, []agent.Hook{webHook}, worker.Absent, nil, nil, false, nil, ""},
-		{"a hook port taken on the remote", true, []agent.Hook{airHook}, worker.Absent, nil, nil, true, []string{"forward 10000"}, "no hooks: remote port 10000"},
-		{"the user's own relay", false, nil, worker.Absent, nil, []Forward{{Port: 8080, Address: "127.0.0.1:1"}}, false, []string{"forward 8080"}, ""},
-		{"the user's port taken", false, nil, worker.Absent, nil, []Forward{{Port: 8080, Address: "127.0.0.1:1"}}, true, []string{"forward 8080"}, "no relay from remote port 8080"},
+		{"a new hooked worker", true, []agent.Hook{airHook}, workspace.WorkerAbsent, nil, nil, false, []string{"forward 10000"}, ""},
+		{"a running hooked worker", true, []agent.Hook{airHook}, workspace.WorkerRunning, recorded, nil, false, []string{"forward 20001"}, ""},
+		{"a running hooked worker with nothing recorded", true, []agent.Hook{airHook}, workspace.WorkerRunning, nil, nil, false, nil, "no hooks"},
+		{"a running worker the caller's settings hook to no client", true, []agent.Hook{webHook}, workspace.WorkerRunning, recorded, nil, false, nil, ""},
+		{"a new worker with no hook to the client", true, []agent.Hook{webHook}, workspace.WorkerAbsent, nil, nil, false, nil, ""},
+		{"a hook port taken on the remote", true, []agent.Hook{airHook}, workspace.WorkerAbsent, nil, nil, true, []string{"forward 10000"}, "no hooks: remote port 10000"},
+		{"the user's own relay", false, nil, workspace.WorkerAbsent, nil, []Forward{{Port: 8080, Address: "127.0.0.1:1"}}, false, []string{"forward 8080"}, ""},
+		{"the user's port taken", false, nil, workspace.WorkerAbsent, nil, []Forward{{Port: 8080, Address: "127.0.0.1:1"}}, true, []string{"forward 8080"}, "no relay from remote port 8080"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFake()
 			f.attach, f.forwardFails = ends, tc.forwardFails
 			state := agent.Stopped.String()
-			if tc.worker == worker.Running {
+			if tc.worker == workspace.WorkerRunning {
 				state = agent.Running.String()
 			}
 			withConversation(f, state)
@@ -372,7 +371,7 @@ func TestAttachNets(t *testing.T) {
 			if tc.agent {
 				req, key = conversation(f, req, tc.hooks...), convW
 			}
-			if tc.worker != worker.Absent {
+			if tc.worker != workspace.WorkerAbsent {
 				f.sessions[key] = &tmuxSession{state: tc.worker}
 				f.dirs[".hermod/s/"+key] = tc.recorded
 			}
@@ -438,7 +437,7 @@ func TestRejoinHooks(t *testing.T) {
 			f := newFake()
 			ctx := context.Background()
 			req := conversation(f, Request{Remote: f.remote(), Local: testLocal(t), Dir: api}, tc.hooks...)
-			f.sessions[convW] = &tmuxSession{state: worker.Running}
+			f.sessions[convW] = &tmuxSession{state: workspace.WorkerRunning}
 			f.dirs[".hermod/s/"+convW] = tc.recorded
 			ws, err := workspace.Open(ctx, req.Remote, req.Local, req.Dir, workspace.Worktree{})
 			if err != nil {
@@ -500,14 +499,14 @@ func TestAttachEnds(t *testing.T) {
 			defer cancel()
 			f := newFake()
 			f.attach, f.signal = tc.ending, cancel
-			f.sessions["edit"] = &tmuxSession{state: worker.Running}
+			f.sessions["edit"] = &tmuxSession{state: workspace.WorkerRunning}
 			in := blocking(t)
 			if tc.eof {
 				in = strings.NewReader("")
 			}
 			err := Attach(ctx, Request{
 				Remote: f.remote(), Local: testLocal(t), Dir: api, Args: []string{"vim"}, Name: "edit",
-				Streams: relay.Streams{In: in},
+				Streams: workspace.Streams{In: in},
 			})
 			if (err != nil) != tc.wantErr {
 				t.Errorf("Attach: %v, want error %v", err, tc.wantErr)
