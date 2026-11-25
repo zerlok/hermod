@@ -243,6 +243,7 @@ func (plainAgent) Lookup(context.Context, string) (agent.Conversation, error) {
 }
 func (plainAgent) Start(context.Context, shell.Executor, agent.Launch) error { return nil }
 func (plainAgent) StateDir(context.Context, string) (string, error)          { return "", nil }
+func (plainAgent) Hooks(agent.Launch) ([]agent.Hook, error)                  { return nil, nil }
 
 // called is how many requests the commands handed into the core.
 func (r *recorder) called() int { return len(r.attached) + len(r.chats) + len(r.configured) }

@@ -15,6 +15,7 @@ import (
 	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/pathmap"
 	"github.com/zerlok/hermod/internal/relay/relaytest"
+	"github.com/zerlok/hermod/internal/secret"
 	"github.com/zerlok/hermod/internal/shell"
 	"github.com/zerlok/hermod/internal/worker/workertest"
 	"github.com/zerlok/hermod/internal/workspace"
@@ -79,6 +80,7 @@ type fake struct {
 	queryFails   bool                 // the agent program's listing and lookup fail
 	queryGarbled bool                 // the agent program's listing and lookup answer what cannot be read
 	hooked       [][]agent.Hook       // the hooks each start of the agent's rewrote, as the Launch's function left them
+	placed       []string             // the paths the Launch's Place gave the agent's files, in order
 	workersFail  bool                 // tmux cannot list its sessions
 	streamWaits  bool                 // a joined line stream serves until it is stopped, rather than ending at once
 	adapterSays  string               // what a joined line stream's process wrote to its stderr
@@ -491,15 +493,18 @@ func dead(s workspace.WorkerState) string {
 // fakeAgent answers from the conversations of its fake remote, and starts a
 // conversation by executing its arguments, mapped, on the executor it is
 // handed, with the variables named AGENT_*, after its hooks went through the
-// Launch's function.
+// Launch's function and its files were placed, by name, through the Launch's
+// Place.
 type fakeAgent struct {
 	f          *fake
 	invocation agent.Invocation
 	id         string
 	stateRoot  string       // where it keeps every directory's conversations
 	hooks      []agent.Hook // its settings' hooks
+	files      []file       // the files a start places
 	handshake  agent.Handshake
 	startFails error
+	hooksFail  error // why its settings' hooks cannot be read
 }
 
 func (a fakeAgent) Classify([]string) (agent.Invocation, string) { return a.invocation, a.id }
@@ -559,14 +564,28 @@ func (a fakeAgent) Start(ctx context.Context, ex shell.Executor, l agent.Launch)
 		}
 		hooked = append(hooked, h)
 	}
-	a.f.mu.Lock()
-	a.f.hooked = append(a.f.hooked, hooked)
-	a.f.mu.Unlock()
 	var args []string
 	for _, word := range l.Args {
 		args = append(args, l.Paths.ToRemote(word))
 	}
-	return a.run(ctx, ex, args, l)
+	var placed []string
+	for _, f := range a.files {
+		placed = append(placed, l.Place(f.name, secret.FromString(f.content)))
+	}
+	a.f.mu.Lock()
+	a.f.hooked = append(a.f.hooked, hooked)
+	a.f.placed = append(a.f.placed, placed...)
+	a.f.mu.Unlock()
+	return a.run(ctx, ex, append(args, placed...), l)
+}
+
+type file struct{ name, content string }
+
+func (a fakeAgent) Hooks(agent.Launch) ([]agent.Hook, error) {
+	if a.hooksFail != nil {
+		return nil, a.hooksFail
+	}
+	return a.hooks, nil
 }
 
 func (a fakeAgent) Adapter(ctx context.Context, ex shell.Executor, l agent.Launch) error {

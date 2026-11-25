@@ -89,6 +89,7 @@ Defaults can come from the environment; an argument always wins:
 | `HERMOD_REMOTE`     | no remote argument is given. With neither, a command fails before doing anything.             |
 | `HERMOD_REMOTE_CMD` | no `-- COMMAND` is given: a command line run by the remote user's shell.                      |
 | `HERMOD_ORIGIN`     | always: the name this machine is given on the remote, the hostname when unset. Set to empty, nothing on the remote names the machine. |
+| `HERMOD_TEARDOWN_TIMEOUT` | no `--teardown-timeout` is given: how long a command may take to give up its relays once its work ends or a signal stops it, as a duration such as `30s`; `10s` when unset. A second SIGINT or SIGTERM ends it at once. |
 
 ```bash
 export HERMOD_REMOTE=prod-box HERMOD_REMOTE_CMD='claude --model opus'

@@ -16,6 +16,7 @@ import (
 	"io"
 	"log"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 
@@ -217,7 +218,7 @@ func run(ctx context.Context, req Request, ws *workspace.Workspace, id string, k
 		return err
 	}
 	if act == join && id != "" {
-		aimed = rejoinHooks(ctx, req, ws, seen)
+		aimed = rejoinHooks(req, ws, seen)
 	}
 	addNets(ctx, req, ws, aimed)
 	return left(ctx, ws.Attach(ctx, key, workspace.Terminal, req.Streams))
@@ -257,9 +258,9 @@ func left(ctx context.Context, err error) error {
 // conversation it first adds the FS relay between the local and the remote
 // agent's state directories, connected and flushed so the agent finds the
 // conversation's transcripts, then has the agent start it on the workspace's
-// Host, its hooks aimed at the client; a command no agent runs is executed on
-// the Host as given. It returns the hooks the agent's settings call, nil for
-// none.
+// Host, its hooks aimed at the client and its files placed in the worker's
+// directory; a command no agent runs is executed on the Host as given. It
+// returns the hooks the agent's settings call, nil for none.
 func startWorker(ctx context.Context, req Request, ws *workspace.Workspace, key workspace.Key, id string) (*hooks, error) {
 	dir := ws.PathMap().ToRemote(req.Dir)
 	if id == "" {
@@ -280,13 +281,22 @@ func startWorker(ctx context.Context, req Request, ws *workspace.Workspace, key 
 	if err := ws.AddFS(ctx, pathmap.Place{Local: local, Remote: remote}); err != nil {
 		return nil, err
 	}
-	client, err := clientOf(ctx, req, ws)
+	client, err := clientOf(req, ws)
 	if err != nil {
 		return nil, err
 	}
 	a := newAimer(req, client, func() (workerHook, error) { return newWorkerHook(ctx, req, ws) })
-	host := ws.Host(key, workspace.Terminal, a.record)
-	if err := req.Agent.Start(ctx, host, launch(req, ws, a.aim)); err != nil {
+	var placed []workspace.File
+	place := func(name string, content secret.Token) string {
+		placed = append(placed, workspace.File{Name: name, Content: content})
+		return path.Join(key.Dir(req.Remote.Home), name)
+	}
+	host := ws.Host(key, workspace.Terminal, func() (workspace.Record, error) {
+		rec, err := a.record()
+		rec.Files = append(placed, rec.Files...)
+		return rec, err
+	})
+	if err := req.Agent.Start(ctx, host, launch(req, ws, a.aim, place)); err != nil {
 		return nil, err
 	}
 	return a.aimed(), nil
@@ -298,8 +308,8 @@ func startWorker(ctx context.Context, req Request, ws *workspace.Workspace, key 
 // settings keep the port, token and routes they were started with. A worker
 // that records none, or settings that cannot be read now, run without the
 // hooks' Net relay.
-func rejoinHooks(ctx context.Context, req Request, ws *workspace.Workspace, seen workspace.Look) *hooks {
-	client, err := clientOf(ctx, req, ws)
+func rejoinHooks(req Request, ws *workspace.Workspace, seen workspace.Look) *hooks {
+	client, err := clientOf(req, ws)
 	if err != nil {
 		req.logger().Printf("no hooks: %v", err)
 		return nil
@@ -319,8 +329,8 @@ func rejoinHooks(ctx context.Context, req Request, ws *workspace.Workspace, seen
 var errNotRecorded = errors.New("the worker's directory records no hook port, token and routes")
 
 // launch is what the agent is given to start req's conversation in ws.
-func launch(req Request, ws *workspace.Workspace, hook func(agent.Hook) (agent.Hook, bool)) agent.Launch {
-	return agent.Launch{Args: req.Args, Dir: req.Dir, Paths: ws.PathMap(), Environ: req.Environ, Hook: hook}
+func launch(req Request, ws *workspace.Workspace, hook func(agent.Hook) (agent.Hook, bool), place func(string, secret.Token) string) agent.Launch {
+	return agent.Launch{Args: req.Args, Dir: req.Dir, Paths: ws.PathMap(), Environ: req.Environ, Hook: hook, Place: place}
 }
 
 // identityRecord is the record of a worker given the developer's git

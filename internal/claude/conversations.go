@@ -19,9 +19,9 @@ import (
 	"github.com/zerlok/hermod/internal/shell"
 )
 
-// conversationsScript reports Claude's config directory, its transcripts and
-// the conversations it runs. It is sent to sh as it is, its inputs as
-// arguments.
+// conversationsScript reports Claude's config directory and executable, its
+// transcripts and the conversations it runs. It is sent to sh as it is, its
+// inputs as arguments.
 //
 //go:embed conversations.sh
 var conversationsScript string
@@ -50,16 +50,26 @@ func (a Agent) StateDir(ctx context.Context, dir string) (string, error) {
 	if !path.IsAbs(dir) {
 		return "", fmt.Errorf("claude: directory %q is not absolute", dir)
 	}
-	out, err := a.conversations(ctx, "config")
+	config, err := a.report(ctx, "config")
+	if err != nil {
+		return "", err
+	}
+	return transcriptDir(config, path.Clean(dir)), nil
+}
+
+// report is the absolute path an operation of conversationsScript that
+// answers with one prints.
+func (a Agent) report(ctx context.Context, op string) (string, error) {
+	out, err := a.conversations(ctx, op)
 	if err != nil {
 		return "", err
 	}
 	_, after, found := cutLine(out, reportMarker)
-	config, _, _ := strings.Cut(string(after), "\n")
-	if !found || !path.IsAbs(config) {
-		return "", fmt.Errorf("claude: config directory: unexpected answer %q", out)
+	line, _, _ := strings.Cut(string(after), "\n")
+	if !found || !path.IsAbs(line) {
+		return "", fmt.Errorf("claude: conversations %s: unexpected answer %q", op, out)
 	}
-	return transcriptDir(config, path.Clean(dir)), nil
+	return line, nil
 }
 
 // List asks Claude for the conversations of dir and of the directories under

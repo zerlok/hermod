@@ -134,6 +134,9 @@ const workersUnderHome = ".hermod/s"
 // form the scripts take it in.
 func (k Key) underHome() string { return path.Join(workersUnderHome, k.name) }
 
+// Dir is the worker's directory on a remote whose user's home is home.
+func (k Key) Dir(home string) string { return path.Join(home, k.underHome()) }
+
 // staging is a new directory name, relative to the remote user's home, for
 // one start to write its files into. Its leading '.' keeps it apart from every
 // key, and its random part from every other start's.

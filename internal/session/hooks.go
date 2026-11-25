@@ -2,7 +2,6 @@ package session
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -16,7 +15,6 @@ import (
 	"github.com/zerlok/hermod/internal/pathmap"
 	"github.com/zerlok/hermod/internal/relay"
 	"github.com/zerlok/hermod/internal/secret"
-	"github.com/zerlok/hermod/internal/shell"
 	"github.com/zerlok/hermod/internal/workspace"
 )
 
@@ -172,32 +170,22 @@ func endpointOf(u *url.URL, h agent.Hook) (e endpoint, carried bool) {
 // clientOf is the client's hook endpoint the caller's settings name now: the
 // first carried hook IsHook accepts; nil for none. It is found before any hook
 // is aimed, so every hook to it is aimed wherever it sits in the settings.
-//
-// TODO: the agent contract has no operation that only reads its settings'
-// hooks: docs/ARCHITECTURE.md lists rewriting them among an agent's
-// capabilities, but its method table has none. The hooks are therefore read
-// by a start on an executor that runs nothing, which holds only for an agent
-// whose start acts through its executor alone.
-func clientOf(ctx context.Context, req Request, ws *workspace.Workspace) (*endpoint, error) {
+func clientOf(req Request, ws *workspace.Workspace) (*endpoint, error) {
 	if req.IsHook == nil {
 		return nil, nil
 	}
-	var client *endpoint
-	find := func(h agent.Hook) (agent.Hook, bool) {
-		if client != nil {
-			return h, true
-		}
-		if u, err := url.Parse(h.URL); err == nil && isLoopback(u) && req.IsHook(u) {
-			if e, carried := endpointOf(u, h); carried {
-				client = &e
-			}
-		}
-		return h, true
-	}
-	if err := req.Agent.Start(ctx, shell.NewDryRun(io.Discard), launch(req, ws, find)); err != nil {
+	hooks, err := req.Agent.Hooks(launch(req, ws, nil, nil))
+	if err != nil {
 		return nil, err
 	}
-	return client, nil
+	for _, h := range hooks {
+		if u, err := url.Parse(h.URL); err == nil && isLoopback(u) && req.IsHook(u) {
+			if e, carried := endpointOf(u, h); carried {
+				return &e, nil
+			}
+		}
+	}
+	return nil, nil
 }
 
 // routed is a hook pointed at the worker's port on the remote's loopback,

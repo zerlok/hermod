@@ -61,10 +61,8 @@ func (v Value) Format(f fmt.State, verb rune) {
 // MarshalText keeps a secret masked in a display encoding.
 func (v Value) MarshalText() ([]byte, error) { return []byte(v.String()), nil }
 
-// WorkerDir is the variable a worker's process is given with the worker's
-// directory, an absolute path on the remote. The worker sets it, and a command
-// declared before anyone knows where its worker's directory will be names its
-// files under it.
+// WorkerDir is the variable the worker sets to its own directory, an absolute
+// path on the remote, for the process it starts.
 const WorkerDir = "HERMOD_WORKER_DIR"
 
 // Pair is one variable.

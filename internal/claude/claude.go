@@ -18,8 +18,9 @@ import (
 
 // Config is what Claude is built with.
 type Config struct {
-	// Exec runs the commands that ask Claude about its conversations and its
-	// config directory, on the workstation this Agent answers for.
+	// Exec runs the commands that ask Claude about its conversations, its
+	// config directory and the Claude executable its ACP adapter runs, on the
+	// workstation this Agent answers for.
 	Exec shell.Executor
 	// ReadFile reads a file of the caller's that `--settings` or `--mcp-config`
 	// names, whose contents the conversation is given in place of the path.

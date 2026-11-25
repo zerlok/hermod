@@ -2,11 +2,14 @@
 # runs on this workstation.
 #
 #   sh -c "$(cat conversations.sh)" conversations config
+#   sh -c "$(cat conversations.sh)" conversations executable
 #   sh -c "$(cat conversations.sh)" conversations list PREFIX
 #   sh -c "$(cat conversations.sh)" conversations locate [ID]
 #
 # Claude's config directory is the one Claude here uses,
-# ${CLAUDE_CONFIG_DIR:-$HOME/.claude}, absolute; `config` prints it. PREFIX is
+# ${CLAUDE_CONFIG_DIR:-$HOME/.claude}, absolute; `config` prints it.
+# `executable` prints the Claude a program started here runs: the
+# environment's CLAUDE_CODE_EXECUTABLE, else `claude` found on PATH. PREFIX is
 # the name Claude gives a directory under its projects/, and every transcript
 # of a directory whose name starts with it is reported: those of the
 # directories under it start with it too. ID is a conversation's UUID, whose
@@ -50,6 +53,11 @@ case $op in
 config)
   echo conversations:
   printf '%s\n' "$c"
+  exit 0
+  ;;
+executable)
+  echo conversations:
+  printf '%s\n' "${CLAUDE_CODE_EXECUTABLE:-$(command -v claude)}"
   exit 0
   ;;
 list)

@@ -69,69 +69,77 @@ func blocking(t *testing.T) io.Reader {
 // TestAttachDecides runs every row of the decision table, and a worker that
 // runs no agent, and checks what each one changes on the remote, in order: a
 // start adds the FS relays the agent requires before it writes the worker's
-// directory, and starts the worker last.
+// directory, and starts the worker last; one whose settings' hooks cannot be
+// read starts none.
 func TestAttachDecides(t *testing.T) {
 	cases := []struct {
 		name        string
 		agent       bool   // the command is a conversation's
 		probe       string // what the agent program says of the conversation
 		worker      workspace.WorkerState
+		hooksFail   bool // the agent cannot read its settings' hooks
 		wantErr     error
 		wantChanges []string
 	}{
-		{"running conversation, running worker: attach", true, "running", workspace.WorkerRunning, nil, []string{
+		{"running conversation, running worker: attach", true, "running", workspace.WorkerRunning, false, nil, []string{
 			"create " + api, "flush " + api,
 			"pause " + api,
 		}},
-		{"running conversation, no worker: refuse", true, "running", workspace.WorkerAbsent, ErrRunsOutside, []string{
+		{"running conversation, no worker: refuse", true, "running", workspace.WorkerAbsent, false, ErrRunsOutside, []string{
 			"create " + api, "flush " + api,
 			"flush " + api, "terminate " + api,
 		}},
-		{"running conversation, exited worker: refuse", true, "running", workspace.WorkerExited, ErrRunsOutside, []string{
+		{"running conversation, exited worker: refuse", true, "running", workspace.WorkerExited, false, ErrRunsOutside, []string{
 			"create " + api, "flush " + api,
 			"pause " + api,
 		}},
-		{"stopped conversation, running worker: remove, then start", true, "stopped", workspace.WorkerRunning, nil, []string{
+		{"stopped conversation, running worker: remove, then start", true, "stopped", workspace.WorkerRunning, false, nil, []string{
 			"create " + api, "flush " + api,
 			"close " + convW,
 			"create " + transcripts.Local, "flush " + transcripts.Local,
 			"write env", "start in " + apiR + " " + convW,
 			"pause " + transcripts.Local, "pause " + api,
 		}},
-		{"stopped conversation, exited worker: remove, then start", true, "stopped", workspace.WorkerExited, nil, []string{
+		{"stopped conversation, exited worker: remove, then start", true, "stopped", workspace.WorkerExited, false, nil, []string{
 			"create " + api, "flush " + api,
 			"remove " + convW,
 			"create " + transcripts.Local, "flush " + transcripts.Local,
 			"write env", "start in " + apiR + " " + convW,
 			"pause " + transcripts.Local, "pause " + api,
 		}},
-		{"a conversation the program does not have yet, no worker: start", true, "", workspace.WorkerAbsent, nil, []string{
+		{"a conversation the program does not have yet, no worker: start", true, "", workspace.WorkerAbsent, false, nil, []string{
 			"create " + api, "flush " + api,
 			"create " + transcripts.Local, "flush " + transcripts.Local,
 			"write env", "start in " + apiR + " " + convW,
 			"pause " + transcripts.Local, "pause " + api,
 		}},
-		{"stopped conversation, no worker: start", true, "stopped", workspace.WorkerAbsent, nil, []string{
+		{"stopped conversation, no worker: start", true, "stopped", workspace.WorkerAbsent, false, nil, []string{
 			"create " + api, "flush " + api,
 			"create " + transcripts.Local, "flush " + transcripts.Local,
 			"write env", "start in " + apiR + " " + convW,
 			"pause " + transcripts.Local, "pause " + api,
 		}},
-		{"an unreadable answer of the agent program", true, "garbled", workspace.WorkerRunning, errAny, []string{
+		{"an unreadable answer of the agent program", true, "garbled", workspace.WorkerRunning, false, errAny, []string{
 			"create " + api, "flush " + api,
 			"pause " + api,
 		}},
-		{"no agent, running worker: attach", false, "", workspace.WorkerRunning, nil, []string{
+		{"settings whose hooks cannot be read, no worker: refuse", true, "stopped", workspace.WorkerAbsent, true, errAny, []string{
+			"create " + api, "flush " + api,
+			"create " + transcripts.Local, "flush " + transcripts.Local,
+			"flush " + transcripts.Local, "terminate " + transcripts.Local,
+			"flush " + api, "terminate " + api,
+		}},
+		{"no agent, running worker: attach", false, "", workspace.WorkerRunning, false, nil, []string{
 			"create " + api, "flush " + api,
 			"pause " + api,
 		}},
-		{"no agent, exited worker: remove, then start", false, "", workspace.WorkerExited, nil, []string{
+		{"no agent, exited worker: remove, then start", false, "", workspace.WorkerExited, false, nil, []string{
 			"create " + api, "flush " + api,
 			"remove edit",
 			"write env", "start in " + apiR + " edit",
 			"pause " + api,
 		}},
-		{"no agent, no worker: start", false, "", workspace.WorkerAbsent, nil, []string{
+		{"no agent, no worker: start", false, "", workspace.WorkerAbsent, false, nil, []string{
 			"create " + api, "flush " + api,
 			"write env", "start in " + apiR + " edit",
 			"pause " + api,
@@ -146,6 +154,9 @@ func TestAttachDecides(t *testing.T) {
 			key := "edit"
 			if tc.agent {
 				req, key = conversation(f, req), convW
+				if tc.hooksFail {
+					req.Agent = failingHooks(req.Agent)
+				}
 			}
 			if tc.worker != workspace.WorkerAbsent {
 				f.sessions[key] = &tmuxSession{state: tc.worker}
@@ -159,6 +170,14 @@ func TestAttachDecides(t *testing.T) {
 			}
 		})
 	}
+}
+
+// failingHooks is a conversation's agent that cannot read its settings'
+// hooks.
+func failingHooks(a agent.Agent) agent.Agent {
+	failing := a.(fakeAgent)
+	failing.hooksFail = errors.New("unreadable settings")
+	return failing
 }
 
 // errAny stands, in a table, for any error.
@@ -203,13 +222,16 @@ func TestAttachWorkerDirectory(t *testing.T) {
 	cases := []struct {
 		name       string
 		hooks      []agent.Hook
+		files      []file // the files the agent places
 		want       map[string]string
 		wantHooks  []agent.Hook
+		wantPlaced []string
 		wantLogged []string
 	}{
 		{
 			"the client's hooks aimed and recorded",
 			[]agent.Hook{airHook, airHook, webHook},
+			nil,
 			map[string]string{
 				"env":      "export AGENT_X=1\n" + identity,
 				portFile:   "10000\n",
@@ -218,10 +240,12 @@ func TestAttachWorkerDirectory(t *testing.T) {
 			},
 			[]agent.Hook{aimedHook("10000", "/air/hook?x=1"), aimedHook("10000", "/air/hook?x=1"), webHook},
 			nil,
+			nil,
 		},
 		{
 			"another loopback endpoint left out and logged without its credentials",
 			[]agent.Hook{otherHook, airPlain, otherHook},
+			nil,
 			map[string]string{
 				"env":      "export AGENT_X=1\n" + identity,
 				portFile:   "10000\n",
@@ -229,11 +253,13 @@ func TestAttachWorkerDirectory(t *testing.T) {
 				tokenFile:  zeros,
 			},
 			[]agent.Hook{aimedHook("10000", "/air/stop")},
+			nil,
 			[]string{"left out the hook to http://localhost:9000/mine: no relay carries it to this workstation"},
 		},
 		{
 			"a hook to the client's endpoint before the client's own hook aimed too",
 			[]agent.Hook{airOther, airHook},
+			nil,
 			map[string]string{
 				"env":      "export AGENT_X=1\n" + identity,
 				portFile:   "10000\n",
@@ -242,10 +268,12 @@ func TestAttachWorkerDirectory(t *testing.T) {
 			},
 			[]agent.Hook{aimedHook("10000", "/api/x"), aimedHook("10000", "/air/hook?x=1")},
 			nil,
+			nil,
 		},
 		{
 			"a hook to the client's endpoint with another token left out",
 			[]agent.Hook{airHook, airPlain},
+			nil,
 			map[string]string{
 				"env":      "export AGENT_X=1\n" + identity,
 				portFile:   "10000\n",
@@ -253,20 +281,41 @@ func TestAttachWorkerDirectory(t *testing.T) {
 				tokenFile:  zeros,
 			},
 			[]agent.Hook{aimedHook("10000", "/air/hook?x=1")},
+			nil,
 			[]string{"left out the hook to http://127.0.0.1:1/air/stop: it carries another credential than the client's endpoint expects"},
 		},
 		{
 			"an https hook to the client left out, no port picked",
 			[]agent.Hook{httpsHook, webHook},
+			nil,
 			map[string]string{"env": "export AGENT_X=1\n" + identity},
 			[]agent.Hook{webHook},
+			nil,
 			[]string{"left out the hook to https://127.0.0.1:1/air/hook: no relay carries it to this workstation"},
 		},
 		{
 			"no hooks",
 			nil,
+			nil,
 			map[string]string{"env": "export AGENT_X=1\n" + identity},
 			nil,
+			nil,
+			nil,
+		},
+		{
+			"the agent's files placed in the worker's directory beside its hooks' record",
+			[]agent.Hook{airHook},
+			[]file{{"settings.json", `{"hooks":{}}`}, {"mcp-1.json", `{"mcpServers":{}}`}},
+			map[string]string{
+				"env":           "export AGENT_X=1\n" + identity,
+				"settings.json": `{"hooks":{}}`,
+				"mcp-1.json":    `{"mcpServers":{}}`,
+				portFile:        "10000\n",
+				routesFile:      "/air/hook?x=1\n",
+				tokenFile:       zeros,
+			},
+			[]agent.Hook{aimedHook("10000", "/air/hook?x=1")},
+			[]string{testRemoteHome + "/.hermod/s/" + convW + "/settings.json", testRemoteHome + "/.hermod/s/" + convW + "/mcp-1.json"},
 			nil,
 		},
 	}
@@ -282,16 +331,20 @@ func TestAttachWorkerDirectory(t *testing.T) {
 				Log:      log.New(&logged, "", 0),
 				Random:   bytes.NewReader(make([]byte, 1024)),
 			}, tc.hooks...)
+			placing := req.Agent.(fakeAgent)
+			placing.files = tc.files
+			req.Agent = placing
 			if err := Attach(context.Background(), req); err != nil {
 				t.Fatalf("Attach: %v", err)
 			}
 			if got := f.dirs[".hermod/s/"+convW]; !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("worker's directory\n%q\nwant\n%q", got, tc.want)
 			}
-			// The last start is the one that reached the worker; any before it
-			// ran nothing.
-			if len(f.hooked) == 0 || !sameHooks(f.hooked[len(f.hooked)-1], tc.wantHooks) {
-				t.Errorf("hooks started with %v, want %v", revealHooks(f.hooked), revealHooks([][]agent.Hook{tc.wantHooks}))
+			if len(f.hooked) != 1 || !sameHooks(f.hooked[0], tc.wantHooks) {
+				t.Errorf("hooks started with %v, want one start with %v", revealHooks(f.hooked), revealHooks([][]agent.Hook{tc.wantHooks}))
+			}
+			if !reflect.DeepEqual(f.placed, tc.wantPlaced) {
+				t.Errorf("files placed at %q, want %q", f.placed, tc.wantPlaced)
 			}
 			for _, want := range tc.wantLogged {
 				if !strings.Contains(logged.String(), want) {
@@ -329,8 +382,9 @@ func revealHooks(all [][]agent.Hook) []string {
 var netFailures = []string{"no hooks", "no relay"}
 
 // TestAttachNets checks the session's Net relays: the hooks' on the port the
-// worker's directory records, the user's own, and a port taken on the remote,
-// which costs only the relay.
+// worker's directory records, the user's own, and a port taken on the remote
+// or a running worker's settings that cannot be read now, which cost only the
+// relay.
 func TestAttachNets(t *testing.T) {
 	recorded := map[string]string{portFile: "20001\n", tokenFile: "t", routesFile: "/air/hook?x=1\n"}
 	cases := []struct {
@@ -338,20 +392,22 @@ func TestAttachNets(t *testing.T) {
 		agent        bool // the command is a conversation's
 		hooks        []agent.Hook
 		worker       workspace.WorkerState
+		hooksFail    bool              // the agent cannot read its settings' hooks
 		recorded     map[string]string // the worker's directory before
 		forwards     []Forward
 		forwardFails bool
 		wantForwards []string
 		wantLog      string
 	}{
-		{"a new hooked worker", true, []agent.Hook{airHook}, workspace.WorkerAbsent, nil, nil, false, []string{"forward 10000"}, ""},
-		{"a running hooked worker", true, []agent.Hook{airHook}, workspace.WorkerRunning, recorded, nil, false, []string{"forward 20001"}, ""},
-		{"a running hooked worker with nothing recorded", true, []agent.Hook{airHook}, workspace.WorkerRunning, nil, nil, false, nil, "no hooks"},
-		{"a running worker the caller's settings hook to no client", true, []agent.Hook{webHook}, workspace.WorkerRunning, recorded, nil, false, nil, ""},
-		{"a new worker with no hook to the client", true, []agent.Hook{webHook}, workspace.WorkerAbsent, nil, nil, false, nil, ""},
-		{"a hook port taken on the remote", true, []agent.Hook{airHook}, workspace.WorkerAbsent, nil, nil, true, []string{"forward 10000"}, "no hooks: remote port 10000"},
-		{"the user's own relay", false, nil, workspace.WorkerAbsent, nil, []Forward{{Port: 8080, Address: "127.0.0.1:1"}}, false, []string{"forward 8080"}, ""},
-		{"the user's port taken", false, nil, workspace.WorkerAbsent, nil, []Forward{{Port: 8080, Address: "127.0.0.1:1"}}, true, []string{"forward 8080"}, "no relay from remote port 8080"},
+		{"a new hooked worker", true, []agent.Hook{airHook}, workspace.WorkerAbsent, false, nil, nil, false, []string{"forward 10000"}, ""},
+		{"a running hooked worker", true, []agent.Hook{airHook}, workspace.WorkerRunning, false, recorded, nil, false, []string{"forward 20001"}, ""},
+		{"a running hooked worker with nothing recorded", true, []agent.Hook{airHook}, workspace.WorkerRunning, false, nil, nil, false, nil, "no hooks"},
+		{"a running hooked worker whose settings cannot be read now", true, []agent.Hook{airHook}, workspace.WorkerRunning, true, recorded, nil, false, nil, "no hooks: unreadable settings"},
+		{"a running worker the caller's settings hook to no client", true, []agent.Hook{webHook}, workspace.WorkerRunning, false, recorded, nil, false, nil, ""},
+		{"a new worker with no hook to the client", true, []agent.Hook{webHook}, workspace.WorkerAbsent, false, nil, nil, false, nil, ""},
+		{"a hook port taken on the remote", true, []agent.Hook{airHook}, workspace.WorkerAbsent, false, nil, nil, true, []string{"forward 10000"}, "no hooks: remote port 10000"},
+		{"the user's own relay", false, nil, workspace.WorkerAbsent, false, nil, []Forward{{Port: 8080, Address: "127.0.0.1:1"}}, false, []string{"forward 8080"}, ""},
+		{"the user's port taken", false, nil, workspace.WorkerAbsent, false, nil, []Forward{{Port: 8080, Address: "127.0.0.1:1"}}, true, []string{"forward 8080"}, "no relay from remote port 8080"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -371,6 +427,9 @@ func TestAttachNets(t *testing.T) {
 			key := "edit"
 			if tc.agent {
 				req, key = conversation(f, req, tc.hooks...), convW
+				if tc.hooksFail {
+					req.Agent = failingHooks(req.Agent)
+				}
 			}
 			if tc.worker != workspace.WorkerAbsent {
 				f.sessions[key] = &tmuxSession{state: tc.worker}
@@ -452,7 +511,7 @@ func TestRejoinHooks(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Look: %v", err)
 			}
-			got := rejoinHooks(ctx, req, ws, seen)
+			got := rejoinHooks(req, ws, seen)
 			if (got != nil) != tc.wantHooked {
 				t.Fatalf("hooks %v, want hooked %v", got, tc.wantHooked)
 			}

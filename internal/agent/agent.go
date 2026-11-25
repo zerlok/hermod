@@ -34,6 +34,9 @@ type Agent interface {
 	// StateDir is the directory where the program keeps the state of dir's
 	// conversations, such as their transcripts.
 	StateDir(ctx context.Context, dir string) (string, error)
+	// Hooks are the hooks of the Launch's settings, read without starting
+	// anything, in the order a start hands them to the Launch's Hook.
+	Hooks(launch Launch) ([]Hook, error)
 }
 
 // ACP is the optional contract of an agent that serves a chat client through
@@ -91,6 +94,10 @@ type Launch struct {
 	// Hook rewrites one hook of the agent's settings, or leaves it out when
 	// ok is false. Nil keeps every hook as it is.
 	Hook func(h Hook) (rewritten Hook, ok bool)
+	// Place puts a file into the directory of the worker the start runs in
+	// and returns its path there, so a command names its files with every
+	// path resolved and carries no secret on its command line.
+	Place func(name string, content secret.Token) (path string)
 }
 
 // Hook is one hook of an agent's settings: a URL the program calls, and the
