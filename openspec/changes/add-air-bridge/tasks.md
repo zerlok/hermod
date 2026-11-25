@@ -196,5 +196,5 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 ## 27. Documentation
 
 - [x] 27.1 Check README.md, docs/ARCHITECTURE.md and docs/air-integration.md against the code, each package against its [Packages](../../../docs/ARCHITECTURE.md#packages) row and the imports against [Package dependencies](../../../docs/ARCHITECTURE.md#package-dependencies); list `HERMOD_TEARDOWN_TIMEOUT` among README's variables; then tick 20.1
-- [ ] 27.2 Run `gofmt -l .`, `go vet ./...`, `go test ./...` and `go build ./...` on the whole module
-- [ ] 27.3 Run `openspec validate add-air-bridge --strict`
+- [x] 27.2 Run `gofmt -l .`, `go vet ./...`, `go test ./...` and `go build ./...` on the whole module
+- [x] 27.3 Run `openspec validate add-air-bridge --strict`
