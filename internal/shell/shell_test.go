@@ -6,7 +6,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -126,9 +128,13 @@ func TestTmuxRewrite(t *testing.T) {
 	}{
 		{"default shell no command", "api", nil, Command{}, []string{"tmux", "new-session", "-A", "-s", "api"}, false},
 		{"with dir", "api", nil, Command{Dir: "/home/u/api"}, []string{"tmux", "new-session", "-A", "-s", "api", "-c", "/home/u/api"}, false},
+		{"a dir ending in ';' stays in its word", "api", nil, Command{Dir: "dev/a;"}, []string{"tmux", "new-session", "-A", "-s", "api", "-c", `dev/a\;`}, false},
 		{"a '#' in the dir is no format", "api", nil, Command{Dir: "dev/p#(id>T)C#"}, []string{"tmux", "new-session", "-A", "-s", "api", "-c", "dev/p##(id>T)C##"}, false},
 		{"with env", "api", nil, Command{Env: vars("GIT_AUTHOR_NAME", "Jane Doe", "A", "1")}, []string{"tmux", "new-session", "-A", "-s", "api", "-e", "GIT_AUTHOR_NAME=Jane Doe", "-e", "A=1"}, false},
-		{"command joined", "api", nil, Command{Dir: "/home/u/api", Args: []string{"claude", "--model", "opus"}}, []string{"tmux", "new-session", "-A", "-s", "api", "-c", "/home/u/api", "claude --model opus"}, false},
+		{"a value ending in ';' stays in its word", "api", nil, Command{Env: vars("A", "x;")}, []string{"tmux", "new-session", "-A", "-s", "api", "-e", `A=x\;`}, false},
+		{"command words after --", "api", nil, Command{Dir: "/home/u/api", Args: []string{"claude", "--model", "opus"}}, []string{"tmux", "new-session", "-A", "-s", "api", "-c", "/home/u/api", "--", "claude", "--model", "opus"}, false},
+		{"words ending in ';' stay words", "api", nil, Command{Args: []string{"sh", "-c", "a;", ";"}}, []string{"tmux", "new-session", "-A", "-s", "api", "--", "sh", "-c", `a\;`, `\;`}, false},
+		{"a lone word quoted for tmux's shell", "api", nil, Command{Args: []string{"my prog;"}}, []string{"tmux", "new-session", "-A", "-s", "api", "--", "'my prog;'"}, false},
 		{"secret variable refused", "api", nil, Command{Env: env.New(env.Pair{Key: "A", Value: env.Plain("1")}, env.Pair{Key: "ANTHROPIC_API_KEY", Value: env.Secret(secret.FromString("sk-ant-secret"))})}, nil, true},
 		{"key with a space refused", "api", nil, Command{Env: vars("A B", "1")}, nil, true},
 		{"key with a '=' refused", "api", nil, Command{Env: vars("A=B", "1")}, nil, true},
@@ -136,15 +142,43 @@ func TestTmuxRewrite(t *testing.T) {
 			"session options follow the command",
 			"api", []TmuxOption{WithSessionOptions(tags...)},
 			Command{Dir: "dev/api", Args: []string{"htop"}},
-			[]string{"tmux", "new-session", "-A", "-s", "api", "-c", "dev/api", "htop", ";", "set-option", "-t", "=api:", "-qo", "@hermod-mode", "attach", ";", "set-option", "-t", "=api:", "-qo", "@hermod-dir", "dev/my api"},
+			[]string{"tmux", "new-session", "-A", "-s", "api", "-c", "dev/api", "--", "htop", ";", "set-option", "-t", "=api:", "-qo", "@hermod-mode", "attach", ";", "set-option", "-t", "=api:", "-qo", "@hermod-dir", "dev/my api"},
 			false,
 		},
 		{
 			"detached start",
 			"hermod-x", []TmuxOption{Detached(), WithSessionOptions(tags[0])},
 			Command{Args: []string{"claude"}},
-			[]string{"tmux", "new-session", "-d", "-s", "hermod-x", "claude", ";", "set-option", "-t", "=hermod-x:", "-qo", "@hermod-mode", "attach"},
+			[]string{"tmux", "new-session", "-d", "-s", "hermod-x", "--", "claude", ";", "set-option", "-t", "=hermod-x:", "-qo", "@hermod-mode", "attach"},
 			false,
+		},
+		{
+			"an option value ending in ';' stays in its word",
+			"api", []TmuxOption{WithSessionOptions(SessionOption{"@hermod-x", "v;"})},
+			Command{},
+			[]string{"tmux", "new-session", "-A", "-s", "api", ";", "set-option", "-t", "=api:", "-qo", "@hermod-x", `v\;`},
+			false,
+		},
+		{
+			"an option value holding a tab refused",
+			"api", []TmuxOption{WithSessionOptions(SessionOption{"@hermod-x", "a\tb"})},
+			Command{},
+			nil,
+			true,
+		},
+		{
+			"an option value holding a newline refused",
+			"api", []TmuxOption{WithSessionOptions(SessionOption{"@hermod-x", "a\nb"})},
+			Command{},
+			nil,
+			true,
+		},
+		{
+			"an option that is no user option refused",
+			"api", []TmuxOption{WithSessionOptions(SessionOption{"status", "off"})},
+			Command{},
+			nil,
+			true,
 		},
 		{
 			"options target the name tmux stores",
@@ -169,6 +203,206 @@ func TestTmuxRewrite(t *testing.T) {
 			}
 			if inner.got.Dir != "" || inner.got.Env.Len() != 0 {
 				t.Errorf("dir and env handed in as well: dir=%q env=%v", inner.got.Dir, inner.got.Env)
+			}
+		})
+	}
+}
+
+func TestCheckSessionOption(t *testing.T) {
+	cases := []struct {
+		name    string
+		option  SessionOption
+		wantErr bool
+	}{
+		{"a user option", SessionOption{"@hermod-workspace", "hermod-box-api-1f2e"}, false},
+		{"upper case and '_' in the name", SessionOption{"@Hermod_x", "v"}, false},
+		{"a value with a space and ';'", SessionOption{"@w", "a b;"}, false},
+		{"an empty value", SessionOption{"@w", ""}, false},
+		{"no '@'", SessionOption{"hermod-origin", "x"}, true},
+		{"a bare '@'", SessionOption{"@", "x"}, true},
+		{"format syntax in the name", SessionOption{"@a}#{b", "x"}, true},
+		{"a tab in the value", SessionOption{"@w", "a\tb"}, true},
+		{"a newline in the value", SessionOption{"@w", "a\nb"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := CheckSessionOption(tc.option); (err != nil) != tc.wantErr {
+				t.Errorf("CheckSessionOption(%q) = %v, want an error: %v", tc.option, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestTmuxSessionCommands(t *testing.T) {
+	cases := []struct {
+		name    string
+		session string
+		command func(TmuxSession) []string
+		want    []string
+	}{
+		{"has", "hermod-k", TmuxSession.Has, []string{"sh", "-c", classifyScript, "tmux", "1", "2", "tmux", "has-session", "-t", "=hermod-k:"}},
+		{"pane dead", "hermod-k", TmuxSession.PaneDead, []string{"sh", "-c", classifyScript, "tmux", "1", "2", "tmux", "has-session", "-t", "=hermod-k:", ";", "display-message", "-p", "-t", "=hermod-k:", "#{pane_dead}"}},
+		{"kill", "hermod-k", TmuxSession.Kill, []string{"tmux", "kill-session", "-t", "=hermod-k:"}},
+		{"attach", "hermod-k", TmuxSession.Attach, []string{"tmux", "attach-session", "-t", "=hermod-k:"}},
+		{"keep a failed pane", "hermod-k", TmuxSession.KeepFailedPane, []string{"tmux", "set-option", "-w", "-t", "=hermod-k:", "remain-on-exit", "failed"}},
+		{"the name tmux stores", "dev.api:2", TmuxSession.Kill, []string{"tmux", "kill-session", "-t", "=dev_api_2:"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.command(NewTmuxSession(tc.session)); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("command = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTmuxListingCommand(t *testing.T) {
+	cases := []struct {
+		name    string
+		options []string
+		want    []string
+		wantErr bool
+	}{
+		{"no option", nil, []string{"sh", "-c", classifyScript, "tmux", "0", "2", "tmux", "list-sessions", "-F", "#{pane_dead}\t#{session_name}"}, false},
+		{"two options", []string{"@hermod-workspace", "@hermod_origin"}, []string{"sh", "-c", classifyScript, "tmux", "0", "2", "tmux", "list-sessions", "-F", "#{pane_dead}\t#{@hermod-workspace}\t#{@hermod_origin}\t#{session_name}"}, false},
+		{"no user option", []string{"status"}, nil, true},
+		{"format syntax in a name", []string{"@a}#{b"}, nil, true},
+		{"a bare '@'", []string{"@"}, nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			listing, err := NewTmuxListing(tc.options...)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, want an error: %v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if got := listing.Command(); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("command = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClassify runs the classifying script under sh over a stand-in for tmux
+// that prints and exits as each case says.
+func TestClassify(t *testing.T) {
+	cases := []struct {
+		name       string
+		absent     int
+		out, says  string
+		status     int
+		wantStatus int
+		wantOut    string
+		wantErr    string
+	}{
+		{"success passes stdout through", TmuxAbsent, "1\n", "", 0, 0, "1\n", ""},
+		{"a missing session", TmuxAbsent, "", "can't find session: hermod-k", 1, TmuxAbsent, "", ""},
+		{"no server", TmuxAbsent, "", "no server running on /tmp/tmux-1000/default", 1, TmuxAbsent, "", ""},
+		{"no socket directory", TmuxAbsent, "", "error connecting to /tmp/tmux-1000/default (No such file or directory)", 1, TmuxAbsent, "", ""},
+		{"a listing with no server", 0, "", "no server running on /tmp/tmux-1000/default", 1, 0, "", ""},
+		{"a socket it may not open", TmuxAbsent, "", "error connecting to /tmp/tmux-1000/default (Permission denied)", 1, TmuxUnreadable, "", "error connecting to /tmp/tmux-1000/default (Permission denied)\n"},
+		{"any other failure", 0, "", "server exited unexpectedly", 1, TmuxUnreadable, "", "server exited unexpectedly\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stand := []string{"sh", "-c", `printf '%s' "$1"; printf '%s' "$2" >&2; exit "$3"`, "tmux", tc.out, tc.says, strconv.Itoa(tc.status)}
+			args := classified(tc.absent, stand...)
+			var out, errOut bytes.Buffer
+			cmd := exec.Command(args[0], args[1:]...)
+			cmd.Stdout, cmd.Stderr = &out, &errOut
+			err := cmd.Run()
+			status := 0
+			if exit, ok := err.(*exec.ExitError); ok {
+				status = exit.ExitCode()
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if status != tc.wantStatus || out.String() != tc.wantOut || errOut.String() != tc.wantErr {
+				t.Errorf("status %d, out %q, err %q; want %d, %q, %q", status, out.String(), errOut.String(), tc.wantStatus, tc.wantOut, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestTmuxListingParse(t *testing.T) {
+	cases := []struct {
+		name    string
+		options []string
+		out     string
+		want    []TmuxListed
+		wantErr bool
+	}{
+		{"none", []string{"@w"}, "", nil, false},
+		{
+			"a running and a dead session",
+			[]string{"@w"},
+			"0\tws\thermod-a\n1\t\thermod-b\n",
+			[]TmuxListed{
+				{Name: "hermod-a", Options: map[string]string{"@w": "ws"}},
+				{Name: "hermod-b", Dead: true, Options: map[string]string{"@w": ""}},
+			},
+			false,
+		},
+		{
+			"a name holding the separator, and no final newline",
+			nil,
+			"0\tmy\tsession",
+			[]TmuxListed{{Name: "my\tsession", Options: map[string]string{}}},
+			false,
+		},
+		{
+			"two options in their order",
+			[]string{"@w", "@o"},
+			"0\tws\tbox\thermod-a\n",
+			[]TmuxListed{{Name: "hermod-a", Options: map[string]string{"@w": "ws", "@o": "box"}}},
+			false,
+		},
+		{"a line short of a field", []string{"@w"}, "0\thermod-a\n", nil, true},
+		{"an unreadable pane state", nil, "x\thermod-a\n", nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			listing, err := NewTmuxListing(tc.options...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := listing.Parse(tc.out)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, want an error: %v", err, tc.wantErr)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("sessions = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLine runs each line through sh, which must read back the words it was
+// made from.
+func TestLine(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"safe words", []string{"tmux", "has-session", "-t", "=hermod-k:"}, "tmux has-session -t =hermod-k:"},
+		{"a format", []string{"tmux", "display-message", "-p", "#{pane_dead}"}, "tmux display-message -p '#{pane_dead}'"},
+		{"a quote and a space", []string{"echo", "it's here"}, `echo 'it'\''s here'`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			line := Line(tc.args)
+			if line != tc.want {
+				t.Errorf("Line = %q, want %q", line, tc.want)
+			}
+			out, err := exec.Command("sh", "-c", `eval "set -- $1"; printf '%s\n' "$@"`, "sh", line).Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n"); !reflect.DeepEqual(got, tc.args) {
+				t.Errorf("sh read %q, want %q", got, tc.args)
 			}
 		})
 	}
@@ -224,16 +458,16 @@ func TestNesting(t *testing.T) {
 			"tmux over ssh with identity",
 			func(leaf Executor) Executor { return NewTmux(NewSSH(leaf, "prod", WithTty()), "api") },
 			Command{Dir: "/home/u/api", Env: vars("GIT_AUTHOR_NAME", "Jane Doe"), Args: []string{"claude", "--model", "opus"}},
-			[]string{"ssh", "-t", "prod", "tmux new-session -A -s api -c /home/u/api -e 'GIT_AUTHOR_NAME=Jane Doe' 'claude --model opus'"},
-			`ssh -t prod 'tmux new-session -A -s api -c /home/u/api -e '\''GIT_AUTHOR_NAME=Jane Doe'\'' '\''claude --model opus'\'''` + "\n",
+			[]string{"ssh", "-t", "prod", "tmux new-session -A -s api -c /home/u/api -e 'GIT_AUTHOR_NAME=Jane Doe' -- claude --model opus"},
+			`ssh -t prod 'tmux new-session -A -s api -c /home/u/api -e '\''GIT_AUTHOR_NAME=Jane Doe'\'' -- claude --model opus'` + "\n",
 			false,
 		},
 		{
 			"login over tmux over ssh",
 			func(leaf Executor) Executor { return NewLogin(NewTmux(NewSSH(leaf, "prod"), "api", Detached())) },
 			Command{Args: []string{"claude"}},
-			[]string{"ssh", "prod", `tmux new-session -d -s api 'sh -c '\''exec "$SHELL" -lc "$1"'\'' sh claude'`},
-			`ssh prod 'tmux new-session -d -s api '\''sh -c '\''\'\'''\''exec "$SHELL" -lc "$1"'\''\'\'''\'' sh claude'\'''` + "\n",
+			[]string{"ssh", "prod", `tmux new-session -d -s api -- sh -c 'exec "$SHELL" -lc "$1"' sh claude`},
+			`ssh prod 'tmux new-session -d -s api -- sh -c '\''exec "$SHELL" -lc "$1"'\'' sh claude'` + "\n",
 			false,
 		},
 		{

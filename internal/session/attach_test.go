@@ -160,7 +160,7 @@ func TestAttachWorkerDirectory(t *testing.T) {
 				WithVars(func(key string) bool { return key == "CLAUDE_X" }).
 				WithHookedSettings("settings.json", secret.FromString("doc"), agent.NewCallback("127.0.0.1:1", []string{"/hook"}, secret.FromString("Bearer client"))),
 			map[string]string{
-				"env":           "export CLAUDE_X=1\nexport GIT_AUTHOR_NAME=Me\nexport GIT_COMMITTER_NAME=Me\nexport HERMOD_WORKER_DIR=/home/u/.hermod/s/hermod-c0ffee\n",
+				"env":           "export CLAUDE_X=1\nexport GIT_AUTHOR_NAME=Me\nexport GIT_COMMITTER_NAME=Me\n",
 				"mcp.json":      `{"k":"v"}`,
 				"settings.json": "doc port=10000 token=" + zeros,
 				portFile:        "10000\n",
@@ -171,7 +171,7 @@ func TestAttachWorkerDirectory(t *testing.T) {
 			"settings without hooks",
 			agent.NewNeeds([]string{"claude"}).WithSettings("settings.json", secret.FromString("doc")),
 			map[string]string{
-				"env":           "export GIT_AUTHOR_NAME=Me\nexport GIT_COMMITTER_NAME=Me\nexport HERMOD_WORKER_DIR=/home/u/.hermod/s/hermod-c0ffee\n",
+				"env":           "export GIT_AUTHOR_NAME=Me\nexport GIT_COMMITTER_NAME=Me\n",
 				"settings.json": "doc",
 			},
 		},

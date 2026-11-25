@@ -49,12 +49,6 @@ func NewCallback(address string, routes []string, token secret.Token) Callback {
 	return Callback{address: address, routes: clone(routes), token: token}
 }
 
-// DirVar is the variable a worker's process is given with its directory, an
-// absolute path on the remote. A command is declared before anyone knows
-// where its worker's directory will be, so it names the files its Needs
-// declare under this variable.
-const DirVar = "HERMOD_WORKER_DIR"
-
 // NewNeeds is the needs of a command, given with its paths already mapped to
 // the remote.
 func NewNeeds(command []string) Needs { return Needs{command: clone(command)} }

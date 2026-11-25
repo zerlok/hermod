@@ -1,17 +1,18 @@
 // Package worker is one process on the remote that outlives whoever started
 // it: a tmux session running a command, identified by a key and carrying tags,
-// both its caller's to choose. It builds tmux commands and runs them through a
-// shell.Executor pointed at the remote, and knows nothing about what its
-// process is or who it is for.
+// both its caller's to choose. It keeps the worker's lifecycle and runs it
+// through a shell.Executor pointed at the remote, taking every tmux command
+// from shell's tmux, and knows nothing about what its process is or who it is
+// for.
 //
 // Every program it runs on the remote is a script embedded here, so nothing of
 // Hermod's is installed there: write.sh, stream.sh and keep.sh start a worker,
-// and act.sh lists, closes, removes and joins one. Each takes its inputs as
-// arguments and runs as it reads in the repository.
+// pane.sh is its session's process, and act.sh lists, closes, removes and
+// joins one. Each takes its inputs as arguments, the tmux commands among them,
+// and runs as it reads in the repository.
 package worker
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -24,7 +25,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/zerlok/hermod/internal/env"
 	"github.com/zerlok/hermod/internal/shell"
@@ -37,6 +37,8 @@ var (
 	streamScript []byte
 	//go:embed keep.sh
 	keepScript []byte
+	//go:embed pane.sh
+	paneScript []byte
 	//go:embed act.sh
 	actScript []byte
 )
@@ -96,8 +98,9 @@ func unknownForm(f Form) error { return fmt.Errorf("worker: unknown form %d", f)
 type Key struct{ name string }
 
 // NewKey checks a worker's key. It is letters, digits, '-', '_', '@' and '+',
-// not starting with '-': tmux replaces '.' and ':' in a session name, a '/'
-// would leave the worker's directory, and a leading '-' reads as an option.
+// not starting with '-': tmux replaces '.' and ':' in a session name, so a
+// listing would not find the key again, a '/' would leave the worker's
+// directory, and a leading '-' reads as an option.
 func NewKey(name string) (Key, error) {
 	if name == "" || name[0] == '-' {
 		return Key{}, fmt.Errorf("worker: invalid key %q", name)
@@ -120,9 +123,8 @@ func (k Key) String() string { return k.name }
 // IsZero reports whether the key is the zero value, which names no worker.
 func (k Key) IsZero() bool { return k.name == "" }
 
-// target names the key's session exactly: without '=' a name also matches any
-// session it is the prefix of.
-func (k Key) target() string { return "=" + k.name + ":" }
+// session is the key's tmux session.
+func (k Key) session() shell.TmuxSession { return shell.NewTmuxSession(k.name) }
 
 // workersUnderHome holds every worker's directory, relative to the remote
 // user's home.
@@ -131,10 +133,6 @@ const workersUnderHome = ".hermod/s"
 // underHome is the worker's directory relative to the remote user's home, the
 // form the scripts take it in.
 func (k Key) underHome() string { return path.Join(workersUnderHome, k.name) }
-
-// Dir is the worker's directory on the remote, under the remote user's home,
-// where the files it was started with lie.
-func (k Key) Dir(home string) string { return path.Join(home, k.underHome()) }
 
 // staging is a new directory name, relative to the remote user's home, for
 // one start to write its files into. Its leading '.' keeps it apart from every
@@ -151,26 +149,14 @@ func (k Key) staging() (string, error) {
 // by which List finds it again.
 type Tag struct{ name, value string }
 
-// NewTag checks a tag: its name a tmux user option, '@' and then lower-case
-// letters, digits and '-', and its value printable, without spaces or ';'. A
-// listing prints the value between spaces, and tmux ends a command at a word
-// ending in ';'.
+// NewTag checks a tag: a session option shell's tmux takes, with a value,
+// since a session that lacks the option lists it empty.
 func NewTag(name, value string) (Tag, error) {
-	if len(name) < 2 || name[0] != '@' {
-		return Tag{}, fmt.Errorf("worker: invalid tag name %q", name)
-	}
-	for _, r := range name[1:] {
-		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
-			return Tag{}, fmt.Errorf("worker: invalid tag name %q", name)
-		}
+	if err := shell.CheckSessionOption(shell.SessionOption{Name: name, Value: value}); err != nil {
+		return Tag{}, fmt.Errorf("worker: invalid tag: %w", err)
 	}
 	if value == "" {
 		return Tag{}, fmt.Errorf("worker: tag %s has an empty value", name)
-	}
-	for _, r := range value {
-		if r == ';' || unicode.IsSpace(r) || !unicode.IsPrint(r) {
-			return Tag{}, fmt.Errorf("worker: invalid value %q of tag %s", value, name)
-		}
 	}
 	return Tag{name: name, value: value}, nil
 }
@@ -212,10 +198,6 @@ const (
 	posSuffix = ".pos"
 )
 
-// markVar is the variable that marks a line stream's process with its
-// directory, so a close never waits on another process that reused the ID.
-const markVar = "HERMOD_WORKER"
-
 // reserved are the names in the worker's directory a caller's file may not
 // take: the scripts' own.
 var reserved = map[string]bool{
@@ -241,7 +223,7 @@ type Spec struct {
 	Dir     string   // where the process starts on the remote, absolute or under the remote user's home
 	Command []string // the process and its arguments; none runs the user's login shell
 	Files   []File   // written into the worker's directory
-	Vars    env.Vars // given to the process from a file in the worker's directory, never on a command line
+	Vars    env.Vars // given to the process from a file in the worker's directory, never on a command line; env.WorkerDir is the worker's own
 	Tags    []Tag
 	Form    Form
 }
@@ -266,6 +248,11 @@ func (s Spec) check() error {
 	for _, key := range s.Vars.Keys() {
 		if !shell.IsName(key) {
 			return fmt.Errorf("worker: variable %q is not a shell name", key)
+		}
+		// The process is given its directory under this name after the
+		// variables, so a value of the caller's would never reach it.
+		if key == env.WorkerDir {
+			return fmt.Errorf("worker: variable %s is the worker's own", key)
 		}
 	}
 	for _, t := range s.Tags {
@@ -331,7 +318,7 @@ const (
 func act(op string, args ...string) shell.Command {
 	return shell.Command{Args: append([]string{
 		"sh", "-c", string(actScript), "act",
-		strconv.Itoa(refusedStatus), strconv.Itoa(lingersStatus), strconv.Itoa(readFailed), op,
+		strconv.Itoa(refusedStatus), strconv.Itoa(lingersStatus), strconv.Itoa(readFailed), strconv.Itoa(shell.TmuxAbsent), op,
 	}, args...)}
 }
 
@@ -368,17 +355,24 @@ func Start(ctx context.Context, remote Remote, spec Spec) (Worker, error) {
 			return Worker{}, err
 		}
 	}
-	args := []string{
-		w.key.name, w.key.underHome(), staging, spec.Dir, markVar, pidFile, envFile,
-		spec.Form.String(), fifo, outLog, errLog, strconv.Itoa(refusedStatus), strconv.Itoa(len(spec.Tags)),
+	session := w.key.session()
+	options := make([]shell.SessionOption, len(spec.Tags))
+	for i, t := range spec.Tags {
+		options[i] = shell.SessionOption{Name: t.name, Value: t.value}
 	}
-	for _, t := range spec.Tags {
-		args = append(args, t.name, t.value)
+	pane := append([]string{
+		"sh", "-c", string(paneScript), "pane",
+		w.key.underHome(), staging, spec.Dir, env.WorkerDir, pidFile, envFile,
+		spec.Form.String(), fifo, outLog, errLog, shell.Line(session.KeepFailedPane()),
+	}, spec.Command...)
+	newSession, err := handed(func(in shell.Executor) shell.Executor {
+		return shell.NewLogin(shell.NewTmux(in, w.key.name, shell.Detached(), shell.WithSessionOptions(options...)))
+	}, pane)
+	if err != nil {
+		return Worker{}, fmt.Errorf("start worker %s: %w", w.key, err)
 	}
-	for _, word := range spec.Command {
-		args = append(args, tmuxWord(word))
-	}
-	err = w.exec(ctx, "start", script(keepScript, args...))
+	keep := append([]string{w.key.underHome(), staging, strconv.Itoa(refusedStatus), shell.Line(session.Has())}, newSession...)
+	err = w.exec(ctx, "start", script(keepScript, keep...))
 	if refused(err) {
 		return Worker{}, fmt.Errorf("start %s: %w", w.key, ErrPresent)
 	}
@@ -388,13 +382,23 @@ func Start(ctx context.Context, remote Remote, spec Spec) (Worker, error) {
 	return w, nil
 }
 
-// tmuxWord keeps a command word whole in tmux's arguments, where a word ending
-// in ';' ends the command and "\;" stands for a literal one.
-func tmuxWord(word string) string {
-	if strings.HasSuffix(word, ";") {
-		return strings.TrimSuffix(word, ";") + `\;`
+// handed is args as the executors wrap makes hand them inward, run nowhere,
+// for a script on the remote that decides whether to run them.
+func handed(wrap func(shell.Executor) shell.Executor, args []string) ([]string, error) {
+	var c capture
+	if err := wrap(&c).Exec(context.Background(), shell.Command{Args: args}).Wait(); err != nil {
+		return nil, err
 	}
-	return word
+	return c.args, nil
+}
+
+// capture is an executor that records the arguments of the command it is
+// handed and runs nothing.
+type capture struct{ args []string }
+
+func (c *capture) Exec(_ context.Context, cmd shell.Command) shell.Execution {
+	c.args = cmd.Args
+	return shell.Finished(cmd, nil)
 }
 
 // writeDir writes the variables and spec's files into staging, each name
@@ -411,72 +415,62 @@ func (w Worker) writeDir(ctx context.Context, staging string, spec Spec) error {
 	return w.exec(ctx, "write the directory of", shell.Command{Args: args, Stdin: &payload})
 }
 
-// listed is one session of a listing: its name, its state and the value of
-// the tag asked for, "" when it has none.
-type listed struct {
-	name  string
-	state State
-	tag   string
+// listEnd is the line act.sh's list ends a complete listing with.
+const listEnd = "end\n"
+
+// complete is a listing without the line that ends it; ok is false when out
+// lacks that line, as a listing cut short does.
+func complete(out string) (sessions string, ok bool) {
+	if out == listEnd {
+		return "", true
+	}
+	sessions, ok = strings.CutSuffix(out, "\n"+listEnd)
+	if !ok {
+		return "", false
+	}
+	return sessions + "\n", true
 }
 
-// list reads every tmux session on the remote with the value of the tag
-// option named, or of none when it is "". The session's name comes last, as
-// the one field that may hold a space.
-func list(ctx context.Context, remote Remote, tagName string) ([]listed, error) {
-	format := "#{pane_dead}  #{session_name}"
-	if tagName != "" {
-		format = "#{pane_dead} #{" + tagName + "} #{session_name}"
+// list reads every tmux session on the remote with the values of the tags
+// named.
+func list(ctx context.Context, remote Remote, tags ...string) ([]shell.TmuxListed, error) {
+	listing, err := shell.NewTmuxListing(tags...)
+	if err != nil {
+		return nil, err
 	}
-	out, err := shell.Run(ctx, remote.Read, act("list", format))
+	out, err := shell.Run(ctx, remote.Read, act("list", shell.Line(listing.Command())))
 	if err != nil {
 		return nil, fmt.Errorf("list tmux sessions: %w%s", err, detail(out.Stderr))
 	}
-	return parseList(out.Stdout)
-}
-
-func parseList(out string) ([]listed, error) {
-	var (
-		sessions []listed
-		ended    bool
-	)
-	sc := bufio.NewScanner(strings.NewReader(out))
-	for sc.Scan() {
-		line := sc.Text()
-		if line == "end" {
-			ended = true
-			continue
-		}
-		fields := strings.SplitN(line, " ", 3)
-		if len(fields) != 3 {
-			return nil, fmt.Errorf("list tmux sessions: unreadable line %q", line)
-		}
-		s := listed{name: fields[2], tag: fields[1]}
-		switch fields[0] {
-		case "0":
-			s.state = Running
-		case "1":
-			s.state = Exited
-		default:
-			return nil, fmt.Errorf("list tmux sessions: unreadable line %q", line)
-		}
-		sessions = append(sessions, s)
-	}
+	sessions, ended := complete(out.Stdout)
 	if !ended {
 		return nil, errors.New("list tmux sessions: incomplete output")
 	}
-	return sessions, nil
+	listed, err := listing.Parse(sessions)
+	if err != nil {
+		return nil, fmt.Errorf("list tmux sessions: %w", err)
+	}
+	return listed, nil
+}
+
+// stateOf is the state of a session a listing found.
+func stateOf(s shell.TmuxListed) State {
+	if s.Dead {
+		return Exited
+	}
+	return Running
 }
 
 // State reads the worker's state from tmux. It is read-only; a look that fails
 // is an error, not a state.
 func (w Worker) State(ctx context.Context) (State, error) {
-	sessions, err := list(ctx, w.remote, "")
+	sessions, err := list(ctx, w.remote)
 	if err != nil {
 		return Absent, err
 	}
 	for _, s := range sessions {
-		if s.name == w.key.name {
-			return s.state, nil
+		if s.Name == w.key.name {
+			return stateOf(s), nil
 		}
 	}
 	return Absent, nil
@@ -501,14 +495,14 @@ func List(ctx context.Context, remote Remote, tag Tag) ([]Listed, error) {
 	}
 	var found []Listed
 	for _, s := range sessions {
-		if s.tag != tag.value {
+		if s.Options[tag.name] != tag.value {
 			continue
 		}
-		key, err := NewKey(s.name)
+		key, err := NewKey(s.Name)
 		if err != nil {
 			continue
 		}
-		found = append(found, Listed{Worker: New(remote, key), State: s.state})
+		found = append(found, Listed{Worker: New(remote, key), State: stateOf(s)})
 	}
 	return found, nil
 }
@@ -544,15 +538,16 @@ func (w Worker) Look(ctx context.Context, cmd []string, files ...string) (Look, 
 			return Look{}, err
 		}
 	}
-	line := ""
+	var line string
 	if len(cmd) > 0 {
-		words := make([]string, len(cmd))
-		for i, word := range cmd {
-			words[i] = shell.Quote(word)
+		login, err := handed(shell.NewLogin, cmd)
+		if err != nil {
+			return Look{}, fmt.Errorf("look at worker %s: %w", w.key, err)
 		}
-		line = strings.Join(words, " ")
+		line = shell.Line(login)
 	}
-	out, err := shell.Run(ctx, w.remote.Read, act("look", append([]string{w.key.target(), w.key.underHome(), line}, files...)...))
+	args := []string{shell.Line(w.key.session().PaneDead()), w.key.underHome(), line}
+	out, err := shell.Run(ctx, w.remote.Read, act("look", append(args, files...)...))
 	if err != nil {
 		return Look{}, fmt.Errorf("look at worker %s: %w%s", w.key, err, detail(out.Stderr))
 	}
@@ -638,7 +633,10 @@ func FreePort(ctx context.Context, remote Remote, record string, candidates []in
 // ErrExited, since its pane is removed instead, and an Absent one has nothing
 // to close. A tmux that cannot tell is an error. The worker's directory stays.
 func (w Worker) Close(ctx context.Context) error {
-	err := w.exec(ctx, "close", act("close", w.key.target(), w.key.underHome(), pidFile, markVar))
+	session := w.key.session()
+	err := w.exec(ctx, "close", act("close",
+		shell.Line(session.PaneDead()), shell.Line(session.Kill()),
+		w.key.underHome(), pidFile, env.WorkerDir))
 	switch code, _ := shell.ExitCode(err); {
 	case err == nil:
 		return nil
@@ -653,7 +651,8 @@ func (w Worker) Close(ctx context.Context) error {
 // Remove removes an Exited worker. A Running one is ErrRunning, an Absent one
 // has nothing to remove, and a tmux that cannot tell is an error.
 func (w Worker) Remove(ctx context.Context) error {
-	err := w.exec(ctx, "remove", act("remove", w.key.target()))
+	session := w.key.session()
+	err := w.exec(ctx, "remove", act("remove", shell.Line(session.PaneDead()), shell.Line(session.Kill())))
 	if refused(err) {
 		return fmt.Errorf("remove %s: %w", w.key, ErrRunning)
 	}
@@ -685,13 +684,14 @@ func (Lines) isStdio()  {}
 // Stdio is the commands that join the worker's stdio in form, which its
 // caller started it with; a form Start would refuse is refused here too.
 func (w Worker) Stdio(form Form) (Stdio, error) {
+	session := w.key.session()
 	switch form {
 	case Terminal:
-		return Attach{Command: act("attach", w.key.target())}, nil
+		return Attach{Command: act("attach", shell.Line(session.Has()), shell.Line(session.Attach()))}, nil
 	case LineStream:
 		dir := w.key.underHome()
 		logOf := func(log string) shell.Command {
-			return act("log", w.key.target(), path.Join(dir, log), path.Join(dir, log+posSuffix))
+			return act("log", shell.Line(session.PaneDead()), path.Join(dir, log), path.Join(dir, log+posSuffix))
 		}
 		return Lines{
 			In:  act("feed", path.Join(dir, fifo)),

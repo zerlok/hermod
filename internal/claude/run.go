@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/zerlok/hermod/internal/agent"
+	"github.com/zerlok/hermod/internal/env"
 	"github.com/zerlok/hermod/internal/pathmap"
 	"github.com/zerlok/hermod/internal/secret"
 )
@@ -322,7 +323,7 @@ func (r *rewriter) command() []string {
 	var params []string
 	for _, w := range r.words {
 		if w.file {
-			script = append(script, `"${`+agent.DirVar+`:?}/`+w.text+`"`)
+			script = append(script, `"${`+env.WorkerDir+`:?}/`+w.text+`"`)
 			continue
 		}
 		params = append(params, w.text)

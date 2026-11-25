@@ -15,9 +15,10 @@ type login struct{ inner Executor }
 // command becomes the tmux session's shell command.
 func NewLogin(inner Executor) Executor { return login{inner: inner} }
 
-// Exec hands the command inward as `sh -c 'exec "$SHELL" -lc "$1"' sh LINE`:
-// $SHELL is resolved on the remote, the joined line keeps the command's own
-// word boundaries as the single $1, and exec leaves no wrapper process.
+// Exec hands the command inward as the command that runs it under the user's
+// login shell: `sh -c 'exec "$SHELL" -lc "$1"' sh LINE`. $SHELL is resolved
+// where it runs, the joined line keeps the command's own word boundaries as
+// the single $1, and exec leaves no wrapper process.
 func (l login) Exec(ctx context.Context, cmd Command) Execution {
 	if len(cmd.Args) == 0 {
 		return l.inner.Exec(ctx, cmd)

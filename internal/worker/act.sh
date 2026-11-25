@@ -1,62 +1,49 @@
 # Acts on a worker that keep.sh started: lists the tmux sessions, closes or
 # removes one, or joins its stdio.
 #
-#   sh -c "$(cat act.sh)" act REFUSED LINGERS UNREADABLE OP [ARG]...
+#   sh -c "$(cat act.sh)" act REFUSED LINGERS UNREADABLE ABSENT OP [ARG]...
 #
 # REFUSED is the status a refused operation exits with, LINGERS that of a close
 # whose process outlived the wait, and UNREADABLE that of a tmux that could not
-# tell which sessions exist. OP is one of:
+# tell which sessions exist. ABSENT is the status HAS and DEAD exit with for a
+# missing session. OP is one of:
 #
-#   list FORMAT                 every session in FORMAT, then `end`
-#   close TARGET WDIR PID MARK  hang up on a Running worker
-#   remove TARGET               remove an Exited worker's kept pane
-#   attach TARGET               join a terminal worker on the caller's tty
-#   feed FIFO                   copy stdin into a line stream's FIFO
-#   log TARGET LOG POS          deliver a line stream's log
-#   look TARGET WDIR LINE [FILE]...  read a worker's state and files, and run LINE
-#   port DIR RECORD [PORT]...   pick a port free on the remote
+#   list LIST                       every session as LIST prints it, then `end`
+#   close DEAD KILL WDIR PID MARK   hang up on a Running worker
+#   remove DEAD KILL                remove an Exited worker's kept pane
+#   attach HAS ATTACH               join a terminal worker on the caller's tty
+#   feed FIFO                       copy stdin into a line stream's FIFO
+#   log DEAD LOG POS                deliver a line stream's log
+#   look DEAD WDIR LINE [FILE]...   read a worker's state and files, and run LINE
+#   port DIR RECORD [PORT]...       pick a port free on the remote
 #
-# TARGET names the session exactly, and WDIR, FIFO, LOG and POS are under
-# $HOME. A command it is sent with runs here unchanged, so it reads the same in
-# the repository as on the remote.
-refused=$1 lingers=$2 unreadable=$3 op=$4
-shift 4
+# HAS, DEAD, KILL, ATTACH and LIST are tmux commands on the worker's session,
+# each quoted for this shell: HAS exits 0 when the session exists, DEAD prints 1
+# when its pane is kept after the process ended and 0 while it runs, KILL ends
+# it, ATTACH joins it, and LIST lists every session, printing nothing when there
+# is none. HAS, DEAD and LIST exit ABSENT, or 0 for LIST, when the session or
+# the tmux server is missing, and with another failure when tmux cannot tell,
+# having said why on stderr. LINE is a command quoted for this shell. WDIR,
+# FIFO, LOG and POS are under $HOME. A command it is sent with runs here
+# unchanged, so it reads the same in the repository as on the remote.
+refused=$1 lingers=$2 unreadable=$3 absent=$4 op=$5
+shift 5
 
-# absent reports whether tmux's message says the session asked for, or its
-# whole server, is not there. Any other failure may hide a session, so it is no
-# answer.
-absent() {
-  case $1 in
-  *"can't find session"* | *"no server running"* | *"error connecting to"*"(No such file or directory)"*) return 0 ;;
-  esac
-  return 1
-}
-
-# present reports whether the session $1 exists, leaving its pane_dead in
-# $dead, and exits UNREADABLE when tmux cannot tell. has-session decides, since
-# display-message prints an empty line for a missing session while a server
-# runs.
+# present reports whether the session exists, by DEAD $1, leaving what it
+# prints in $dead, and exits UNREADABLE when tmux cannot tell.
 present() {
-  if ! out=$(tmux has-session -t "$1" 2>&1 </dev/null); then
-    absent "$out" && return 1
-    printf '%s\n' "$out" >&2
-    exit "$unreadable"
-  fi
-  dead=$(tmux display-message -p -t "$1" '#{pane_dead}' </dev/null) || exit "$unreadable"
-  [ -n "$dead" ]
+  dead=$(eval "$1" </dev/null)
+  case $? in
+  0) return 0 ;;
+  "$absent") return 1 ;;
+  esac
+  exit "$unreadable"
 }
 
-# A look that ends with `end` is complete. A tmux with no server has no
-# sessions; any other failure exits UNREADABLE, since sessions may exist that
-# it could not list.
+# A look that ends with `end` is complete; one that fails exits UNREADABLE,
+# since sessions may exist that it could not list.
 list() {
-  if ! out=$(tmux list-sessions -F "$1" 2>&1 </dev/null); then
-    if ! absent "$out"; then
-      printf '%s\n' "$out" >&2
-      exit "$unreadable"
-    fi
-    out=
-  fi
+  out=$(eval "$1" </dev/null) || exit "$unreadable"
   if [ -n "$out" ]; then printf '%s\n' "$out"; fi
   echo end
 }
@@ -69,13 +56,13 @@ list() {
 # gone has nothing to close; an Exited one is refused.
 close() {
   present "$1" || exit 0
-  d=$HOME/$2
-  p=$(cat "$d/$3" 2>/dev/null) || p=
+  d=$HOME/$3
+  p=$(cat "$d/$4" 2>/dev/null) || p=
   if [ "$dead" = 1 ]; then exit "$refused"; fi
-  tmux kill-session -t "$1" </dev/null 2>/dev/null || true
+  eval "$2" </dev/null 2>/dev/null || true
   i=0
-  while ours "$p" "$4=$d" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-  if ours "$p" "$4=$d"; then exit "$lingers"; fi
+  while ours "$p" "$5=$d" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  if ours "$p" "$5=$d"; then exit "$lingers"; fi
 }
 
 ours() { [ -n "$1" ] && tr '\0' '\n' 2>/dev/null <"/proc/$1/environ" | grep -qxF "$2"; }
@@ -84,17 +71,17 @@ ours() { [ -n "$1" ] && tr '\0' '\n' 2>/dev/null <"/proc/$1/environ" | grep -qxF
 remove() {
   present "$1" || exit 0
   if [ "$dead" != 1 ]; then exit "$refused"; fi
-  exec tmux kill-session -t "$1" </dev/null
+  eval "$2" </dev/null
 }
 
 # Joins a session only when it exists: attaching creates nothing, but it fails
 # without saying why.
 attach() {
-  tmux has-session -t "$1" 2>/dev/null </dev/null || {
-    printf 'no tmux session %s\n' "$1" >&2
+  if ! eval "$1" </dev/null; then
+    echo 'no tmux session to join' >&2
     exit "$refused"
-  }
-  exec tmux attach-session -t "$1"
+  fi
+  eval "exec $2"
 }
 
 # Copies stdin into the FIFO one complete line at a time: `read -r` gives a
@@ -125,7 +112,7 @@ feed() {
 log() {
   export LC_ALL=C
   trap '' PIPE
-  t=$1 log=$HOME/$2 pos=$HOME/$3
+  pane=$1 log=$HOME/$2 pos=$HOME/$3
   [ -f "$log" ] || {
     printf 'no log at %s\n' "$log" >&2
     exit "$refused"
@@ -144,12 +131,12 @@ log() {
 }
 
 alive() {
-  if s=$(tmux display-message -p -t "$t" '#{pane_dead}' 2>&1 </dev/null); then
-    case $s in 1 | "") return 1 ;; esac
-  else
-    absent "$s" && return 1
-  fi
-  return 0
+  s=$(eval "$pane" 2>/dev/null </dev/null)
+  case $? in
+  0) [ "$s" != 1 ] ;;
+  "$absent") return 1 ;;
+  *) return 0 ;;
+  esac
 }
 
 emit() {
@@ -163,16 +150,15 @@ emit() {
 
 at() { cat "$pos" 2>/dev/null || echo 0; }
 
-# Reads in one call what a caller decides from: the worker's state, as
-# `state 0`, `state 1` for a dead pane or `state absent`; each FILE of its
+# Reads in one call what a caller decides from: the worker's state, by DEAD,
+# as `state 0`, `state 1` for a dead pane or `state absent`; each FILE of its
 # directory that exists, as `file NAME LENGTH` and its bytes; then `out` and
-# what the command line LINE writes, run under the login shell, where a program
-# such as an agent is found. A LINE that fails fails the look, since its output
-# then answers nothing.
+# what the command LINE writes. A LINE that fails fails the look, since its
+# output then answers nothing.
 look() {
-  t=$1 wd=$HOME/$2 line=$3
+  pane=$1 wd=$HOME/$2 line=$3
   shift 3
-  if present "$t"; then printf 'state %s\n' "$dead"; else echo 'state absent'; fi
+  if present "$pane"; then printf 'state %s\n' "$dead"; else echo 'state absent'; fi
   for f; do
     if [ -f "$wd/$f" ]; then
       printf 'file %s %s\n' "$f" "$(wc -c <"$wd/$f" | tr -d ' ')"
@@ -180,7 +166,7 @@ look() {
     fi
   done
   echo out
-  if [ -n "$line" ]; then exec "$SHELL" -lc "$line" </dev/null; fi
+  if [ -n "$line" ]; then eval "exec $line" </dev/null; fi
 }
 
 # Prints the first PORT that no worker's directory under DIR records in its

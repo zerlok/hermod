@@ -16,6 +16,7 @@ import (
 	"github.com/zerlok/hermod/internal/secret"
 	"github.com/zerlok/hermod/internal/shell"
 	"github.com/zerlok/hermod/internal/worker"
+	"github.com/zerlok/hermod/internal/worker/workertest"
 	"github.com/zerlok/hermod/internal/workspace"
 )
 
@@ -30,12 +31,6 @@ type exitError int
 
 func (e exitError) Error() string { return "exit status " + strconv.Itoa(int(e)) }
 func (e exitError) ExitCode() int { return int(e) }
-
-// The statuses worker's scripts exit with, as it passes them.
-const (
-	refusedStatus = 3
-	unreadable    = 5
-)
 
 // sshFailed is ssh's own exit status, for a connection that dropped or a
 // forward it could not bind.
@@ -122,7 +117,7 @@ type play func(ctx context.Context, in io.Reader, out, errOut io.Writer) error
 func (f *fake) Exec(ctx context.Context, cmd shell.Command) shell.Execution {
 	var p play
 	if args := cmd.Args; len(args) > 0 && args[0] == "ssh" {
-		p = f.onRemote(splitWords(args[len(args)-1]), forwarded(args))
+		p = f.onRemote(workertest.Words(args[len(args)-1]), forwarded(args))
 	} else {
 		p = f.onLocal(args)
 	}
@@ -244,63 +239,22 @@ func (f *fake) list(rest []string, out, errOut io.Writer) error {
 	return nil
 }
 
-// splitWords splits a line the way a POSIX shell splits the words shell
-// quotes: bare words and single-quoted parts.
-func splitWords(line string) []string {
-	var (
-		words  []string
-		cur    strings.Builder
-		inWord bool
-		quoted bool
-	)
-	for i := 0; i < len(line); i++ {
-		c := line[i]
-		switch {
-		case quoted && c == '\'':
-			quoted = false
-		case quoted:
-			cur.WriteByte(c)
-		case c == '\'':
-			quoted, inWord = true, true
-		case c == '\\' && i+1 < len(line):
-			i++
-			cur.WriteByte(line[i])
-			inWord = true
-		case c == ' ':
-			if inWord {
-				words = append(words, cur.String())
-				cur.Reset()
-				inWord = false
-			}
-		default:
-			cur.WriteByte(c)
-			inWord = true
-		}
-	}
-	if inWord {
-		words = append(words, cur.String())
-	}
-	return words
-}
-
-func sessionOf(target string) string {
-	return strings.TrimSuffix(strings.TrimPrefix(target, "="), ":")
-}
-
 func (f *fake) onRemote(words []string, port string) play {
 	switch {
 	case len(words) == 5 && words[0] == "sh" && words[2] == `exec "$SHELL" -lc "$1"`:
-		inner := splitWords(words[4])
+		inner := workertest.Words(words[4])
 		if len(inner) == 2 && (inner[0] == agentList || inner[0] == agentLocate) {
 			return f.query(inner[0], inner[1])
 		}
 		return f.oneShot(inner)
-	case len(words) > 7 && words[0] == "sh" && words[1] == "-c" && words[3] == "act":
-		return f.act(words[7], words[8:])
-	case len(words) > 4 && words[0] == "sh" && words[1] == "-c" && words[3] == "write":
-		return f.write(words[4], words[5:])
-	case len(words) > 7 && words[0] == "sh" && words[1] == "-s":
-		return f.keep(words[3:])
+	}
+	switch c, isWorker := workertest.Read(words); {
+	case isWorker && c.Script == "act":
+		return f.act(c)
+	case isWorker && c.Script == "write":
+		return f.write(c.Args[0], c.Args[1:])
+	case isWorker && c.Script == "keep":
+		return f.keep(c)
 	case len(words) == 3 && words[0] == "sh" && strings.HasPrefix(words[2], "echo hermod-net-ready"):
 		return f.forward(port)
 	}
@@ -389,101 +343,96 @@ func (f *fake) write(staging string, pairs []string) play {
 	}
 }
 
-// keep starts a worker as keep.sh does, from its arguments.
-func (f *fake) keep(args []string) play {
+// keep starts a worker as keep.sh does.
+func (f *fake) keep(c workertest.Command) play {
 	return func(_ context.Context, in io.Reader, _, _ io.Writer) error {
 		_, _ = io.Copy(io.Discard, in)
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		name, wd, staging := args[0], args[1], args[2]
+		name := c.Session
 		if _, ok := f.sessions[name]; ok {
-			return exitError(refusedStatus)
+			return exitError(c.Refused)
 		}
-		n, _ := strconv.Atoi(args[12])
-		tags := map[string]string{}
-		for i := 0; i < n; i++ {
-			tags[args[13+2*i]] = args[14+2*i]
-		}
-		f.sessions[name] = &tmuxSession{state: worker.Running, tags: tags}
-		f.dirs[wd] = f.dirs[staging]
-		delete(f.dirs, staging)
-		f.forms[name] = args[7]
-		f.record("start in", args[3], name)
+		f.sessions[name] = &tmuxSession{state: worker.Running, tags: c.Start.Tags}
+		f.dirs[c.Start.WorkerDir] = f.dirs[c.Start.Staging]
+		delete(f.dirs, c.Start.Staging)
+		f.forms[name] = c.Start.Form
+		f.record("start in", c.Start.Dir, name)
 		return nil
 	}
 }
 
 // act plays one operation of act.sh.
-func (f *fake) act(op string, args []string) play {
+func (f *fake) act(c workertest.Command) play {
 	return func(ctx context.Context, _ io.Reader, out, _ io.Writer) error {
-		switch op {
+		switch c.Op {
 		case "attach":
 			f.mu.Lock()
 			f.joins = append(f.joins, worker.Terminal.String())
 			f.mu.Unlock()
 			return f.join(ctx)
 		case "feed", "log":
-			if op == "log" && len(args) > 1 && path.Base(args[1]) == "err.log" {
+			if c.Op == "log" && path.Base(c.Args[1]) == "err.log" {
 				f.mu.Lock()
 				says := f.adapterSays
 				f.mu.Unlock()
 				_, _ = io.WriteString(out, says)
 			}
-			return f.stream(ctx, op)
+			return f.stream(ctx, c.Op)
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		switch op {
+		switch c.Op {
 		case "list":
 			if f.workersFail {
-				return exitError(unreadable)
-			}
-			tag := ""
-			if fields := strings.Fields(args[0]); len(fields) == 3 {
-				tag = strings.TrimSuffix(strings.TrimPrefix(fields[1], "#{"), "}")
+				return exitError(c.Failed)
 			}
 			var names []string
 			for name := range f.sessions {
 				names = append(names, name)
 			}
 			sort.Strings(names)
+			var listed []workertest.Listed
 			for _, name := range names {
 				s := f.sessions[name]
-				value := s.tags[tag]
-				if s.tags == nil {
-					value = f.workspaceOf()
+				tags := s.tags
+				if tags == nil {
+					tags = map[string]string{}
+					for _, o := range c.Listed {
+						tags[o] = f.workspaceOf()
+					}
 				}
-				_, _ = fmt.Fprintf(out, "%s %s %s\n", dead(s.state), value, name)
+				listed = append(listed, workertest.Listed{Name: name, Dead: s.state == worker.Exited, Tags: tags})
 			}
-			_, _ = fmt.Fprintln(out, "end")
+			_, _ = io.WriteString(out, c.List(listed))
 		case "look":
 			state := "absent"
-			if s, ok := f.sessions[sessionOf(args[0])]; ok {
+			if s, ok := f.sessions[c.Session]; ok {
 				state = dead(s.state)
 			}
 			_, _ = fmt.Fprintf(out, "state %s\n", state)
-			for _, name := range args[3:] {
-				if content, ok := f.dirs[args[1]][name]; ok {
+			for _, name := range c.Look.Files {
+				if content, ok := f.dirs[c.Look.WorkerDir][name]; ok {
 					_, _ = fmt.Fprintf(out, "file %s %d\n%s", name, len(content), content)
 				}
 			}
 			_, _ = fmt.Fprintln(out, "out")
-			if args[2] != "" {
+			if c.Look.Line != "" {
 				_, _ = io.WriteString(out, f.probe)
 			}
 		case "port":
-			_, _ = fmt.Fprintln(out, args[3])
+			_, _ = fmt.Fprintln(out, c.Ports[0])
 		case "close":
-			name := sessionOf(args[0])
+			name := c.Session
 			if s, ok := f.sessions[name]; ok && s.state == worker.Exited {
-				return exitError(refusedStatus)
+				return exitError(c.Refused)
 			}
 			delete(f.sessions, name)
 			f.record("close", name)
 		case "remove":
-			name := sessionOf(args[0])
+			name := c.Session
 			if s, ok := f.sessions[name]; ok && s.state == worker.Running {
-				return exitError(refusedStatus)
+				return exitError(c.Refused)
 			}
 			delete(f.sessions, name)
 			f.record("remove", name)

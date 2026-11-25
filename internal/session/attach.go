@@ -297,10 +297,8 @@ func startWorker(ctx context.Context, req Request, ws *workspace.Workspace, key 
 		Dir:     ws.PathMap().ToRemote(req.Dir),
 		Command: needs.Command(),
 		Files:   files,
-		Vars: needs.Vars(req.Environ).
-			With(req.Identity.vars()...).
-			With(env.Pair{Key: agent.DirVar, Value: env.Plain(key.Dir(req.Remote.Home))}),
-		Form: form,
+		Vars:    needs.Vars(req.Environ).With(req.Identity.vars()...),
+		Form:    form,
 	})
 	return h, hooked, err
 }

@@ -109,9 +109,9 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 ## 15. `shell` and `worker`: tmux in `shell`
 
-- [ ] 15.1 In `internal/shell`, give the tmux wrapper all of tmux's command language: making a session with its options, quoting what goes on tmux's command line, and listing the sessions with their options in one format ([`shell.Executor`](../../../docs/ARCHITECTURE.md#shellexecutor--a-workstation)). Move `tmuxWord`, the session creation and the `ls` format out of `internal/worker`
+- [x] 15.1 In `internal/shell`, give the tmux wrapper all of tmux's command language: making a session with its options, quoting what goes on tmux's command line, and listing the sessions with their options in one format ([`shell.Executor`](../../../docs/ARCHITECTURE.md#shellexecutor--a-workstation)). Move `tmuxWord`, the session creation and the `ls` format out of `internal/worker`
 - [ ] 15.2 Reduce `internal/worker` to lifecycle: key, tags, state, start, close, remove and its [scripts](../../../docs/ARCHITECTURE.md#remote-scripts), through `shell`'s tmux, building no tmux command; `Spec` is key, directory, command, variables, tags and `Form`, its variables written to the worker's `env`; the worker's directory is given to its process as the variable whose name the `env` package declares, `HERMOD_WORKER_DIR` ([Worker](../../../docs/ARCHITECTURE.md#worker), [A worker's directory](../../../docs/ARCHITECTURE.md#a-workers-directory))
-- [ ] 15.3 Tests: tmux argv for a session with options, quoting, and the listing; `worker` start, close, remove and list through a fake `shell.Executor`; no secret in any argv
+- [x] 15.3 Tests: tmux argv for a session with options, quoting, and the listing; `worker` start, close, remove and list through a fake `shell.Executor`; no secret in any argv
 
 ## 16. `relay`
 

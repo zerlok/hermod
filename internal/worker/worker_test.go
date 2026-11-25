@@ -17,6 +17,7 @@ import (
 	"github.com/zerlok/hermod/internal/env"
 	"github.com/zerlok/hermod/internal/secret"
 	"github.com/zerlok/hermod/internal/shell"
+	"github.com/zerlok/hermod/internal/worker/workertest"
 )
 
 // exitError is a remote command's failure with its exit status.
@@ -68,22 +69,21 @@ func (r *remote) Exec(_ context.Context, cmd shell.Command) shell.Execution {
 }
 
 func (r *remote) answer(args []string, stdin string) (string, error) {
+	c, ok := workertest.Read(args)
 	switch {
-	case stdin == string(keepScript):
-		return "", r.start(args[3:])
-	case stdin == string(streamScript):
-		return "", r.stream(args[3:])
-	case len(args) > 4 && args[2] == string(writeScript):
-		return "", r.write(args[4], args[5:], stdin)
-	case len(args) > 8 && args[2] == string(actScript):
-		switch op, target := args[7], strings.Trim(args[8], "=:"); op {
-		case "list":
-			return r.list(args[8])
-		case "close":
-			return "", r.close(target)
-		case "remove":
-			return "", r.remove(target)
-		}
+	case !ok:
+	case c.Script == "keep":
+		return "", r.start(c)
+	case c.Script == "stream":
+		return "", r.stream(c.Args)
+	case c.Script == "write":
+		return "", r.write(c.Args[0], c.Args[1:], stdin)
+	case c.Op == "list":
+		return r.list(c)
+	case c.Op == "close":
+		return "", r.close(c.Session)
+	case c.Op == "remove":
+		return "", r.remove(c.Session)
 	}
 	return "", fmt.Errorf("unexpected command %q", args)
 }
@@ -119,31 +119,26 @@ func (r *remote) stream(args []string) error {
 	return nil
 }
 
-// start makes the session, then puts the staging directory in place of the
-// worker's; a session taken already only drops the staging directory.
-func (r *remote) start(args []string) error {
-	name, wd, staging := args[0], args[1], args[2]
-	if _, ok := r.sessions[name]; ok {
-		delete(r.dirs, staging)
-		code, _ := strconv.Atoi(args[11])
-		return exitError(code)
-	}
-	tags := map[string]string{}
-	n, _ := strconv.Atoi(args[12])
-	for i := 0; i < n; i++ {
-		tags[args[13+2*i]] = args[14+2*i]
+// start makes the session keep makes, with its tags, then puts the staging
+// directory in place of the worker's; a session taken already only drops the
+// staging directory.
+func (r *remote) start(c workertest.Command) error {
+	if _, ok := r.sessions[c.Session]; ok {
+		delete(r.dirs, c.Start.Staging)
+		return exitError(c.Refused)
 	}
 	state := r.failsAs
 	if state == Absent {
 		state = Running
 	}
-	r.sessions[name] = session{state: state, tags: tags}
-	r.dirs[wd] = r.dirs[staging]
-	delete(r.dirs, staging)
+	r.sessions[c.Session] = session{state: state, tags: c.Start.Tags}
+	r.dirs[c.Start.WorkerDir] = r.dirs[c.Start.Staging]
+	delete(r.dirs, c.Start.Staging)
 	return nil
 }
 
-func (r *remote) list(format string) (string, error) {
+// list prints the sessions as the listing's command formats them.
+func (r *remote) list(c workertest.Command) (string, error) {
 	if r.listErr != nil {
 		return "", r.listErr
 	}
@@ -153,14 +148,11 @@ func (r *remote) list(format string) (string, error) {
 	if r.appears != "" {
 		defer func() { r.sessions[r.appears], r.appears = session{state: Running}, "" }()
 	}
-	tag := strings.TrimSuffix(strings.TrimPrefix(strings.Fields(format)[1], "#{"), "}")
-	var b strings.Builder
+	var listed []workertest.Listed
 	for name, s := range r.sessions {
-		dead := map[State]string{Running: "0", Exited: "1"}[s.state]
-		fmt.Fprintf(&b, "%s %s %s\n", dead, s.tags[tag], name)
+		listed = append(listed, workertest.Listed{Name: name, Dead: s.state == Exited, Tags: s.tags})
 	}
-	b.WriteString("end\n")
-	return b.String(), nil
+	return c.List(listed), nil
 }
 
 func (r *remote) close(name string) error {
@@ -339,13 +331,15 @@ func TestReadState(t *testing.T) {
 		want    State
 		wantErr bool
 	}{
-		{"absent", "0  other\nend\n", nil, Absent, false},
-		{"running", "1  other\n0  hermod-k\nend\n", nil, Running, false},
-		{"exited", "1  hermod-k\nend\n", nil, Exited, false},
+		{"absent", "0\tother\nend\n", nil, Absent, false},
+		{"running", "1\tother\n0\thermod-k\nend\n", nil, Running, false},
+		{"exited", "1\thermod-k\nend\n", nil, Exited, false},
 		{"no server", "end\n", nil, Absent, false},
-		{"a name with spaces", "0  my session\n0  hermod-k\nend\n", nil, Running, false},
-		{"incomplete output", "0  hermod-k\n", nil, Absent, true},
-		{"unreadable state", "x  hermod-k\nend\n", nil, Absent, true},
+		{"a name with spaces", "0\tmy session\n0\thermod-k\nend\n", nil, Running, false},
+		{"incomplete output", "0\thermod-k\n", nil, Absent, true},
+		{"cut short after a name ending in the marker", "0\thermod-k\n0\tbackend\n", nil, Absent, true},
+		{"cut short inside a line", "0\thermod-k\n0\tback", nil, Absent, true},
+		{"unreadable state", "x\thermod-k\nend\n", nil, Absent, true},
 		{"unreadable line", "0\nend\n", nil, Absent, true},
 		{"tmux failed", "", exitError(readFailed), Absent, true},
 		{"connection failed", "", exitError(255), Absent, true},
@@ -366,24 +360,53 @@ func TestReadState(t *testing.T) {
 
 // actArgs are the arguments of an act.sh operation, the exit statuses first.
 func actArgs(op string, args ...string) []string {
-	return append([]string{"sh", "-c", string(actScript), "act", "3", "4", "5", op}, args...)
+	return append([]string{"sh", "-c", string(actScript), "act", "3", "4", "5", "1", op}, args...)
+}
+
+// The tmux command lines the scripts are handed for the session hermod-k, as
+// shell, whose own tests check them, makes them.
+var (
+	hasK  = shell.Line(shell.NewTmuxSession("hermod-k").Has())
+	deadK = shell.Line(shell.NewTmuxSession("hermod-k").PaneDead())
+	killK = "tmux kill-session -t =hermod-k:"
+)
+
+// listOf is the act.sh list operation for the tags named.
+func listOf(tags ...string) []string {
+	listing, err := shell.NewTmuxListing(tags...)
+	if err != nil {
+		panic(err)
+	}
+	return actArgs("list", shell.Line(listing.Command()))
+}
+
+// keepArgs are keep.sh's arguments for a start under key: its own, then the
+// tmux command that makes the session detached, its process pane.sh with pane
+// as its arguments under the login shell, and then sets options, each a
+// name and a value.
+func keepArgs(key string, pane []string, options ...string) []string {
+	args := []string{"sh", "-s", "--", ".hermod/s/" + key, staged, "3", shell.Line(shell.NewTmuxSession(key).Has()),
+		"tmux", "new-session", "-d", "-s", key, "--",
+		"sh", "-c", `exec "$SHELL" -lc "$1"`, "sh", shell.Line(append([]string{"sh", "-c", string(paneScript), "pane"}, pane...)),
+	}
+	for i := 0; i+1 < len(options); i += 2 {
+		args = append(args, ";", "set-option", "-t", "="+key+":", "-qo", options[i], options[i+1])
+	}
+	return args
 }
 
 // stagingName matches a staging directory's name, whose random part a table
 // cannot know; staged stands for it in a table.
-var stagingName = regexp.MustCompile(`^\.hermod/s/\.[^/]+\.[0-9a-f]{16}$`)
+var stagingName = regexp.MustCompile(`\.hermod/s/\.[^/ ']+\.[0-9a-f]{16}`)
 
-const staged = "<staging>"
+const staged = "STAGING"
 
 func withoutStaging(calls []call) []call {
 	out := make([]call, len(calls))
 	for i, c := range calls {
 		args := make([]string, len(c.args))
 		for j, a := range c.args {
-			if stagingName.MatchString(a) {
-				a = staged
-			}
-			args[j] = a
+			args[j] = stagingName.ReplaceAllString(a, staged)
 		}
 		out[i] = call{args: args, stdin: c.stdin}
 	}
@@ -397,27 +420,29 @@ func TestStartCommands(t *testing.T) {
 		want []call
 	}{
 		{
-			"terminal",
+			"terminal, a tag value tmux would split at",
 			func(t *testing.T) Spec {
 				return Spec{
 					Key:     mustKey(t, "hermod-k"),
 					Dir:     "/srv/api",
 					Command: []string{"claude", "--resume", "id"},
 					Vars:    env.New(env.Pair{Key: "GIT_AUTHOR_NAME", Value: env.Plain("Jane O'Neil")}),
-					Tags:    []Tag{mustTag(t, "@hermod-workspace", "ws"), mustTag(t, "@hermod-origin", "box")},
+					Tags:    []Tag{mustTag(t, "@hermod-workspace", "ws"), mustTag(t, "@hermod-origin", "my box;")},
 					Form:    Terminal,
 				}
 			},
 			[]call{
-				{args: actArgs("list", "#{pane_dead}  #{session_name}")},
+				{args: listOf()},
 				{
 					args:  []string{"sh", "-c", string(writeScript), "write", staged, "env", "40"},
 					stdin: "export GIT_AUTHOR_NAME='Jane O'\\''Neil'\n",
 				},
 				{
-					args: []string{"sh", "-s", "--", "hermod-k", ".hermod/s/hermod-k", staged, "/srv/api", "HERMOD_WORKER", "pid", "env",
-						"terminal", "in.fifo", "out.log", "err.log", "3", "2",
-						"@hermod-workspace", "ws", "@hermod-origin", "box", "claude", "--resume", "id"},
+					args: keepArgs("hermod-k",
+						[]string{".hermod/s/hermod-k", staged, "/srv/api", "HERMOD_WORKER_DIR", "pid", "env",
+							"terminal", "in.fifo", "out.log", "err.log", "tmux set-option -w -t =hermod-k: remain-on-exit failed",
+							"claude", "--resume", "id"},
+						"@hermod-workspace", "ws", "@hermod-origin", `my box\;`),
 					stdin: string(keepScript),
 				},
 			},
@@ -434,7 +459,7 @@ func TestStartCommands(t *testing.T) {
 				}
 			},
 			[]call{
-				{args: actArgs("list", "#{pane_dead}  #{session_name}")},
+				{args: listOf()},
 				{
 					args:  []string{"sh", "-c", string(writeScript), "write", staged, "env", "0", "settings.json", "2", "mcp.json", "3"},
 					stdin: "{}[1]",
@@ -444,8 +469,10 @@ func TestStartCommands(t *testing.T) {
 					stdin: string(streamScript),
 				},
 				{
-					args: []string{"sh", "-s", "--", "hermod-acp-ws", ".hermod/s/hermod-acp-ws", staged, "proj", "HERMOD_WORKER", "pid", "env",
-						"stream", "in.fifo", "out.log", "err.log", "3", "0", "sh", "-c", `a\;`, `\;`},
+					args: keepArgs("hermod-acp-ws",
+						[]string{".hermod/s/hermod-acp-ws", staged, "proj", "HERMOD_WORKER_DIR", "pid", "env",
+							"stream", "in.fifo", "out.log", "err.log", "tmux set-option -w -t =hermod-acp-ws: remain-on-exit failed",
+							"sh", "-c", "a;", ";"}),
 					stdin: string(keepScript),
 				},
 			},
@@ -536,7 +563,7 @@ func TestList(t *testing.T) {
 			},
 			func(t *testing.T) Tag { return mustTag(t, "@hermod-workspace", "ws") },
 			map[string]State{"hermod-a": Running, "hermod-b": Exited},
-			[][]string{actArgs("list", "#{pane_dead} #{@hermod-workspace} #{session_name}")},
+			[][]string{listOf("@hermod-workspace")},
 			false,
 		},
 		{
@@ -544,7 +571,7 @@ func TestList(t *testing.T) {
 			map[string]session{},
 			func(t *testing.T) Tag { return mustTag(t, "@hermod-origin", "box") },
 			map[string]State{},
-			[][]string{actArgs("list", "#{pane_dead} #{@hermod-origin} #{session_name}")},
+			[][]string{listOf("@hermod-origin")},
 			false,
 		},
 		{
@@ -587,8 +614,8 @@ func TestCloseAndRemoveCommands(t *testing.T) {
 		op   op
 		want []string
 	}{
-		{"close", opClose, actArgs("close", "=hermod-k:", ".hermod/s/hermod-k", "pid", "HERMOD_WORKER")},
-		{"remove", opRemove, actArgs("remove", "=hermod-k:")},
+		{"close", opClose, actArgs("close", deadK, killK, ".hermod/s/hermod-k", "pid", "HERMOD_WORKER_DIR")},
+		{"remove", opRemove, actArgs("remove", deadK, killK)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -646,11 +673,11 @@ func TestStdio(t *testing.T) {
 		want    Stdio
 		wantErr bool
 	}{
-		{"terminal", Terminal, Attach{Command: shell.Command{Args: actArgs("attach", "=hermod-k:")}}, false},
+		{"terminal", Terminal, Attach{Command: shell.Command{Args: actArgs("attach", hasK, "tmux attach-session -t =hermod-k:")}}, false},
 		{"line stream", LineStream, Lines{
 			In:  shell.Command{Args: actArgs("feed", ".hermod/s/hermod-k/in.fifo")},
-			Out: shell.Command{Args: actArgs("log", "=hermod-k:", ".hermod/s/hermod-k/out.log", ".hermod/s/hermod-k/out.log.pos")},
-			Err: shell.Command{Args: actArgs("log", "=hermod-k:", ".hermod/s/hermod-k/err.log", ".hermod/s/hermod-k/err.log.pos")},
+			Out: shell.Command{Args: actArgs("log", deadK, ".hermod/s/hermod-k/out.log", ".hermod/s/hermod-k/out.log.pos")},
+			Err: shell.Command{Args: actArgs("log", deadK, ".hermod/s/hermod-k/err.log", ".hermod/s/hermod-k/err.log.pos")},
 		}, false},
 		{"unknown form", Form(7), nil, true},
 	}
@@ -760,11 +787,11 @@ func TestNewTag(t *testing.T) {
 		{"@hermod-origin", "laptop.local", false},
 		{"hermod-origin", "x", true},
 		{"@", "x", true},
-		{"@Hermod", "x", true},
 		{"@hermod-origin", "", true},
-		{"@hermod-origin", "a b", true},
-		{"@hermod-origin", "a;", true},
+		{"@hermod-origin", "a b", false},
+		{"@hermod-origin", "a;", false},
 		{"@hermod-origin", "a\tb", true},
+		{"@hermod-origin", "a\nb", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name+"="+tc.value, func(t *testing.T) {
@@ -793,6 +820,9 @@ func TestSpecRefused(t *testing.T) {
 			return Spec{Key: mustKey(t, "k"), Vars: env.New(env.Pair{Key: "A.B", Value: env.Plain("1")})}
 		}},
 		{"a zero tag", func(t *testing.T) Spec { return Spec{Key: mustKey(t, "k"), Tags: []Tag{{}}} }},
+		{"the variable the worker sets itself", func(t *testing.T) Spec {
+			return Spec{Key: mustKey(t, "k"), Vars: env.New(env.Pair{Key: env.WorkerDir, Value: env.Plain("/elsewhere")})}
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -823,22 +853,6 @@ func TestFilePrintsMasked(t *testing.T) {
 		t.Run(tc.format, func(t *testing.T) {
 			if got := fmt.Sprintf(tc.format, tc.file); strings.Contains(got, tc.secret) || !strings.Contains(got, tc.file.Name) {
 				t.Errorf("Sprintf(%s) = %q", tc.format, got)
-			}
-		})
-	}
-}
-
-func TestKeyDir(t *testing.T) {
-	cases := []struct {
-		home, key, want string
-	}{
-		{"/home/u", "hermod-k", "/home/u/.hermod/s/hermod-k"},
-		{"/root/", "hermod-acp-ws", "/root/.hermod/s/hermod-acp-ws"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.key, func(t *testing.T) {
-			if got := mustKey(t, tc.key).Dir(tc.home); got != tc.want {
-				t.Errorf("Dir = %q, want %q", got, tc.want)
 			}
 		})
 	}
@@ -876,7 +890,7 @@ func TestLook(t *testing.T) {
 			"a running worker with its files and the command's output",
 			[]string{"claude", "agents", "--json"}, []string{"port", "token"},
 			"state 0\nfile port 6\n20001\nfile token 3\nabcout\n[{\"id\":1}]\n", nil,
-			actArgs("look", "=hermod-k:", ".hermod/s/hermod-k", "claude agents --json", "port", "token"),
+			actArgs("look", deadK, ".hermod/s/hermod-k", `sh -c 'exec "$SHELL" -lc "$1"' sh 'claude agents --json'`, "port", "token"),
 			Look{State: Running, Files: []File{{Name: "port", Content: []byte("20001\n")}, {Name: "token", Content: []byte("abc")}}, Out: []byte("[{\"id\":1}]\n")},
 			false, 1,
 		},
@@ -884,7 +898,7 @@ func TestLook(t *testing.T) {
 			"an exited worker, no file and no command",
 			nil, []string{"port"},
 			"state 1\nout\n", nil,
-			actArgs("look", "=hermod-k:", ".hermod/s/hermod-k", "", "port"),
+			actArgs("look", deadK, ".hermod/s/hermod-k", "", "port"),
 			Look{State: Exited, Out: []byte{}},
 			false, 1,
 		},
@@ -892,7 +906,7 @@ func TestLook(t *testing.T) {
 			"an absent worker, a command word quoted",
 			[]string{"probe", "a b"}, nil,
 			"state absent\nout\n", nil,
-			actArgs("look", "=hermod-k:", ".hermod/s/hermod-k", "probe 'a b'"),
+			actArgs("look", deadK, ".hermod/s/hermod-k", `sh -c 'exec "$SHELL" -lc "$1"' sh 'probe '\''a b'\'''`),
 			Look{State: Absent, Out: []byte{}},
 			false, 1,
 		},
@@ -1050,4 +1064,209 @@ func TestPortScript(t *testing.T) {
 			}
 		})
 	}
+}
+
+// runScript runs a script under a local sh with home as $HOME, the way the
+// remote runs it, and returns what it wrote to stdout and its exit status.
+func runScript(t *testing.T, home string, args []string, stdin io.Reader) (string, int) {
+	t.Helper()
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "SHELL=/bin/sh"}
+	cmd.Stdin = stdin
+	out, err := cmd.Output()
+	var exitErr *exec.ExitError
+	switch {
+	case errors.As(err, &exitErr):
+		return string(out), exitErr.ExitCode()
+	case err != nil:
+		t.Fatal(err)
+	}
+	return string(out), 0
+}
+
+// TestActScript runs act.sh's operations that take tmux command lines under a
+// local sh, each line a stand-in for what tmux would answer, since the fakes
+// above only replay the script's answers.
+func TestActScript(t *testing.T) {
+	const (
+		absent      = "(exit 1)" // what shell's HAS and DEAD exit with for a missing session
+		unreadable  = `echo "lost server" >&2; (exit 2)`
+		running     = "echo 0"
+		dead        = "echo 1"
+		present     = "true"
+		killed      = "echo killed"
+		wdir        = ".hermod/s/hermod-k"
+		listed      = `printf '0\thermod-k\n'`
+		joined      = "echo joined"
+		lookCommand = "echo answer"
+	)
+	cases := []struct {
+		name       string
+		args       []string
+		wantOut    string
+		wantStatus int
+	}{
+		{"list", []string{"list", listed}, "0\thermod-k\nend\n", 0},
+		{"list with no session", []string{"list", "true"}, "end\n", 0},
+		{"list tmux cannot answer", []string{"list", unreadable}, "", readFailed},
+		{"remove an exited worker", []string{"remove", dead, killed}, "killed\n", 0},
+		{"remove a running worker", []string{"remove", running, killed}, "", refusedStatus},
+		{"remove an absent worker", []string{"remove", absent, killed}, "", 0},
+		{"remove when tmux cannot tell", []string{"remove", unreadable, killed}, "", readFailed},
+		{"close a running worker", []string{"close", running, killed, wdir, "pid", "HERMOD_WORKER_DIR"}, "killed\n", 0},
+		{"close an exited worker", []string{"close", dead, killed, wdir, "pid", "HERMOD_WORKER_DIR"}, "", refusedStatus},
+		{"close an absent worker", []string{"close", absent, killed, wdir, "pid", "HERMOD_WORKER_DIR"}, "", 0},
+		{"close when tmux cannot tell", []string{"close", unreadable, killed, wdir, "pid", "HERMOD_WORKER_DIR"}, "", readFailed},
+		{"attach", []string{"attach", present, joined}, "joined\n", 0},
+		{"attach to nothing", []string{"attach", absent, joined}, "", refusedStatus},
+		{"look at a running worker", []string{"look", running, wdir, lookCommand}, "state 0\nout\nanswer\n", 0},
+		{"look at an exited worker", []string{"look", dead, wdir, ""}, "state 1\nout\n", 0},
+		{"look at an absent worker", []string{"look", absent, wdir, ""}, "state absent\nout\n", 0},
+		{"look when tmux cannot tell", []string{"look", unreadable, wdir, ""}, "", readFailed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, status := runScript(t, t.TempDir(), actArgs(tc.args[0], tc.args[1:]...), nil)
+			if out != tc.wantOut || status != tc.wantStatus {
+				t.Errorf("out = %q status %d, want %q status %d", out, status, tc.wantOut, tc.wantStatus)
+			}
+		})
+	}
+}
+
+// TestKeepScript runs keep.sh under a local sh, with stand-ins for tmux's
+// answer to HAS and for the command that makes the session, against a
+// temporary home that holds the worker's directory and its staging one.
+func TestKeepScript(t *testing.T) {
+	const (
+		made  = "made" // the file the stand-in for making the session leaves under the home
+		taken = `[ -e "$HOME/made" ]`
+	)
+	cases := []struct {
+		name       string
+		has        string
+		make       string
+		wantStatus int
+		want       map[string]string // the files under the home, by path
+	}{
+		{"a free key", "false", `touch "$HOME/made"`, 0,
+			map[string]string{".hermod/s/hermod-k/env": "new", made: ""}},
+		{"a key a session holds", "true", `touch "$HOME/made"`, refusedStatus,
+			map[string]string{".hermod/s/hermod-k/env": "old"}},
+		{"a key another start takes meanwhile", taken, `touch "$HOME/made"; false`, refusedStatus,
+			map[string]string{".hermod/s/hermod-k/env": "old", made: ""}},
+		{"tmux fails to make the session", "false", "false", 1,
+			map[string]string{".hermod/s/hermod-k/env": "old"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			for dir, content := range map[string]string{".hermod/s/hermod-k": "old", ".hermod/s/.hermod-k.0": "new"} {
+				if err := os.MkdirAll(filepath.Join(home, dir), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(home, dir, "env"), []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			args := []string{"sh", "-s", "--", ".hermod/s/hermod-k", ".hermod/s/.hermod-k.0", strconv.Itoa(refusedStatus), tc.has, "sh", "-c", tc.make}
+			_, status := runScript(t, home, args, strings.NewReader(string(keepScript)))
+			if status != tc.wantStatus {
+				t.Errorf("status %d, want %d", status, tc.wantStatus)
+			}
+			if got := filesUnder(t, home); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("files = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPaneScript runs pane.sh under a local sh against a temporary home, its
+// worker's directory already in place, with a command that reports where it
+// runs and the variables it was given. "~" in a table stands for the home.
+func TestPaneScript(t *testing.T) {
+	const report = `printf '%s %s %s\n' "$PWD" "$A" "$HERMOD_WORKER_DIR"`
+	cases := []struct {
+		name       string
+		dir        string
+		form       string
+		wantOut    string
+		wantStatus int
+		want       map[string]string // the files under the home, by path
+	}{
+		{"a terminal under the home", "proj", "terminal", "~/proj 1 ~/.hermod/s/hermod-k\n", 0,
+			map[string]string{".hermod/s/hermod-k/env": "export A=1 HERMOD_WORKER_DIR=wrong\n", "kept": ""}},
+		{"a line stream at an absolute directory", "~/proj", "stream", "", 0,
+			map[string]string{
+				".hermod/s/hermod-k/env":     "export A=1 HERMOD_WORKER_DIR=wrong\n",
+				".hermod/s/hermod-k/in.fifo": "",
+				".hermod/s/hermod-k/out.log": "~/proj 1 ~/.hermod/s/hermod-k\n",
+				".hermod/s/hermod-k/err.log": "",
+				".hermod/s/hermod-k/pid":     "<pid>",
+				"kept":                       "",
+			}},
+		{"a directory that is not there", "gone", "terminal", "", 1,
+			map[string]string{".hermod/s/hermod-k/env": "export A=1 HERMOD_WORKER_DIR=wrong\n", "kept": ""}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			wd := filepath.Join(home, ".hermod", "s", "hermod-k")
+			if err := os.MkdirAll(wd, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(filepath.Join(home, "proj"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			files := map[string]string{"env": "export A=1 HERMOD_WORKER_DIR=wrong\n", "in.fifo": "", "out.log": "", "err.log": ""}
+			if tc.form != "stream" {
+				files = map[string]string{"env": files["env"]}
+			}
+			for name, content := range files {
+				if err := os.WriteFile(filepath.Join(wd, name), []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			args := []string{"sh", "-c", string(paneScript), "pane",
+				".hermod/s/hermod-k", ".hermod/s/.hermod-k.0", strings.ReplaceAll(tc.dir, "~", home), "HERMOD_WORKER_DIR", "pid", "env",
+				tc.form, "in.fifo", "out.log", "err.log", `touch "$HOME/kept"`, "sh", "-c", report}
+			out, status := runScript(t, home, args, nil)
+			if want := strings.ReplaceAll(tc.wantOut, "~", home); out != want || status != tc.wantStatus {
+				t.Errorf("out = %q status %d, want %q status %d", out, status, want, tc.wantStatus)
+			}
+			got := filesUnder(t, home)
+			if _, ok := got[".hermod/s/hermod-k/pid"]; ok {
+				got[".hermod/s/hermod-k/pid"] = "<pid>"
+			}
+			want := map[string]string{}
+			for name, content := range tc.want {
+				want[name] = strings.ReplaceAll(content, "~", home)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("files = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// filesUnder is every regular file under root, by its path from root.
+func filesUnder(t *testing.T, root string) map[string]string {
+	t.Helper()
+	files := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		files[rel] = string(content)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
 }

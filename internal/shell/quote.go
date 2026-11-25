@@ -40,3 +40,7 @@ func isShellSafe(r rune) bool {
 // Quote is s as one word of a POSIX shell line, for a caller that writes a
 // line itself, such as a file the remote's shell sources.
 func Quote(s string) string { return quote(s) }
+
+// Line is args as one line that a POSIX shell parses back into args, for a
+// caller that hands a command to a script, which runs it with eval.
+func Line(args []string) string { return join(args) }
