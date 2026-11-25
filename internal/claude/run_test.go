@@ -25,7 +25,7 @@ const (
 )
 
 const (
-	airHook = `{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"http://localhost:63342/air/claude/hook?x=1","headers":{"Authorization":"Bearer air-` + credential + `"}}]}]}}`
+	airHook = `{"hooks":{"Stop":[{"hooks":[{"headers":{"Authorization":"Bearer air-` + credential + `"},"type":"http","url":"http://localhost:63342/air/claude/hook?x=1"}]}]}}`
 	aimed   = `{"hooks":{"Stop":[{"hooks":[{"headers":{"Authorization":"Bearer worker"},"type":"http","url":"http://localhost:45001/air/claude/hook?x=1"}]}]}}`
 )
 
@@ -164,6 +164,26 @@ func TestStart(t *testing.T) {
 			argv:    []string{"claude", "--session-id", uuid, "--settings", "/tmp/air/settings.json"},
 			noRead:  true,
 			wantErr: errAny,
+		},
+		{
+			name: "a JSON prompt with no path kept as written, one with a path mapped",
+			argv: []string{"claude", "--session-id", uuid, "--", "[1, 2]", `{"b": 1, "a": 2}`, `{"b": "` + localDir + `/x", "a": 1}`},
+			want: []string{"claude", "--session-id", uuid, "--", "[1, 2]", `{"b": 1, "a": 2}`, `{"a":1,"b":"` + remoteDir + `/x"}`},
+		},
+		{
+			name:    "a settings document with data after it",
+			argv:    []string{"claude", "--session-id", uuid, "--settings", `{"hooks":{}} {}`},
+			wantErr: errAny,
+		},
+		{
+			name:    "an MCP config with data after it",
+			argv:    []string{"claude", "--session-id", uuid, `--mcp-config={"a":1} x`},
+			wantErr: errAny,
+		},
+		{
+			name:    "a malformed inline document that fails at its credential",
+			argv:    []string{"claude", "--session-id", uuid, `--mcp-config={"a":` + credential + `}`},
+			wantErr: errNotJSON,
 		},
 		{
 			name:    "a malformed inline document",

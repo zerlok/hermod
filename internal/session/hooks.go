@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -278,15 +279,26 @@ func (f hookFilter) Pass(c relay.Call) (relay.Call, error) {
 	}, nil
 }
 
-// mapBody maps the paths in a JSON body; a body that is not JSON passes as it
-// is, since a hook's caller and its endpoint agree on it without Hermod.
+// mapBody maps the paths in a JSON body; a body that is not one JSON value
+// passes as it is, since a hook's caller and its endpoint agree on it without
+// Hermod.
 func mapBody(body []byte, mapPath func(string) string) []byte {
-	if len(bytes.TrimSpace(body)) == 0 {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	// Numbers stay as written: a float64 would round a large integer.
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
 		return body
 	}
-	mapped, err := pathmap.JSON(body, mapPath)
-	if err != nil {
+	if _, err := dec.Token(); err != io.EOF {
 		return body
 	}
-	return mapped
+	var out bytes.Buffer
+	enc := json.NewEncoder(&out)
+	// A path may hold '&', '<' or '>', and the body is not HTML.
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(pathmap.Value(v, mapPath)); err != nil {
+		return body
+	}
+	return bytes.TrimSuffix(out.Bytes(), []byte("\n"))
 }

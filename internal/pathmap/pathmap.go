@@ -2,14 +2,11 @@
 // Map is built from places, each a local root and the remote root it is joined
 // to, and maps a path by the place whose root is its longest prefix at a
 // path-segment boundary, in either direction; the same mapping applies to every
-// string inside a JSON value. It knows nothing about the programs whose
+// string inside a decoded JSON value. It knows nothing about the programs whose
 // arguments, settings or messages carry the paths.
 package pathmap
 
 import (
-	"bytes"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"path"
 	"sort"
@@ -80,13 +77,6 @@ func (m Map) ToRemote(p string) string { return apply(m.toRemote, p) }
 // other way.
 func (m Map) ToLocal(p string) string { return apply(m.toLocal, p) }
 
-// ToRemoteJSON maps every string inside a JSON document to the remote.
-func (m Map) ToRemoteJSON(doc []byte) ([]byte, error) { return JSON(doc, m.ToRemote) }
-
-// ToLocalJSON maps every string inside a JSON document to the local
-// workstation.
-func (m Map) ToLocalJSON(doc []byte) ([]byte, error) { return JSON(doc, m.ToLocal) }
-
 func apply(rules []rule, p string) string {
 	for _, r := range rules {
 		if rest, ok := under(p, r.from); ok {
@@ -94,38 +84,6 @@ func apply(rules []rule, p string) string {
 		}
 	}
 	return p
-}
-
-// JSON applies mapPath to every string value inside one JSON document, at any
-// depth. Object keys, every other value, the order of members and the
-// document's whitespace are left as they are; only a string that maps to a
-// different one is encoded again, so escapes the producer chose are kept.
-func JSON(doc []byte, mapPath func(string) string) ([]byte, error) {
-	if !json.Valid(doc) {
-		return nil, errors.New("pathmap: not a JSON document")
-	}
-	var out bytes.Buffer
-	out.Grow(len(doc))
-	for i := 0; i < len(doc); {
-		if doc[i] != '"' {
-			out.WriteByte(doc[i])
-			i++
-			continue
-		}
-		end := stringEnd(doc, i)
-		literal := doc[i:end]
-		i = end
-		if isKey(doc, end) {
-			out.Write(literal)
-			continue
-		}
-		mapped, err := mapLiteral(literal, mapPath)
-		if err != nil {
-			return nil, err
-		}
-		out.Write(mapped)
-	}
-	return out.Bytes(), nil
 }
 
 // Value is v, a value encoding/json decodes into an interface, with every
@@ -149,58 +107,6 @@ func Value(v any, mapString func(string) string) any {
 		return out
 	}
 	return v
-}
-
-// mapLiteral maps one encoded JSON string, returning it byte for byte when it
-// does not change.
-func mapLiteral(lit []byte, mapPath func(string) string) ([]byte, error) {
-	var s string
-	if err := json.Unmarshal(lit, &s); err != nil {
-		return nil, fmt.Errorf("pathmap: decode string: %w", err)
-	}
-	mapped := mapPath(s)
-	if mapped == s {
-		return lit, nil
-	}
-	var b bytes.Buffer
-	enc := json.NewEncoder(&b)
-	// Paths may hold '&', '<' or '>', which the default encoder escapes for
-	// HTML; the document is not HTML, so they are written as they are.
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(mapped); err != nil {
-		return nil, fmt.Errorf("pathmap: encode string: %w", err)
-	}
-	return bytes.TrimRight(b.Bytes(), "\n"), nil
-}
-
-// stringEnd returns the index just past the string literal opening at start.
-// The document is valid JSON, so the closing quote exists.
-func stringEnd(doc []byte, start int) int {
-	for i := start + 1; i < len(doc); i++ {
-		switch doc[i] {
-		case '\\':
-			i++
-		case '"':
-			return i + 1
-		}
-	}
-	return len(doc)
-}
-
-// isKey reports whether the string literal ending at end is an object key: in
-// valid JSON, and only there, a string is followed by a colon.
-func isKey(doc []byte, end int) bool {
-	for i := end; i < len(doc); i++ {
-		switch doc[i] {
-		case ' ', '\t', '\n', '\r':
-			continue
-		case ':':
-			return true
-		default:
-			return false
-		}
-	}
-	return false
 }
 
 // trimRoot drops trailing slashes, keeping the filesystem root "/" itself.

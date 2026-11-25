@@ -1,6 +1,7 @@
 package pathmap
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -103,94 +104,6 @@ func TestZeroMapMapsNothing(t *testing.T) {
 	}
 }
 
-func TestJSON(t *testing.T) {
-	api := []Place{{"/home/me/dev/api", "/home/u/dev/api"}}
-	cases := []struct {
-		name    string
-		places  []Place
-		toLocal bool
-		in      string
-		want    string
-		wantErr bool
-	}{
-		{
-			"nested strings mapped, other fields unchanged",
-			api, true,
-			`{"cwd":"/home/u/dev/api","tool_input":{"file_path":"/home/u/dev/api/x.go","limit":10},"ok":true,"none":null}`,
-			`{"cwd":"/home/me/dev/api","tool_input":{"file_path":"/home/me/dev/api/x.go","limit":10},"ok":true,"none":null}`,
-			false,
-		},
-		{
-			"keys are never mapped",
-			api, true,
-			`{"/home/u/dev/api" : "/home/u/dev/api/a"}`,
-			`{"/home/u/dev/api" : "/home/me/dev/api/a"}`,
-			false,
-		},
-		{
-			"arrays at any depth",
-			api, true,
-			`[["/home/u/dev/api/a"],{"x":["/home/u/dev/api/b",1.50]}]`,
-			`[["/home/me/dev/api/a"],{"x":["/home/me/dev/api/b",1.50]}]`,
-			false,
-		},
-		{
-			"member order and whitespace kept",
-			api, false,
-			"{ \"z\": \"/home/me/dev/api\",\n  \"a\": 1e3 }",
-			"{ \"z\": \"/home/u/dev/api\",\n  \"a\": 1e3 }",
-			false,
-		},
-		{
-			"unmapped string keeps its escapes",
-			api, true,
-			`{"s":"/etc\/hosts \"q\""}`,
-			`{"s":"/etc\/hosts \"q\""}`,
-			false,
-		},
-		{
-			"escaped path is decoded before mapping",
-			api, true,
-			`{"p":"\/home\/u\/dev\/api\/x"}`,
-			`{"p":"/home/me/dev/api/x"}`,
-			false,
-		},
-		{
-			"mapped string written without HTML escapes",
-			[]Place{{"/home/me/a&b", "/home/u/a<b>"}}, false,
-			`"/home/me/a&b/x"`,
-			`"/home/u/a<b>/x"`,
-			false,
-		},
-		{
-			"escaped quote before a colon inside a value",
-			api, true,
-			`{"k":"a\": b","p":"/home/u/dev/api/c"}`,
-			`{"k":"a\": b","p":"/home/me/dev/api/c"}`,
-			false,
-		},
-		{"bare string document", api, true, `"/home/u/dev/api/x"`, `"/home/me/dev/api/x"`, false},
-		{"invalid JSON", api, true, `{"cwd":`, "", true},
-		{"empty document", api, true, ``, "", true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			m := mustMap(t, tc.places...)
-			mapJSON := m.ToRemoteJSON
-			if tc.toLocal {
-				mapJSON = m.ToLocalJSON
-			}
-			got, err := mapJSON([]byte(tc.in))
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("JSON() error = %v, wantErr %v", err, tc.wantErr)
-			}
-			if string(got) != tc.want {
-				t.Errorf("JSON() = %s, want %s", got, tc.want)
-			}
-		})
-	}
-}
-
 func TestPlaces(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -276,6 +189,9 @@ func TestValue(t *testing.T) {
 			map[string]any{"/home/u/dev/api": []any{"/home/me/dev/api/b", 1.5, true, nil, map[string]any{"p": "/home/me/dev/api"}}}},
 		{"a string under no root", false, "/etc/hosts", "/etc/hosts"},
 		{"no string", true, 7.0, 7.0},
+		{"a number decoded as written stays one", false,
+			[]any{json.Number("12345678901234567890"), "/home/me/dev/api"},
+			[]any{json.Number("12345678901234567890"), "/home/u/dev/api"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

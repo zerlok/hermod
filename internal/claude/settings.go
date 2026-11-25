@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
-	"strings"
 
 	"github.com/zerlok/hermod/internal/agent"
 	"github.com/zerlok/hermod/internal/secret"
@@ -63,13 +63,11 @@ func rewriteHooks(document secret.Token, rewrite func(agent.Hook) (agent.Hook, b
 	return secret.FromString(string(out)), nil
 }
 
-// decodeSettings reads a settings document, its numbers such as timeouts kept
-// as written.
+// decodeSettings reads a settings document, which must be a JSON object.
 func decodeSettings(document secret.Token) (map[string]any, error) {
-	var settings map[string]any
-	dec := json.NewDecoder(strings.NewReader(document.Reveal()))
-	dec.UseNumber()
-	if err := dec.Decode(&settings); err != nil || settings == nil {
+	v, err := decodeDocument([]byte(document.Reveal()))
+	settings, ok := v.(map[string]any)
+	if err != nil || !ok {
 		return nil, errors.New("claude: settings: not a JSON object")
 	}
 	return settings, nil
@@ -167,6 +165,25 @@ func filterHooks(settings map[string]any, keep func(h map[string]any) bool) {
 			delete(byName, name)
 		}
 	}
+}
+
+// errNotJSON carries no detail of the decoder's error: a syntax error quotes
+// the document's text, and a document may hold a credential.
+var errNotJSON = errors.New("not a JSON document")
+
+// decodeDocument reads one JSON value and refuses data after it. Numbers, such
+// as timeouts, stay as written: a float64 would round a large integer.
+func decodeDocument(doc []byte) (any, error) {
+	dec := json.NewDecoder(bytes.NewReader(doc))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, errNotJSON
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errNotJSON
+	}
+	return v, nil
 }
 
 // marshal encodes v without HTML escaping: the documents are read by Claude,

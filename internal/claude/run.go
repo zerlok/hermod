@@ -262,7 +262,7 @@ func (r *rewriter) document(option, value string) (secret.Token, error) {
 		}
 		content = read
 	}
-	mapped, err := pathmap.JSON(content, r.paths.ToRemote)
+	mapped, err := mapJSON(content, r.paths)
 	if err != nil {
 		return secret.Token{}, fmt.Errorf("claude: %s %s: %w", option, describe(value), err)
 	}
@@ -339,11 +339,31 @@ func mapWords(words []string, paths pathmap.Map) []string {
 func mapWord(w string, paths pathmap.Map) string {
 	trimmed := strings.TrimSpace(w)
 	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
-		if mapped, err := pathmap.JSON([]byte(w), paths.ToRemote); err == nil {
+		if mapped, err := mapJSON([]byte(w), paths); err == nil {
 			return string(mapped)
 		}
 	}
 	return paths.ToRemote(w)
+}
+
+// mapJSON maps every string of one JSON document to the remote. A document
+// with no path in it is kept as written, since re-encoding would reformat the
+// caller's own text, such as a prompt.
+func mapJSON(doc []byte, paths pathmap.Map) ([]byte, error) {
+	v, err := decodeDocument(doc)
+	if err != nil {
+		return nil, err
+	}
+	changed := false
+	v = pathmap.Value(v, func(s string) string {
+		out := paths.ToRemote(s)
+		changed = changed || out != s
+		return out
+	})
+	if !changed {
+		return doc, nil
+	}
+	return marshal(v)
 }
 
 // skipValues is the index of the last value of the variadic option at

@@ -163,9 +163,9 @@ Every group's tests are table-driven, and the core is tested through a fake `she
 
 ## 22. `pathmap` over decoded values
 
-- [ ] 22.1 Replace the raw-byte scanner of `internal/pathmap` (`JSON`, `stringEnd`, `isKey`, `mapLiteral`, `ToRemoteJSON`, `ToLocalJSON`) with a mapping over a decoded JSON value (`map[string]any`, `[]any`, a string) ([Concrete types](../../../docs/ARCHITECTURE.md#concrete-types))
-- [ ] 22.2 Its callers decode with `encoding/json`, map and encode again: the hook bodies in `session`'s filter, Claude's settings and MCP configuration in `claude`, and the free-form fields and `_meta` of `acp`'s types through `pathmap.Value`
-- [ ] 22.3 Tests: nested strings mapped, keys and numbers untouched, both directions
+- [x] 22.1 Replace the raw-byte scanner of `internal/pathmap` (`JSON`, `stringEnd`, `isKey`, `mapLiteral`, `ToRemoteJSON`, `ToLocalJSON`) with a mapping over a decoded JSON value (`map[string]any`, `[]any`, a string) ([Concrete types](../../../docs/ARCHITECTURE.md#concrete-types))
+- [x] 22.2 Its callers decode with `encoding/json`, map and encode again: the hook bodies in `session`'s filter, Claude's settings and MCP configuration in `claude`, and the free-form fields and `_meta` of `acp`'s types through `pathmap.Value`
+- [x] 22.3 Tests: nested strings mapped, keys and numbers untouched, both directions
 
 ## 23. Graceful shutdown; contexts from `cli`
 

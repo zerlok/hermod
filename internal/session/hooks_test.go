@@ -42,6 +42,22 @@ func TestHookFilter(t *testing.T) {
 			`{"file":"` + api + `/b.go"}`, `{"file":"` + apiR + `/b.go"}`,
 		},
 		{
+			"nested paths mapped, keys and numbers kept, an empty answer passed",
+			secret.FromString("Bearer client"),
+			relay.Call{Method: http.MethodPost, URI: "/hook", Header: header("Authorization", "Bearer worker"), Body: []byte(`{"n":12345678901234567890,"tool":{"` + apiR + `":["` + apiR + `/x"]}}`)},
+			0,
+			relay.Call{Method: http.MethodPost, URI: "/hook", Header: header("Authorization", "Bearer client"), Body: []byte(`{"n":12345678901234567890,"tool":{"` + apiR + `":["` + api + `/x"]}}`)},
+			"", "",
+		},
+		{
+			"a body and an answer with data after their value passed as given",
+			secret.FromString("Bearer client"),
+			relay.Call{Method: http.MethodPost, URI: "/hook", Header: header("Authorization", "Bearer worker"), Body: []byte(`{"file":"` + apiR + `/a"} trailing`)},
+			0,
+			relay.Call{Method: http.MethodPost, URI: "/hook", Header: header("Authorization", "Bearer client"), Body: []byte(`{"file":"` + apiR + `/a"} trailing`)},
+			`{"file":"` + api + `/b"} {}`, `{"file":"` + api + `/b"} {}`,
+		},
+		{
 			"a client that expects no token, a body that is no JSON",
 			secret.Token{},
 			relay.Call{Method: http.MethodPost, URI: "/hook", Header: header("Authorization", "Bearer worker"), Body: []byte("plain " + apiR)},
