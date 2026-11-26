@@ -51,12 +51,24 @@ fmt-check: ## Fail if any file is not gofmt-clean
 		echo "gofmt needed on:"; echo "$$unformatted"; exit 1; \
 	fi
 
+# The stand-in: hermod started as `claude` runs `hermod attach -- claude ARGS…`,
+# for Air's terminal to start as its Claude executable. The default is off PATH,
+# so a local claude stays the one a shell finds; `hermod air configure` reports
+# it there. Override to put it elsewhere, e.g. `make install STANDIN=~/bin/claude`.
+STANDIN ?= $(XDG_DATA_HOME)/hermod/bin/claude
+
 .PHONY: install
-install: $(HERMOD) $(COMPLETION) ## Install to $GOBIN and (re)generate bash completions
+install: $(HERMOD) $(COMPLETION) standin ## Install to $GOBIN, (re)generate bash completions and link the claude stand-in
 
 # Install the hermod binary to $GOBIN
 $(HERMOD): $(SOURCES)
 	go install .
+
+# Always relinked: cheap, and it repairs a link left pointing elsewhere.
+.PHONY: standin
+standin: $(HERMOD)
+	@mkdir -p $(dir $(STANDIN))
+	ln -sfn $(HERMOD) $(STANDIN)
 
 # Generate completion script whenever the installed binary changes
 $(COMPLETION): $(HERMOD)

@@ -1,5 +1,6 @@
-// Command hermod mirrors a working directory to a sandbox and attaches a
-// persistent session running there, pausing or tearing down the mirror on detach.
+// Command hermod attaches a local client to a workspace on a remote: the
+// relays that carry files, stdio and calls between the two workstations, and
+// the workers that keep running there when the client is gone.
 package main
 
 import (

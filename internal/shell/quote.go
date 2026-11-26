@@ -2,13 +2,13 @@ package shell
 
 import "strings"
 
-// join renders an argv as a single space-separated line with each element
-// shell-quoted. It collapses a command into one argument when crossing a host
-// boundary: ssh joins its trailing args with spaces, so the command must arrive
-// pre-quoted as a single string to survive the remote shell re-parsing it.
-func join(argv []string) string {
-	parts := make([]string, len(argv))
-	for i, a := range argv {
+// join renders arguments as one space-separated line, each shell-quoted. It
+// collapses a command into one argument when crossing to another workstation:
+// ssh joins its trailing arguments with spaces, so the command must arrive
+// quoted as a single string to survive the remote shell parsing it again.
+func join(args []string) string {
+	parts := make([]string, len(args))
+	for i, a := range args {
 		parts[i] = quote(a)
 	}
 	return strings.Join(parts, " ")
@@ -36,3 +36,11 @@ func isShellSafe(r rune) bool {
 		return strings.ContainsRune("_-./:=@,", r)
 	}
 }
+
+// Quote is s as one word of a POSIX shell line, for a caller that writes a
+// line itself, such as a file the remote's shell sources.
+func Quote(s string) string { return quote(s) }
+
+// Line is args as one line that a POSIX shell parses back into args, for a
+// caller that hands a command to a script, which runs it with eval.
+func Line(args []string) string { return join(args) }
